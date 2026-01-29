@@ -16,6 +16,9 @@ pip install git+https://github.com/NehemiahZewde/AI_framework.git
 ```
 
 ### Option 2: Clone and install (editable)
+
+```bash
 git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
 pip install -e .
+```
