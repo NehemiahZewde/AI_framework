@@ -1,2 +1,2 @@
-# AI_framework
+# AI framework
 Al modeling framework for clinical data
