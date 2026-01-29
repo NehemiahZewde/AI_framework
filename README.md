@@ -13,6 +13,7 @@ This installs the latest code from the `main` branch:
 
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
+```
 
 ### Option 2: Clone and install (editable)
 git clone https://github.com/NehemiahZewde/AI_framework.git
