@@ -10,7 +10,6 @@ import mne_features
 from .utils import validate_feature_names, _normalize_epochs_input
 
 
-
 def feature_line_length_per_epoch(
     X: np.ndarray,
     sfreq: float | None = None,

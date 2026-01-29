@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 
 authors = [{ name = "Nehemiah Zewde" }]
-license = { text = "MIT" }  # change if needed
+license = { file = "LICENSE" }
+license-files = ["LICENSE"]
 keywords = ["EEG", "EEG feature extraction", "machine-learning", "neuroscience"]
 
 classifiers = [
@@ -20,6 +21,7 @@ classifiers = [
   "Operating System :: Microsoft :: Windows",
   "Operating System :: MacOS",
   "Operating System :: POSIX",
+  "License :: OSI Approved :: MIT License",
 ]
 
 
