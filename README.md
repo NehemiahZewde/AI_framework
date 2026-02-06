@@ -61,10 +61,42 @@ Applicable across disease areas and modalities (examples include neurology, immu
 ### Option 1: Install directly from GitHub
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
-```
+
+````md
 ### Option 2: Clone and install (editable)
 ```bash
 git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
 pip install -e .
+````
+
+---
+
+## Quickstart
+
+> Coming next: a minimal end-to-end example (data → train → report) runnable in a few commands.
+
+---
+
+## Project layout
+
+* `ai_framework/` — core pipeline building blocks (data prep, training, evaluation, calibration, reporting)
+* `tutorial/` — end-to-end examples (includes an EEG example module)
+
+---
+
+## Roadmap (near-term)
+
+* Minimal CLI + config-driven runs
+* Example datasets and reproducible tutorial notebooks
+* Report artifacts (metrics tables, calibration curves, interpretation outputs)
+* Additional modality examples (tabular clinical + imaging-derived features)
+
+---
+
+## Disclaimer
+
+Research code. Not a medical device. Not intended for clinical decision-making.
+
+```
 ```
