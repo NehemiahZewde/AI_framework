@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional, Tuple, Union, Sequence, List
 Threshold = Union[float, Tuple[float, float]]
 
 
+Threshold = Union[float, Tuple[float, float]]
+
 
 def preprocess_by_threshold(
     df: pd.DataFrame,
@@ -392,3 +394,66 @@ def pocket_metrics_from_raw(
 
     return summary, df_hi
 
+
+def pocket_metrics_by_model(
+    df: pd.DataFrame,
+    threshold: Threshold,
+    *,
+    # selection
+    model: Optional[Union[str, Sequence[str]]] = None,  # None => all models in df
+    # pass-through knobs (match pocket_metrics_from_raw)
+    score_col: str = "p_median",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[list[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Run `pocket_metrics_from_raw` separately for each model and return results in a dict.
+
+    Returns
+    -------
+    dict[model_name, (summary_df, df_hi)]
+        - summary_df: 1-row pocket summary for that model (and other filters)
+        - df_hi: the threshold-selected pocket rows for that model
+    """
+    if "model" not in df.columns:
+        raise KeyError("df must contain a 'model' column to run per-model pocket metrics.")
+
+    # Resolve which models to run
+    if model is None:
+        model_list = sorted(df["model"].dropna().astype(str).unique().tolist())
+    elif isinstance(model, str):
+        model_list = [model]
+    else:
+        model_list = list(model)
+
+    if len(model_list) == 0:
+        raise ValueError("No models selected.")
+
+    results: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+
+    for m in model_list:
+        summary, df_hi = pocket_metrics_from_raw(
+            df=df,
+            threshold=threshold,
+            score_col=score_col,
+            split=split,
+            models=m,                 # <-- key bit: run one model at a time
+            variants=variants,
+            grouping_keys=grouping_keys,
+            enforce_unique=enforce_unique,
+            drop_subject_ids=drop_subject_ids,
+            subject_col=subject_col,
+            y_col=y_col,
+            label_col=label_col,
+            meta_cols=meta_cols,
+        )
+        results[str(m)] = (summary, df_hi)
+
+    return results

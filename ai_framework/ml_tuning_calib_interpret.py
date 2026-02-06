@@ -20,9 +20,6 @@ from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross
 from sklearn.model_selection._split import BaseCrossValidator  # for typing
 from sklearn.preprocessing import StandardScaler
 
-#from collections import defaultdict
-
-
 import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
@@ -61,7 +58,7 @@ from datetime import datetime
 from pathlib import Path
 
 import re
-
+from .ml_feature_selection import prepare_training_bundle
 
 
 # ---------------------------------------------------------------------
@@ -462,101 +459,206 @@ def fit_and_evaluate_final_model(
 
 
 
-
 # ---------------------------------------------------------------------
 # Run nested CV for a single model_name using config
 # ---------------------------------------------------------------------
 def run_nested_cv_for_model(
     model_name: str,
-    X: np.ndarray,
-    y: np.ndarray,
+    bundle: Dict[str, Any],
     cfg: Dict[str, Any],
-    groups: Optional[np.ndarray] = None,
+    *,
+    x_key: str = "combined_X_raw",
+    y_key: str = "combined_y",
+    groups_key: Optional[str] = None,   # e.g. "combined_groups" if you want group-aware CV
     model_selection: str = "StratifiedKFold",
 ) -> List[Dict[str, Any]]:
     """
-    Run nested cross-validation with Optuna hyperparameter tuning
-    for a single model specified by `model_name`.
+    Run nested cross-validation with Optuna hyperparameter tuning for ONE model.
 
-    The procedure is:
+    This function supports:
+      1) Choosing which dataset "level" to use from `bundle` via keys:
+           - x_key (default: "combined_X_raw")
+           - y_key (default: "combined_y")
+           - groups_key (optional, e.g. "combined_groups")
+      2) Per-model feature subsetting (slice columns ONCE per model run) via config:
+           - cfg["models"][model_name]["feature_names"] : Optional[List[str]]
+               Select these exact feature names (order preserved).
+           - cfg["models"][model_name]["n_features"] : Optional[int]
+               Select the first K features (prefix mode).
+           - Only ONE of feature_names or n_features may be set (or both None => use all).
 
+    Nested CV procedure:
       * Outer loop:
-          - Repeated `NUM_TRIALS` times.
-          - Each repetition uses a CV splitter (StratifiedKFold or
-            StratifiedGroupKFold, depending on `model_selection`) with
-            `n_outer_splits` folds.
+          - Repeated cfg["cv"]["num_trials"] times.
+          - Uses a CV splitter (StratifiedKFold or StratifiedGroupKFold) with
+            cfg["cv"]["n_outer_splits"] folds.
           - Each outer fold defines an outer train/test split.
-
-      * Inner loop:
-          - On each outer train split (X_train, y_train), run an Optuna
-            study using `objective_with_args` and an inner CV with
-            `n_inner_splits` folds.
-          - The study searches over hyperparameters defined in the config
-            and selects the best trial based on mean inner test score.
-
+      * Inner loop (Optuna tuning):
+          - On each outer-train split, run an Optuna study for
+            cfg["optuna"]["n_inner_trials"] trials.
+          - Each Optuna trial is evaluated with an inner CV of
+            cfg["cv"]["n_inner_splits"] folds using objective_with_args(...).
       * Final model per outer fold:
-          - Rebuild model using the best trial's hyperparameters via
-            `fit_and_evaluate_final_model`.
-          - Fit on the outer train split and evaluate on train and test.
-          - Store inner and outer metrics, best parameters, and indices.
+          - Refit a final model with the best hyperparameters on the full
+            outer-train split and evaluate on outer-train and outer-test.
 
     Parameters
     ----------
-    model_name : str
-        Name of the model to run nested CV for. Must be a key in
-        cfg["models"], e.g. "logistic_regression" or "random_forest".
-    X : np.ndarray
-        Full feature matrix, shape (n_samples, n_features).
-    y : np.ndarray
-        Full label vector, shape (n_samples,).
-    cfg : dict
-        Global configuration dictionary. Must contain:
-        - cfg["cv"] with keys: "num_trials", "n_outer_splits", "n_inner_splits"
-        - cfg["optuna"] with keys: "n_inner_trials", "direction"
-        - cfg["models"][model_name]["params"]: callable(trial) -> dict
-    groups : np.ndarray or None, default=None
-        Group labels for the samples, shape (n_samples,). Required if
-        `model_selection == "StratifiedGroupKFold"`, and ignored when
-        using plain "StratifiedKFold".
-    model_selection : str, default="StratifiedKFold"
-        CV strategy to use for both outer and inner loops. Supported:
-        - "StratifiedKFold"       (no grouping)
-        - "StratifiedGroupKFold"  (group-aware splitting)
+    model_name:
+        Key into cfg["models"].
+    bundle:
+        Dataset dict containing at least:
+          - bundle[x_key]: 2D array (n_samples, n_features)
+          - bundle[y_key]: 1D array (n_samples,)
+          - bundle["feature_names"]: List[str] of length n_features
+        If groups_key is provided, bundle[groups_key] must be length n_samples.
+    cfg:
+        Global configuration dict with:
+          - cfg["cv"]: {"num_trials","n_outer_splits","n_inner_splits"}
+          - cfg["optuna"]: {"n_inner_trials","direction", optional "n_jobs"}
+          - cfg["models"][model_name]:
+              - "params": callable(trial)->dict
+              - optional "feature_names": List[str] | None
+              - optional "n_features": int | None
+              - optional "feature_strict": bool
+              - optional "max_print_features": int
+    x_key, y_key:
+        Keys selecting which X/y arrays to use from bundle.
+    groups_key:
+        Optional key selecting group ids array from bundle (for group-aware CV).
+    model_selection:
+        "StratifiedKFold" or "StratifiedGroupKFold".
 
     Returns
     -------
-    results : list of dict
-        One dictionary per outer fold, containing:
-        - "model_name": str
-        - "trial": int (outer repetition index)
-        - "outer_fold": int (fold index within the outer trial)
-        - "inner_train_scores": np.ndarray (per-fold inner train scores)
-        - "inner_test_scores": np.ndarray (per-fold inner test scores)
-        - "inner_train_mean": float
-        - "inner_train_std": float
-        - "inner_test_mean": float
-        - "inner_test_std": float
-        - "outer_train_metrics": dict of metrics on X_train
-        - "outer_test_metrics": dict of metrics on X_test
-        - "best_params": dict of best hyperparameters (Optuna)
-        - "n_train": int, size of outer train set
-        - "n_test": int, size of outer test set
-        - "final_model": fitted model object
-        - "outer_train_idx": np.ndarray of indices used for train
-        - "outer_test_idx": np.ndarray of indices used for test
-        - "y_train": np.ndarray of labels for train
-        - "y_test": np.ndarray of labels for test
-        - "y_train_scores": np.ndarray of scores on train
-        - "y_test_scores": np.ndarray of scores on test
-    """
-    cv_cfg = cfg["cv"]
-    opt_cfg = cfg["optuna"]
+    results:
+        List of dicts, one per outer fold, including:
+          - model_name, trial, outer_fold
+          - feature_names, n_features
+          - inner_train_scores/test_scores + mean/std (from best trial user_attrs)
+          - outer_train_metrics, outer_test_metrics
+          - best_params, final_model
+          - indices + labels + score vectors
+    """    
+    # Grab this model's configuration block (params search space, feature selection, printing knobs, etc.)
+    m_cfg = cfg["models"][model_name]
 
-    NUM_TRIALS = cv_cfg["num_trials"]
-    n_outer_splits = cv_cfg["n_outer_splits"]
-    n_inner_splits = cv_cfg["n_inner_splits"]
-    N_INNER_OPTUNA_TRIALS = opt_cfg["n_inner_trials"]
+    # -----------------------------
+    # Per-model feature selection knobs (choose ONE approach)
+    # -----------------------------
+    # Option A: explicitly specify feature names to keep (exact match against bundle["feature_names"])
+    keep_features = m_cfg.get("feature_names", None)   # list[str] or None
 
+    # Option B: keep the first K features (prefix mode; uses current column order)
+    n_features = m_cfg.get("n_features", None)         # int or None
+
+    # Disallow ambiguous intent: you either pick specific names OR pick top-K by column order
+    if keep_features is not None and n_features is not None:
+        raise ValueError(f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither).")
+
+    # -----------------------------
+    # Pull the correct dataset "level" from bundle (raw vs aggregated/combined)
+    # -----------------------------
+    # These keys let you decide whether you're running CV on sample-level data or group-aggregated data.
+    if x_key not in bundle:
+        raise KeyError(f"bundle missing x_key='{x_key}'. Available keys: {list(bundle.keys())[:25]} ...")
+    if y_key not in bundle:
+        raise KeyError(f"bundle missing y_key='{y_key}'. Available keys: {list(bundle.keys())[:25]} ...")
+
+    # Needed for name-based feature selection and for sanity checks (must match X columns)
+    if "feature_names" not in bundle:
+        raise KeyError("bundle must contain 'feature_names' for feature selection by name.")
+
+    # Convert to numpy arrays (ensures consistent indexing and shapes)
+    X_full = np.asarray(bundle[x_key])   # full feature matrix for this dataset level
+    y = np.asarray(bundle[y_key])        # labels aligned row-by-row with X_full
+
+    # -----------------------------
+    # Sanity checks: shapes must be consistent before we do any CV splitting
+    # -----------------------------
+    if X_full.ndim != 2:
+        raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
+
+    # Outer CV splitters require X and y to have the same number of rows/samples
+    if X_full.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
+        )
+
+    # Feature name list must match the number of columns in X
+    if X_full.shape[1] != len(bundle["feature_names"]):
+        raise ValueError(
+            f"Mismatch: X has {X_full.shape[1]} cols but feature_names has {len(bundle['feature_names'])}"
+        )
+
+    # -----------------------------
+    # Optional: group labels (only needed for StratifiedGroupKFold)
+    # -----------------------------
+    groups = None
+    if groups_key is not None:
+        # If user requested group-aware splitting, we need a groups vector aligned with y/X rows
+        if groups_key not in bundle:
+            raise KeyError(f"bundle missing groups_key='{groups_key}'")
+        groups = np.asarray(bundle[groups_key])
+
+        if groups.ndim != 1:
+            raise ValueError(f"bundle[{groups_key}] must be 1D, got shape {groups.shape}")
+
+        # Groups must also have one entry per row/sample
+        if len(groups) != len(y):
+            raise ValueError(
+                f"groups/y mismatch for key {groups_key}: len(groups)={len(groups)} vs len(y)={len(y)}"
+            )
+
+    # -----------------------------
+    # Create a tiny "view bundle" that matches prepare_training_bundle's expected schema:
+    # it expects keys "X_raw" and "feature_names"
+    # -----------------------------
+    view_bundle = {"X_raw": X_full, "feature_names": bundle["feature_names"]}
+
+    # -----------------------------
+    # Slice ONCE per model run (column selection only, no data leakage concerns here)
+    # - If keep_features is set: select exact named columns.
+    # - If n_features is set: select the first K columns.
+    # - If neither is set: use all features.
+    # -----------------------------
+    if keep_features is not None or n_features is not None:
+        model_bundle = prepare_training_bundle(
+            view_bundle,
+            n_features=n_features,
+            keep_features=keep_features,
+            strict=m_cfg.get("feature_strict", True),  # error on missing names by default
+            dedupe=True,                               # de-duplicate requested names (preserve order)
+            copy_bundle=True,                          # avoid mutating original bundle
+        )
+    else:
+        model_bundle = view_bundle
+
+    # Final X that will be used for outer & inner CV in this run
+    X = model_bundle["X_raw"]
+    selected_feature_names = list(model_bundle["feature_names"])
+
+    # Helpful debug print so you can verify the slicing did what you expect
+    print(f"[{model_name}] X shape after slicing: {X.shape} (features={len(selected_feature_names)})")
+
+    # Print feature names used (truncate to avoid huge console spam for wide datasets)
+    max_show = int(m_cfg.get("max_print_features", 30))
+    print(f"[{model_name}] feature_names ({len(selected_feature_names)}):")
+    for f in selected_feature_names[:max_show]:
+        print(f"  - {f}")
+    if len(selected_feature_names) > max_show:
+        print(f"  ... (+{len(selected_feature_names) - max_show} more)")
+
+    # If the user selected a group-aware CV strategy, enforce that groups are actually present
+    if model_selection == "StratifiedGroupKFold" and groups is None:
+        raise ValueError(
+            "model_selection='StratifiedGroupKFold' but groups is None. "
+            "Provide groups_key (e.g., 'combined_groups') or use 'StratifiedKFold'."
+        )
+
+    
     # Enforce that groups are provided when using group-aware splitting
     if model_selection == "StratifiedGroupKFold" and groups is None:
         raise ValueError(
@@ -564,9 +666,42 @@ def run_nested_cv_for_model(
             "Provide a groups array or use 'StratifiedKFold'."
         )
 
+
+    # Pull out the sub-configs so we don't keep typing cfg["cv"] / cfg["optuna"] everywhere
+    cv_cfg = cfg["cv"]           # cross-validation settings (outer/inner splits, repetitions)
+    opt_cfg = cfg["optuna"]      # Optuna settings (how many trials, parallelism, etc.)
+
+    # How many times to repeat the entire OUTER CV procedure.
+    # If num_trials = 3 and n_outer_splits = 5, you'll run 15 outer folds total.
+    NUM_TRIALS = cv_cfg["num_trials"]
+
+    # Number of folds in the OUTER CV loop.
+    # Each fold produces one outer test evaluation (generalization estimate).
+    n_outer_splits = cv_cfg["n_outer_splits"]
+
+    # Number of folds in the INNER CV loop (inside Optuna objective).
+    # Each Optuna trial is evaluated by averaging performance across these inner folds.
+    n_inner_splits = cv_cfg["n_inner_splits"]
+
+    # Number of Optuna hyperparameter trials to run PER OUTER FOLD.
+    # This is the tuning budget for searching hyperparameters on each outer-train split.
+    N_INNER_OPTUNA_TRIALS = opt_cfg["n_inner_trials"]
+
+    # How many parallel Optuna trials to run at once.
+    # If missing, default to 1 (fully sequential).
+    OPTUNA_N_JOBS = opt_cfg.get("n_jobs", 1)
+
+    # This list will accumulate one dictionary per OUTER fold, including metrics + best params.
     results: List[Dict[str, Any]] = []
+
+    # A running counter across *all* outer folds across all outer repetitions.
+    # Used purely for printing progress like "Outer fold 3/15".
     cv_tracker = 0
+
+    # Total number of outer folds we expect to run overall:
+    # (num outer repetitions) * (outer folds per repetition).
     total_outer_folds = NUM_TRIALS * n_outer_splits
+
 
     # ------------------------------------------------------------------
     # Outer loop: repeated outer cross-validation
@@ -623,6 +758,7 @@ def run_nested_cv_for_model(
                 ),
                 n_trials=N_INNER_OPTUNA_TRIALS,
                 show_progress_bar=True,
+                n_jobs=OPTUNA_N_JOBS,
             )
 
             best_trial = study.best_trial
@@ -678,6 +814,224 @@ def run_nested_cv_for_model(
             )
 
     return results
+
+
+
+# def run_nested_cv_for_model(
+#     model_name: str,
+#     X: np.ndarray,
+#     y: np.ndarray,
+#     cfg: Dict[str, Any],
+#     groups: Optional[np.ndarray] = None,
+#     model_selection: str = "StratifiedKFold",
+# ) -> List[Dict[str, Any]]:
+#     """
+#     Run nested cross-validation with Optuna hyperparameter tuning
+#     for a single model specified by `model_name`.
+
+#     The procedure is:
+
+#       * Outer loop:
+#           - Repeated `NUM_TRIALS` times.
+#           - Each repetition uses a CV splitter (StratifiedKFold or
+#             StratifiedGroupKFold, depending on `model_selection`) with
+#             `n_outer_splits` folds.
+#           - Each outer fold defines an outer train/test split.
+
+#       * Inner loop:
+#           - On each outer train split (X_train, y_train), run an Optuna
+#             study using `objective_with_args` and an inner CV with
+#             `n_inner_splits` folds.
+#           - The study searches over hyperparameters defined in the config
+#             and selects the best trial based on mean inner test score.
+
+#       * Final model per outer fold:
+#           - Rebuild model using the best trial's hyperparameters via
+#             `fit_and_evaluate_final_model`.
+#           - Fit on the outer train split and evaluate on train and test.
+#           - Store inner and outer metrics, best parameters, and indices.
+
+#     Parameters
+#     ----------
+#     model_name : str
+#         Name of the model to run nested CV for. Must be a key in
+#         cfg["models"], e.g. "logistic_regression" or "random_forest".
+#     X : np.ndarray
+#         Full feature matrix, shape (n_samples, n_features).
+#     y : np.ndarray
+#         Full label vector, shape (n_samples,).
+#     cfg : dict
+#         Global configuration dictionary. Must contain:
+#         - cfg["cv"] with keys: "num_trials", "n_outer_splits", "n_inner_splits"
+#         - cfg["optuna"] with keys: "n_inner_trials", "direction"
+#         - cfg["models"][model_name]["params"]: callable(trial) -> dict
+#     groups : np.ndarray or None, default=None
+#         Group labels for the samples, shape (n_samples,). Required if
+#         `model_selection == "StratifiedGroupKFold"`, and ignored when
+#         using plain "StratifiedKFold".
+#     model_selection : str, default="StratifiedKFold"
+#         CV strategy to use for both outer and inner loops. Supported:
+#         - "StratifiedKFold"       (no grouping)
+#         - "StratifiedGroupKFold"  (group-aware splitting)
+
+#     Returns
+#     -------
+#     results : list of dict
+#         One dictionary per outer fold, containing:
+#         - "model_name": str
+#         - "trial": int (outer repetition index)
+#         - "outer_fold": int (fold index within the outer trial)
+#         - "inner_train_scores": np.ndarray (per-fold inner train scores)
+#         - "inner_test_scores": np.ndarray (per-fold inner test scores)
+#         - "inner_train_mean": float
+#         - "inner_train_std": float
+#         - "inner_test_mean": float
+#         - "inner_test_std": float
+#         - "outer_train_metrics": dict of metrics on X_train
+#         - "outer_test_metrics": dict of metrics on X_test
+#         - "best_params": dict of best hyperparameters (Optuna)
+#         - "n_train": int, size of outer train set
+#         - "n_test": int, size of outer test set
+#         - "final_model": fitted model object
+#         - "outer_train_idx": np.ndarray of indices used for train
+#         - "outer_test_idx": np.ndarray of indices used for test
+#         - "y_train": np.ndarray of labels for train
+#         - "y_test": np.ndarray of labels for test
+#         - "y_train_scores": np.ndarray of scores on train
+#         - "y_test_scores": np.ndarray of scores on test
+#     """
+#     cv_cfg = cfg["cv"]
+#     opt_cfg = cfg["optuna"]
+
+
+#     NUM_TRIALS = cv_cfg["num_trials"]
+#     n_outer_splits = cv_cfg["n_outer_splits"]
+#     n_inner_splits = cv_cfg["n_inner_splits"]
+#     N_INNER_OPTUNA_TRIALS = opt_cfg["n_inner_trials"]
+#     OPTUNA_N_JOBS = opt_cfg.get("n_jobs", 1)   # default to sequential if missing
+    
+#     # Enforce that groups are provided when using group-aware splitting
+#     if model_selection == "StratifiedGroupKFold" and groups is None:
+#         raise ValueError(
+#             "model_selection='StratifiedGroupKFold' but groups is None. "
+#             "Provide a groups array or use 'StratifiedKFold'."
+#         )
+
+#     results: List[Dict[str, Any]] = []
+#     cv_tracker = 0
+#     total_outer_folds = NUM_TRIALS * n_outer_splits
+
+#     # ------------------------------------------------------------------
+#     # Outer loop: repeated outer cross-validation
+#     # ------------------------------------------------------------------
+#     for trial_idx in range(NUM_TRIALS):
+#         # Build outer & inner CV based on the chosen strategy
+#         outer_cv, inner_cv = make_outer_inner_cv(
+#             model_selection=model_selection,
+#             n_outer_splits=n_outer_splits,
+#             n_inner_splits=n_inner_splits,
+#             outer_trial_idx=trial_idx,
+#         )
+
+#         print('='*200)
+#         print(f"\n=== Model: {model_name} | Trial {trial_idx + 1}/{NUM_TRIALS} ===")
+#         print('='*200)
+#         outer_fold_idx = 0
+
+#         # Select outer splits depending on whether we have groups or not
+#         if groups is not None:
+#             outer_splits = outer_cv.split(X, y, groups)
+#         else:
+#             outer_splits = outer_cv.split(X, y)
+
+#         # --------------------------------------------------------------
+#         # Loop over outer folds for this trial
+#         # --------------------------------------------------------------
+#         for outer_train_idx, outer_test_idx in outer_splits:
+#             cv_tracker += 1
+#             outer_fold_idx += 1
+#             print(
+#                 f"Outer fold {cv_tracker}/{total_outer_folds} "
+#                 f"(trial {trial_idx}, fold {outer_fold_idx})"
+#             )
+
+#             # Outer train/test split
+#             X_train, X_test = X[outer_train_idx], X[outer_test_idx]
+#             y_train, y_test = y[outer_train_idx], y[outer_test_idx]
+#             groups_train = groups[outer_train_idx] if groups is not None else None
+
+#             # ----------------------------------------------------------
+#             # Inner CV + Optuna hyperparameter tuning on (X_train, y_train)
+#             # ----------------------------------------------------------
+#             study = optuna.create_study(direction=opt_cfg["direction"])
+#             study.optimize(
+#                 lambda tr: objective_with_args(
+#                     tr,
+#                     model_name,
+#                     X_train,
+#                     y_train,
+#                     inner_cv,
+#                     cfg,
+#                     groups_train=groups_train,
+#                 ),
+#                 n_trials=N_INNER_OPTUNA_TRIALS,
+#                 show_progress_bar=True,
+#                 n_jobs=OPTUNA_N_JOBS,
+#             )
+
+#             best_trial = study.best_trial
+
+#             # ----------------------------------------------------------
+#             # Fit final model on the full outer-train set using best params
+#             # ----------------------------------------------------------
+#             final_model,outer_train_metrics,outer_test_metrics, y_train_scores, y_test_scores,= fit_and_evaluate_final_model(model_name=model_name, 
+#                                                                                                                              best_params=best_trial.params, X_train=X_train,
+#                                                                                                                              y_train=y_train, X_test=X_test, y_test=y_test, cfg=cfg, )
+
+#             # ----------------------------------------------------------
+#             # Collect all information for this outer fold
+#             # ----------------------------------------------------------
+#             results.append(
+#                 {
+#                     "model_name": model_name,
+#                     "trial": trial_idx,
+#                     "outer_fold": outer_fold_idx,
+
+#                     # inner CV stats (directly from best_trial)
+#                     "inner_train_scores": best_trial.user_attrs["inner_train_scores"],
+#                     "inner_test_scores": best_trial.user_attrs["inner_test_scores"],
+#                     "inner_train_mean": float(
+#                         best_trial.user_attrs["inner_train_scores"].mean()
+#                     ),
+#                     "inner_train_std": float(
+#                         best_trial.user_attrs["inner_train_scores"].std()
+#                     ),
+#                     "inner_test_mean": float(
+#                         best_trial.user_attrs["inner_test_scores"].mean()
+#                     ),
+#                     "inner_test_std": float(
+#                         best_trial.user_attrs["inner_test_scores"].std()
+#                     ),
+
+#                     # outer performance
+#                     "outer_train_metrics": outer_train_metrics,
+#                     "outer_test_metrics": outer_test_metrics,
+#                     "best_params": best_trial.params,
+#                     "n_train": len(y_train),
+#                     "n_test": len(y_test),
+#                     "final_model": final_model,
+
+#                     # bookkeeping of indices and raw labels/scores
+#                     "outer_train_idx": outer_train_idx,
+#                     "outer_test_idx": outer_test_idx,
+#                     "y_train": y_train,
+#                     "y_test": y_test,
+#                     "y_train_scores": y_train_scores,
+#                     "y_test_scores": y_test_scores,
+#                 }
+#             )
+
+#     return results
 
 
 def summarize_cv_split_sizes(
@@ -2001,6 +2355,7 @@ def plot_performance_curves(
         plt.tight_layout()
         plt.show()
 
+
 def auroc_auprc_curve(
     all_results,
     model_name: str,
@@ -2520,7 +2875,8 @@ def plot_brier_logloss_all_methods(
             estimator=np.mean,
             errorbar=("sd"),
             order=order_labels,
-            palette=split_palette
+            palette=split_palette,
+            saturation=1,
         )
 
         if baseline_value is not None and baseline_label is not None:
@@ -2778,6 +3134,7 @@ def plot_brier_logloss(
             errorbar=("sd"),
             palette=split_palette,
             order=model_labels,
+            saturation=1,
         )
 
         if baseline_value is not None and baseline_label is not None:
@@ -3072,6 +3429,7 @@ def plot_auprc_auroc(
             errorbar=("sd"),                  # mean ± SD
             palette=split_palette,
             order=model_labels,
+            saturation=1,
         )
 
         # Baselines
@@ -3166,18 +3524,1026 @@ def plot_auprc_auroc(
     _plot_df(df_roc, "AUROC", ylim=auroc_ylim)
 
 
+def plot_patient_auprc_auroc(
+    df_pat: pd.DataFrame,
+    *,
+    model_names: str | Sequence[str] | None = None,
+    variants: str | Sequence[str] | None = None,  # e.g. "beta" or ["uncalib","beta"]
+    # score column from pooled_patient_risk_summary (e.g. p_median / p_mean / p_softmax / p_q75)
+    score_col: str = "p_median",
+
+    figsize: tuple[float, float] = (9.0, 4.0),
+    font_size: float = 12.0,
+    legend_loc: str = "best",
+    x_tick_rotation: int = 0,
+
+    # ---- stylistic parity with plot_auprc_auroc ----
+    method_alias: Mapping[str, str] | None = None,          # alias map for *model names*
+    split_palette: dict[str, str] | None = None,            # colors for Train/Test bars
+
+    # ---- baseline / prevalence handling ----
+    show_prevalence_baseline: bool = True,
+    prevalence: float | None = None,  # optional override; if None, compute from df_pat y prevalence
+    auroc_baseline_color: str = "#D5F713",
+    auprc_baseline_color: str = "#D5F713",
+    baseline_lw: float = 1.5,
+    baseline_ls: str = "--",
+
+    # ---- annotation ----
+    annotate_mean_sd: bool = True,
+    annotate_decimals: int = 3,
+    annotate_font_size: float | None = None,
+    annotate_offset: float = 0.015,
+
+    # ---- per-metric y-limits ----
+    auprc_ylim: tuple[float, float] | None = None,
+    auroc_ylim: tuple[float, float] | None = None,
+
+    # ---- split selection (mirrors your split semantics) ----
+    include_test: bool = True,
+    include_train_oof: bool = True,
+    split_label_map: Mapping[str, str] | None = None,  # e.g. {"train_oof": "Train", "test": "Test"}
+) -> None:
+    """
+    Patient-level analog of `plot_auprc_auroc`.
+
+    Input `df_pat` is expected to come from pooled_patient_risk_summary and contain patient-level scores.
+    For mean ± SD error bars to reflect CV variability, `df_pat` should include per-run identifiers
+    (typically: 'trial' and 'outer_fold'), i.e. built with grouping="per_trial_fold".
+
+    If 'trial'/'outer_fold' are absent, the function still works, but SD will be 0 (single score per bar).
+
+    Required columns in df_pat:
+      - model, variant, split, y, and `score_col`
+      - for run-level SD: trial and outer_fold
+    """
+    # -------------------------
+    # Defaults (match plot_auprc_auroc)
+    # -------------------------
+    if method_alias is None:
+        method_alias = {}
+    if split_palette is None:
+        split_palette = {"Train": "darkblue", "Test": "darkred"}
+    for k in ("Train", "Test"):
+        if k not in split_palette:
+            raise ValueError(f"split_palette must contain '{k}'. Got keys: {list(split_palette.keys())}")
+
+    if split_label_map is None:
+        split_label_map = {"train_oof": "Train", "test": "Test"}
+
+    # -------------------------
+    # Basic validation
+    # -------------------------
+    required = {"model", "variant", "split", "y", score_col}
+    missing = required - set(df_pat.columns)
+    if missing:
+        raise KeyError(f"df_pat missing required columns: {sorted(missing)}")
+
+    # Split selection
+    splits: list[str] = []
+    if include_train_oof:
+        splits.append("train_oof")
+    if include_test:
+        splits.append("test")
+    if len(splits) == 0:
+        raise ValueError("No splits selected. Set include_test/include_train_oof to True.")
+
+    d = df_pat[df_pat["split"].isin(splits)].copy()
+    if d.empty:
+        present = sorted(df_pat["split"].dropna().unique().tolist())
+        raise ValueError(f"No rows left after filtering to splits={splits}. Present splits: {present}")
+
+    # Ensure numeric
+    d[score_col] = pd.to_numeric(d[score_col], errors="coerce")
+    d["y"] = pd.to_numeric(d["y"], errors="coerce")
+    d = d.dropna(subset=[score_col, "y"])
+
+    # Map splits to Train/Test display labels (so plotting matches your original)
+    d["split_disp"] = d["split"].map(split_label_map).fillna(d["split"].astype(str))
+
+    # -------------------------
+    # Choose models (match plot_auprc_auroc API)
+    # -------------------------
+    available_models = sorted(d["model"].astype(str).unique().tolist())
+
+    if model_names is None:
+        model_names_list = available_models
+    elif isinstance(model_names, str):
+        model_names_list = [model_names]
+    else:
+        model_names_list = list(model_names)
+
+    missing_models = [m for m in model_names_list if m not in available_models]
+    if missing_models:
+        raise KeyError(
+            f"Model(s) not found in df_pat: {missing_models}. "
+            f"Available: {available_models}"
+        )
+
+    # Display labels for x-axis (aliasing only affects labels)
+    model_labels = [method_alias.get(m, m) for m in model_names_list]
+    if len(set(model_labels)) != len(model_labels):
+        dupes = pd.Series(model_labels)[pd.Series(model_labels).duplicated(keep=False)].unique().tolist()
+        raise ValueError(
+            f"method_alias causes duplicate model labels {dupes}. "
+            f"Make aliases unique (or omit aliasing for colliding model names)."
+        )
+
+    # Apply model filter + convert model to display label
+    d = d[d["model"].isin(model_names_list)].copy()
+    d["model_disp"] = d["model"].map(lambda m: method_alias.get(m, m))
+
+    # -------------------------
+    # Variant selection (optional)
+    # -------------------------
+    if variants is None:
+        variants_list = sorted(d["variant"].astype(str).unique().tolist())
+    elif isinstance(variants, str):
+        variants_list = [variants]
+    else:
+        variants_list = list(variants)
+
+    d = d[d["variant"].isin(variants_list)].copy()
+    if d.empty:
+        raise ValueError(f"No rows left after filtering to variants={variants_list}.")
+
+    # -------------------------
+    # Prevalence baseline (AUPRC only)
+    # -------------------------
+    p_mean: float | None = None
+    if show_prevalence_baseline:
+        if prevalence is not None:
+            p_mean = float(prevalence)
+        else:
+            # Compute prevalence from the *filtered* data (consistent with what you're plotting)
+            y_vals = d["y"].to_numpy(dtype=float)
+            if y_vals.size == 0:
+                raise ValueError("Cannot compute prevalence baseline: no y values.")
+            p_mean = float(np.mean(y_vals))
+
+    # -------------------------
+    # Metric computation helper (patient-level, per run if available)
+    # -------------------------
+    have_runs = {"trial", "outer_fold"}.issubset(d.columns)
+
+    def _metric_df(metric: Literal["AUPRC", "AUROC"]) -> pd.DataFrame:
+        """
+        Build a tidy df with rows:
+          model_disp, split_disp, score
+        where score is computed per-run if possible.
+        """
+        rows: list[dict[str, Any]] = []
+
+        # group for metric computation:
+        # - always separate by model/variant/split
+        # - if run columns exist: compute one score per (trial, outer_fold)
+        base_keys = ["model_disp", "variant", "split_disp"]
+        run_keys = base_keys + (["trial", "outer_fold"] if have_runs else [])
+
+        for keys, gdf in d.groupby(run_keys, sort=False):
+            y_true = gdf["y"].to_numpy(dtype=int)
+            y_score = gdf[score_col].to_numpy(dtype=float)
+
+            # metric undefined if single class
+            if np.unique(y_true).size < 2:
+                score = np.nan
+            else:
+                if metric == "AUROC":
+                    score = float(roc_auc_score(y_true, y_score))
+                else:
+                    score = float(average_precision_score(y_true, y_score))
+
+            row = dict(zip(run_keys, keys if isinstance(keys, tuple) else (keys,)))
+            row["score"] = score
+            rows.append(row)
+
+        df = pd.DataFrame(rows).dropna(subset=["score"])
+        df["metric"] = metric
+        return df
+
+    # Compute tidy per-run metric tables
+    df_ap = _metric_df("AUPRC")
+    df_roc = _metric_df("AUROC")
+
+    # Title suffix (match your style)
+    # If you pass multiple variants, you're effectively plotting pooled metrics across those variants;
+    # usually you'd plot one variant at a time. We'll include it in the title if single variant.
+    # if len(variants_list) == 1:
+    #     title_suffix = f" (patient-level; variant: {variants_list[0]}; score={score_col})"
+    # else:
+    #     title_suffix = f" (patient-level; variants: {', '.join(map(str, variants_list))}; score={score_col})"
+
+    title_suffix = ''
+    sns.set(style="whitegrid")
+
+    # -------------------------
+    # Plot helper (copied structure from plot_auprc_auroc)
+    # -------------------------
+    def _plot_df(
+        df: pd.DataFrame,
+        metric_name: Literal["AUPRC", "AUROC"],
+        ylim: tuple[float, float] | None = None,
+    ) -> None:
+        # IMPORTANT: x-axis should be model only (like your original)
+        # If you want separate bars per variant too, we can extend later.
+        # For now, assume you're plotting one variant at a time.
+        df_plot = df.copy()
+
+        if df_plot["variant"].nunique() > 1:
+            # Guardrail: your original plot assumes just model on x-axis.
+            # You can still proceed, but you'll be mixing variants.
+            # Better: call the function with variants="beta" etc.
+            pass
+
+        plt.figure(figsize=figsize)
+        ax = sns.barplot(
+            data=df_plot,
+            x="model_disp",
+            y="score",
+            hue="split_disp",
+            hue_order=["Train", "Test"],      # lock ordering for annotation
+            estimator=np.mean,
+            errorbar=("sd"),                  # mean ± SD (across runs)
+            palette=split_palette,
+            order=model_labels,
+            saturation=1,
+        )
+
+        # Baselines
+        if metric_name == "AUPRC" and show_prevalence_baseline and p_mean is not None:
+            ax.axhline(
+                float(p_mean),
+                ls=baseline_ls,
+                lw=baseline_lw,
+                color=auprc_baseline_color,
+                label=f"Baseline = {float(p_mean):.2f}",
+            )
+
+        if metric_name == "AUROC":
+            ax.axhline(
+                0.5,
+                ls=baseline_ls,
+                lw=baseline_lw,
+                color=auroc_baseline_color,
+                label="Baseline = 0.50",
+            )
+
+        ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
+        ax.set_ylabel(metric_name, fontsize=font_size, fontweight="bold")
+        ax.set_title(
+            f"{metric_name} across models{title_suffix}",
+            fontsize=font_size + 2,
+            fontweight="bold",
+        )
+
+        ax.tick_params(axis="both", labelsize=font_size)
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontweight("bold")
+
+        ax.tick_params(axis="x", rotation=x_tick_rotation)
+
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+
+        # -------------------------
+        # Annotate mean ± SD above each bar
+        # -------------------------
+        if annotate_mean_sd:
+            summary = (
+                df_plot.groupby(["model_disp", "split_disp"])["score"]
+                .agg(mean="mean", sd=lambda x: np.std(x, ddof=1))
+                .reset_index()
+            )
+            summary["sd"] = summary["sd"].fillna(0.0)
+
+            stats = {
+                (r["model_disp"], r["split_disp"]): (float(r["mean"]), float(r["sd"]))
+                for _, r in summary.iterrows()
+            }
+
+            ann_fs = annotate_font_size if annotate_font_size is not None else max(8, float(font_size) - 3)
+            offset = float(annotate_offset)
+
+            # containers[0] = Train bars, containers[1] = Test bars (because hue_order is locked)
+            for split, container in zip(["Train", "Test"], ax.containers[:2]):
+                for model_label, bar in zip(model_labels, container):
+                    # If a (model, split) combo isn't present (e.g. no train_oof), skip safely.
+                    if (model_label, split) not in stats:
+                        continue
+                    mean, sd = stats[(model_label, split)]
+                    x = bar.get_x() + bar.get_width() / 2.0
+                    y = mean + sd + offset
+                    ax.text(
+                        x, y,
+                        f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+                        ha="center", va="bottom",
+                        fontsize=ann_fs, fontweight="bold",
+                    )
+
+            top = max(m + s for (m, s) in stats.values()) + offset + 0.05 if stats else 1.0
+            if ylim is None:
+                y0, y1 = ax.get_ylim()
+                ax.set_ylim(y0, max(y1, max(1.05, top)))
+        else:
+            if ylim is None:
+                ax.set_ylim(0.0, 1.05)
+
+        ax.legend(title="", loc=legend_loc, prop={"size": font_size, "weight": "bold"})
+        plt.tight_layout()
+        plt.show()
+
+    _plot_df(df_ap, "AUPRC", ylim=auprc_ylim)
+    _plot_df(df_roc, "AUROC", ylim=auroc_ylim)
+
+
+
+def barplot_balanced_accuracy(
+    all_results: Mapping[str, Sequence[Mapping[str, Any]]],
+    model_names: str | Sequence[str] | None = None,
+    use_calibrated: bool = False,
+    calibration_method: str | None = None,
+    n_grid: int = 101,
+    mode: Literal["train_threshold", "test_threshold", "split_best"] = "train_threshold",
+    # ---- labels / aliasing ----
+    method_alias: Mapping[str, str] | None = None,
+    # ---- styling ----
+    figsize: tuple[float, float] = (9.0, 5.0),
+    font_size: float = 12.0,
+    legend_loc: str = "best",
+    x_tick_rotation: int = 0,
+    split_palette: Mapping[str, str] | None = None,  # {"Train": "...", "Test": "..."}
+    bar_width: float = 0.36,
+    capsize: float = 5.0,
+    # ---- baseline ----
+    show_baseline: bool = True,
+    baseline_value: float = 0.50,
+    baseline_color: str = "#D5F713",
+    baseline_lw: float = 1.5,
+    baseline_ls: str = "--",
+    # ---- annotation ----
+    annotate_mean_sd: bool = True,
+    annotate_decimals: int = 3,
+    annotate_font_size: float | None = None,
+    annotate_offset: float = 0.015,
+    # ---- y limits ----
+    ylim: tuple[float, float] | None = None,
+    # ---- console threshold summary ----
+    print_threshold_summary: bool = True,
+) -> None:
+    """
+    Plot balanced accuracy across outer folds as a grouped bar chart (Train vs Test) for one or
+    more models, summarizing performance as mean ± SD across folds.
+
+    This function is intended to work with your nested-CV `all_results` structure where each
+    model maps to a list of per-(trial, outer_fold) dictionaries containing y labels and score
+    vectors (and optionally calibrated scores).
+
+    What is computed
+    ----------------
+    For each model and each fold dictionary `r`:
+      1) Retrieve (y_train, score_train) and (y_test, score_test) from `r`.
+      2) Convert scores to hard predictions using thresholds on a fixed grid in [0, 1].
+      3) Compute balanced accuracy:
+            BA = (TPR + TNR) / 2
+         where TPR is sensitivity and TNR is specificity.
+      4) Aggregate fold-level balanced accuracy values across folds and display:
+            mean ± SD
+
+    Threshold selection modes
+    -------------------------
+    mode="train_threshold":
+        For each fold, choose a threshold t* that maximizes BA on the TRAIN split for that fold,
+        then evaluate BA on both train and test using that same t*.
+        This is the recommended “train-chosen threshold” summary.
+
+    mode="test_threshold":
+        For each fold, choose a threshold t* that maximizes BA on the TEST split for that fold,
+        then evaluate BA on both train and test using that same t*.
+        This is optimistic (uses test labels to pick thresholds) and is best used for diagnostic
+        or “ceiling” comparisons.
+
+    mode="split_best":
+        For each fold, choose thresholds independently for train and test:
+            Train bar uses max_t BA_train(t)
+            Test  bar uses max_t BA_test(t)
+        This is explicitly post hoc (a per-split upper bound), useful for visualization.
+
+    Score sources
+    -------------
+    If use_calibrated=False:
+        Train: r["y_train"], r["y_train_scores"]
+        Test : r["y_test"],  r["y_test_scores"]
+
+    If use_calibrated=True:
+        `calibration_method` is required and scores are taken from:
+        Train: r[f"cv_calib_train_predictions_{calibration_method}"], with y_train
+        Test : r[f"calib_test_predictions_{calibration_method}"],     with y_test
+
+    Plot contents
+    -------------
+    - Two bars per model: Train and Test.
+    - Error bars show ±1 SD across folds.
+    - Optional horizontal baseline line (default: 0.50) for reference.
+    - Optional annotation above each bar showing "mean ± SD".
+
+    Parameters
+    ----------
+    all_results:
+        Nested-CV results keyed by model name; each value is a list of fold dicts.
+
+    model_names:
+        Model(s) to plot:
+          - None: plot all models in `all_results`
+          - str: plot one model
+          - sequence[str]: plot multiple models
+
+    use_calibrated / calibration_method:
+        If use_calibrated=True, calibration_method must be provided (e.g., "beta") and the
+        calibrated prediction keys must exist in the fold dicts.
+
+    n_grid:
+        Number of thresholds in the uniform grid over [0, 1].
+
+    mode:
+        Threshold selection strategy ("train_threshold", "test_threshold", "split_best").
+
+    method_alias:
+        Optional mapping from internal model keys to display labels on the x-axis.
+
+    split_palette:
+        Optional colors for bars, e.g. {"Train": "#138CFD", "Test": "#000000"}.
+
+    show_baseline / baseline_value / baseline_color / baseline_lw / baseline_ls:
+        Control the horizontal baseline reference line.
+
+    annotate_mean_sd / annotate_decimals / annotate_font_size / annotate_offset:
+        Controls for the "mean ± SD" text annotations.
+
+    ylim:
+        Optional y-axis limits (ymin, ymax). If None, limits are chosen automatically and may
+        expand to avoid clipping annotations.
+
+    print_threshold_summary:
+        If True and mode is "train_threshold" or "test_threshold", print mean ± SD of selected
+        thresholds (t*) across folds for each model.
+
+    Returns
+    -------
+    None
+        Displays a matplotlib figure.
+    """
+    # -------------------------
+    # Defaults / validation
+    # -------------------------
+    if use_calibrated and calibration_method is None:
+        raise ValueError("calibration_method must be provided when use_calibrated=True.")
+    if mode not in {"train_threshold", "test_threshold", "split_best"}:
+        raise ValueError("mode must be 'train_threshold', 'test_threshold', or 'split_best'.")
+
+    if method_alias is None:
+        method_alias = {}
+    if split_palette is None:
+        split_palette = {"Train": "darkblue", "Test": "darkred"}
+    if "Train" not in split_palette or "Test" not in split_palette:
+        raise ValueError("split_palette must contain keys 'Train' and 'Test'.")
+
+    # -------------------------
+    # Choose models
+    # -------------------------
+    if model_names is None:
+        selected = list(all_results.keys())
+    elif isinstance(model_names, str):
+        selected = [model_names]
+    else:
+        selected = list(model_names)
+
+    missing = [m for m in selected if m not in all_results]
+    if missing:
+        raise KeyError(
+            f"Model(s) not found in all_results: {missing}. Available: {list(all_results.keys())}"
+        )
+
+    # display labels + uniqueness check
+    model_labels = [method_alias.get(m, m) for m in selected]
+    if len(set(model_labels)) != len(model_labels):
+        # find duplicates
+        seen = set()
+        dupes = sorted({x for x in model_labels if (x in seen) or seen.add(x) is None and False})  # type: ignore
+        # the trick above is messy; just do a clean count:
+        dupes = sorted({x for x in model_labels if model_labels.count(x) > 1})
+        raise ValueError(
+            f"method_alias causes duplicate model labels: {dupes}. Make aliases unique."
+        )
+
+    grid = np.linspace(0.0, 1.0, int(n_grid))
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _get_y_and_scores(r: Mapping[str, Any], split: Literal["train", "test"]) -> tuple[np.ndarray, np.ndarray]:
+        if not use_calibrated:
+            y_key = "y_train" if split == "train" else "y_test"
+            s_key = "y_train_scores" if split == "train" else "y_test_scores"
+        else:
+            y_key = "y_train" if split == "train" else "y_test"
+            s_key = (
+                f"cv_calib_train_predictions_{calibration_method}"
+                if split == "train"
+                else f"calib_test_predictions_{calibration_method}"
+            )
+
+        if y_key not in r or s_key not in r:
+            raise KeyError(f"Missing keys '{y_key}'/'{s_key}' in fold record.")
+        return np.asarray(r[y_key]), np.asarray(r[s_key])
+
+    def _best_ba_and_t(y: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+        ba = np.array([balanced_accuracy_score(y, (s >= t).astype(int)) for t in grid], dtype=float)
+        j = int(np.argmax(ba))
+        return float(ba[j]), float(grid[j])
+
+    # -------------------------
+    # Compute per-fold BA for each model
+    # -------------------------
+    train_vals_per_model: list[np.ndarray] = []
+    test_vals_per_model: list[np.ndarray] = []
+    tstars_per_model: list[np.ndarray] = []
+
+    for model in selected:
+        folds = all_results[model]
+
+        train_ba: list[float] = []
+        test_ba: list[float] = []
+        tstars: list[float] = []
+
+        for r in folds:
+            try:
+                y_tr, s_tr = _get_y_and_scores(r, "train")
+                y_te, s_te = _get_y_and_scores(r, "test")
+            except KeyError:
+                continue
+
+            if mode == "split_best":
+                ba_tr, _ = _best_ba_and_t(y_tr, s_tr)
+                ba_te, _ = _best_ba_and_t(y_te, s_te)
+                train_ba.append(ba_tr)
+                test_ba.append(ba_te)
+            else:
+                if mode == "train_threshold":
+                    _, t_star = _best_ba_and_t(y_tr, s_tr)
+                else:  # test_threshold
+                    _, t_star = _best_ba_and_t(y_te, s_te)
+
+                tstars.append(t_star)
+                train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_star).astype(int)))
+                test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_star).astype(int)))
+
+        if len(train_ba) == 0:
+            raise ValueError(
+                f"No usable folds found for model '{model}'. "
+                "Check expected score keys for chosen calibration settings."
+            )
+
+        train_vals_per_model.append(np.array(train_ba, dtype=float))
+        test_vals_per_model.append(np.array(test_ba, dtype=float))
+        tstars_per_model.append(np.array(tstars, dtype=float))
+
+    # summarize mean/sd
+    train_means = np.array([v.mean() for v in train_vals_per_model], dtype=float)
+    test_means = np.array([v.mean() for v in test_vals_per_model], dtype=float)
+    train_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in train_vals_per_model], dtype=float)
+    test_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in test_vals_per_model], dtype=float)
+
+    # -------------------------
+    # Plot
+    # -------------------------
+
+
+    x = np.arange(len(model_labels), dtype=float)
+    width = float(bar_width)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    bars_train = ax.bar(
+        x - width / 2,
+        train_means,
+        width,
+        yerr=train_sds,
+        capsize=capsize,
+        color=split_palette["Train"],
+        label="Train",
+    )
+    bars_test = ax.bar(
+        x + width / 2,
+        test_means,
+        width,
+        yerr=test_sds,
+        capsize=capsize,
+        color=split_palette["Test"],
+        label="Test",
+    )
+
+    baseline_handle = None
+    if show_baseline:
+        baseline_handle = ax.axhline(
+            float(baseline_value),
+            linestyle=baseline_ls,
+            linewidth=baseline_lw,
+            color=baseline_color,
+            label=f"Baseline = {baseline_value:.2f}",
+        )
+
+    # ---- labels / title (Option A title) ----
+    ax.set_title(
+        "Balanced accuracy across folds",
+        fontsize=font_size + 1,
+        fontweight="bold",
+    )
+    ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
+    ax.set_ylabel("Balanced accuracy", fontsize=font_size, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_labels, fontsize=font_size, fontweight="bold", rotation=x_tick_rotation)
+    ax.tick_params(axis="y", labelsize=font_size)
+    for lab in ax.get_yticklabels():
+        lab.set_fontweight("bold")
+
+    # ---- annotations (bold) ----
+    if annotate_mean_sd:
+        ann_fs = annotate_font_size if annotate_font_size is not None else max(8.0, float(font_size) - 3.0)
+        offset = float(annotate_offset)
+
+        def _annotate(bars, means, sds):
+            for bar, mean, sd in zip(bars, means, sds):
+                x0 = bar.get_x() + bar.get_width() / 2.0
+                y0 = float(mean) + float(sd) + offset
+                ax.text(
+                    x0,
+                    y0,
+                    f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=ann_fs,
+                    fontweight="bold",
+                )
+
+        _annotate(bars_train, train_means, train_sds)
+        _annotate(bars_test, test_means, test_sds)
+
+    # ---- y-lims (same as before) ----
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+    else:
+        top = max(
+            float(np.max(train_means + train_sds)),
+            float(np.max(test_means + test_sds)),
+            float(baseline_value) if show_baseline else 0.0,
+        )
+        pad = 0.08 if annotate_mean_sd else 0.05
+        ax.set_ylim(0.0, min(1.10, top + pad))
+
+    # ---- legend order: Train, Test, Baseline ----
+    handles, labels = ax.get_legend_handles_labels()
+
+    handle_map = {lab: h for h, lab in zip(handles, labels)}
+    ordered_labels = ["Train", "Test"]
+    if show_baseline:
+        ordered_labels.append(f"Baseline = {baseline_value:.2f}")
+
+    ordered_handles = [handle_map[lbl] for lbl in ordered_labels if lbl in handle_map]
+
+    leg = ax.legend(
+        ordered_handles,
+        ordered_labels,
+        loc=legend_loc,
+        frameon=True,
+        prop={"size": font_size, "weight": "bold"},
+        title="",
+    )
+
+    fig.tight_layout()
+    plt.show()
+
+
+    # -------------------------
+    # Optional: print threshold summary
+    # -------------------------
+    if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
+        print("Per-model selected threshold summary (mean ± SD across folds):")
+        for label, tarr in zip(model_labels, tstars_per_model):
+            if tarr.size == 0:
+                print(f"  {label}: (no thresholds computed)")
+                continue
+            t_mean = float(np.mean(tarr))
+            t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+            print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
+
+
+
 
 
 
 # --------------------------------------------------------------
 # Calibration 
 # --------------------------------------------------------------
+def calibrate_nested_cv_results(
+    all_results: Dict[str, List[Dict[str, Any]]],
+    bundle: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    *,
+    x_key: str = "combined_X_raw",
+    y_key: str = "combined_y",
+    groups_key: Optional[str] = None,
+    model_selection: str = "StratifiedKFold",
+    n_splits: int = 5,
+    calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Calibrate nested-CV models (per outer fold) using out-of-fold (OOF) probabilities
+    computed on the OUTER-TRAIN split, while respecting per-model feature selection.
 
-# # Old COMPLEX CALIBRATION METHOD
-# CalibSpec = Union[
-#     Callable[[], Any],
-#     Tuple[Any, Dict[str, Any]],
-# ]
+    Why this function exists
+    ------------------------
+    After nested CV, each fold dict in `all_results[model_name]` contains:
+      - a tuned + fitted estimator under "final_model"
+      - "outer_train_idx" and "outer_test_idx" (row indices into the dataset level used)
+      - uncalibrated test probabilities under "y_test_scores"
+
+    To calibrate probabilities, we need *training* probabilities that are:
+      - out-of-fold (OOF) on the outer-train set (to avoid fitting calibrators on in-fold predictions)
+      - produced by a model that sees the exact same feature space that the final model expects
+
+    With your new setup, each model can use its own feature subset (via config). Therefore
+    we must:
+      1) start from the *superset* X in the bundle (defined by x_key)
+      2) slice columns ONCE per model (using prepare_training_bundle and config)
+      3) slice rows per fold using outer_train_idx / outer_test_idx
+
+    Behavior / outputs
+    ------------------
+    For every (model_name, fold_dict) in all_results:
+      - Stores OOF uncalibrated train probabilities:
+            r["cv_uncalib_train_predictions"]  -> shape (n_train,)
+
+      - For each calibration method requested, fits a calibrator on the OOF train probs and y_train,
+        then produces calibrated train + test probabilities:
+
+        If "platt":
+            r["calibration_method_platt"] = "platt"
+            r["calibrator_platt"] = fitted LogisticRegression
+            r["cv_calib_train_predictions_platt"] -> calibrated OOF train probs
+            r["calib_test_predictions_platt"] -> calibrated outer-test probs
+
+        If "beta":
+            r["calibration_method_beta"] = "beta"
+            r["calibrator_beta"] = fitted BetaCalibration
+            r["cv_calib_train_predictions_beta"] -> calibrated OOF train probs
+            r["calib_test_predictions_beta"] -> calibrated outer-test probs
+
+    Notes
+    -----
+    - This function does NOT refit the model on the full outer-train split. It only uses
+      cross_val_predict(clone(final_model)) to generate OOF train probabilities, and then
+      fits calibrators on those probabilities.
+    - Test calibration is applied to r["y_test_scores"] (already produced by the fitted final_model
+      during nested CV), so we do not need X_test to calibrate.
+    - If model_selection == "StratifiedGroupKFold", you must pass groups_key so groups can be
+      reconstructed on the outer-train rows for cross_val_predict.
+    """
+    # ------------------------------------------------------------------
+    # 0) Handle calibration method selection + validation
+    # ------------------------------------------------------------------
+    if calibration_methods is None:
+        calibration_methods = ["platt"]  # default behavior
+
+    if len(calibration_methods) == 0:
+        raise ValueError("calibration_methods must contain at least one method.")
+
+    # normalize user input
+    calibration_methods = [m.lower() for m in calibration_methods]
+
+    # validate supported methods
+    supported = {"platt", "beta"}
+    unknown = set(calibration_methods) - supported
+    if unknown:
+        raise ValueError(
+            f"Unsupported calibration methods: {unknown}. Supported methods: {supported}."
+        )
+
+    # ------------------------------------------------------------------
+    # 1) Pull the correct dataset level from the bundle (superset X/y)
+    # ------------------------------------------------------------------
+    if x_key not in bundle:
+        raise KeyError(f"bundle missing x_key='{x_key}'")
+    if y_key not in bundle:
+        raise KeyError(f"bundle missing y_key='{y_key}'")
+
+    # IMPORTANT:
+    # - X_full is the *superset* feature matrix at the dataset level specified by x_key
+    # - feature_names_full must correspond to the columns of X_full
+    X_full = np.asarray(bundle[x_key])
+    y = np.asarray(bundle[y_key])
+
+    if X_full.ndim != 2:
+        raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
+    if X_full.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
+        )
+
+    # Choose which feature-names key to use.
+    # If you have separate names for aggregated features, prefer those.
+    feature_names_key = "feature_names"
+    if str(x_key).startswith("combined_"):
+        if "combined_feature_names" in bundle:
+            feature_names_key = "combined_feature_names"
+
+    if feature_names_key not in bundle:
+        raise KeyError(
+            f"bundle missing '{feature_names_key}'. Needed to map names->columns for feature slicing."
+        )
+
+    feature_names_full = list(bundle[feature_names_key])
+    if X_full.shape[1] != len(feature_names_full):
+        raise ValueError(
+            f"Mismatch: bundle[{x_key}] has {X_full.shape[1]} cols but "
+            f"bundle[{feature_names_key}] has {len(feature_names_full)} names."
+        )
+
+    # Optional group labels at the same dataset level (needed only for StratifiedGroupKFold)
+    groups_all: Optional[np.ndarray] = None
+    if groups_key is not None:
+        if groups_key not in bundle:
+            raise KeyError(f"bundle missing groups_key='{groups_key}'")
+        groups_all = np.asarray(bundle[groups_key])
+        if groups_all.ndim != 1:
+            raise ValueError(f"bundle[{groups_key}] must be 1D, got shape {groups_all.shape}")
+        if len(groups_all) != len(y):
+            raise ValueError(
+                f"groups/y mismatch for key {groups_key}: len(groups)={len(groups_all)} vs len(y)={len(y)}"
+            )
+
+    # ------------------------------------------------------------------
+    # 2) Loop over models; for each model slice X_full -> X_model ONCE
+    # ------------------------------------------------------------------
+    for model_name, folds in all_results.items():
+        # Ensure this model exists in config
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+
+        m_cfg = cfg["models"][model_name]
+
+        # Per-model feature selection knobs (same as training):
+        #   - either a list of feature names OR an integer n_features (prefix mode)
+        keep_features_cfg = m_cfg.get("feature_names", None)  # list[str] | None
+        n_features_cfg = m_cfg.get("n_features", None)        # int | None
+
+        # If your nested CV stored the exact feature names used, prefer those.
+        # This protects you if config changes later.
+        keep_features_from_results: Optional[List[str]] = None
+        if len(folds) > 0 and "feature_names" in folds[0]:
+            keep_features_from_results = list(folds[0]["feature_names"])
+
+        if keep_features_from_results is not None:
+            keep_features = keep_features_from_results
+            n_features_model = None
+        else:
+            keep_features = keep_features_cfg
+            n_features_model = n_features_cfg
+
+        # Do not allow both selection methods at once (ambiguous)
+        if keep_features is not None and n_features_model is not None:
+            raise ValueError(
+                f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
+            )
+
+        # Build the "view bundle" expected by prepare_training_bundle
+        view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
+
+        # Slice columns ONCE per model to match the model's trained feature space
+        if keep_features is not None or n_features_model is not None:
+            mb = prepare_training_bundle(
+                view_bundle,
+                n_features=n_features_model,
+                keep_features=keep_features,
+                strict=m_cfg.get("feature_strict", True),
+                dedupe=True,
+                copy_bundle=True,
+            )
+        else:
+            mb = view_bundle  # no slicing requested
+
+        X_model = np.asarray(mb["X_raw"])                 # shape: (n_samples, D_model)
+        feature_names_model = list(mb["feature_names"])   # length: D_model
+
+        # ------------------------------------------------------------------
+        # 3) Loop over outer folds for this model and perform calibration
+        # ------------------------------------------------------------------
+        for r in folds:
+            outer_train_idx = r["outer_train_idx"]
+            outer_test_idx = r["outer_test_idx"]
+
+            # Outer-train subset (rows only; columns already model-specific)
+            X_train = X_model[outer_train_idx]   # shape: (n_train, D_model)
+            y_train = y[outer_train_idx]         # shape: (n_train,)
+
+            # NOTE:
+            # We don't need X_test to apply calibration, because we calibrate the
+            # already-stored uncalibrated test probabilities in r["y_test_scores"].
+            # X_test = X_model[outer_test_idx]
+            # y_test = y[outer_test_idx]
+
+            # Groups only matter if using StratifiedGroupKFold
+            groups_train = None
+            if (groups_all is not None) and (model_selection == "StratifiedGroupKFold"):
+                groups_train = groups_all[outer_train_idx]
+
+            # Clone the final tuned estimator (unfitted) to generate OOF train probs
+            final_model = r["final_model"]
+            clf = clone(final_model)
+
+            # Build a "regular CV" splitter (not nested) just to produce OOF predictions
+            _, inner_cv = make_outer_inner_cv(
+                model_selection=model_selection,
+                n_outer_splits=n_splits,   # arbitrary but valid
+                n_inner_splits=n_splits,   # K folds for OOF prediction
+                outer_trial_idx=r["trial"],  # seed for reproducibility
+            )
+
+            # cross_val_predict supports passing groups via keyword
+            cv_kwargs = {}
+            if groups_train is not None:
+                cv_kwargs["groups"] = groups_train
+
+            # OOF predicted probabilities for the positive class on outer-train
+            cv_probs_train = cross_val_predict(
+                clf,
+                X_train,
+                y_train,
+                cv=inner_cv,
+                method="predict_proba",
+                **cv_kwargs,
+            )
+            cv_uncalib_train_predictions = cv_probs_train[:, 1]
+            r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
+
+            # Uncalibrated outer-test probabilities from nested CV training step
+            testset_preds_uncalib = r["y_test_scores"]
+
+            # Store some traceability metadata
+            r["calib_x_key"] = x_key
+            r["calib_y_key"] = y_key
+            r["calib_feature_names_key"] = feature_names_key
+            r["calib_feature_names"] = feature_names_model
+
+            # --------------------------------------------------------------
+            # 4) Fit calibrators on (OOF train probs, y_train) and apply
+            # --------------------------------------------------------------
+            if "platt" in calibration_methods:
+                # Platt scaling: logistic regression on the 1D score
+                calibrator_platt = LogisticRegression(
+                    C=np.inf, solver="lbfgs", max_iter=200000
+                )
+                calibrator_platt.fit(
+                    cv_uncalib_train_predictions.reshape(-1, 1),
+                    y_train,
+                )
+
+                r["calibration_method_platt"] = "platt"
+                r["calibrator_platt"] = calibrator_platt
+
+                # Calibrated OOF train probabilities
+                r["cv_calib_train_predictions_platt"] = calibrator_platt.predict_proba(
+                    cv_uncalib_train_predictions.reshape(-1, 1)
+                )[:, 1]
+
+                # Calibrated outer-test probabilities (apply to uncalibrated test scores)
+                r["calib_test_predictions_platt"] = calibrator_platt.predict_proba(
+                    testset_preds_uncalib.reshape(-1, 1)
+                )[:, 1]
+
+            if "beta" in calibration_methods:
+                # Beta calibration on the 1D score
+                calibrator_beta = BetaCalibration(parameters="abm")
+                calibrator_beta.fit(
+                    cv_uncalib_train_predictions,
+                    y_train,
+                )
+
+                r["calibration_method_beta"] = "beta"
+                r["calibrator_beta"] = calibrator_beta
+
+                r["cv_calib_train_predictions_beta"] = calibrator_beta.predict(
+                    cv_uncalib_train_predictions
+                )
+                r["calib_test_predictions_beta"] = calibrator_beta.predict(
+                    testset_preds_uncalib
+                )
+
+    return all_results
+
+
 # def calibrate_nested_cv_results(
 #     all_results: Dict[str, List[Dict[str, Any]]],
 #     X: np.ndarray,
@@ -3185,223 +4551,82 @@ def plot_auprc_auroc(
 #     model_selection: str = "StratifiedKFold",
 #     n_splits: int = 5,
 #     groups: Optional[np.ndarray] = None,
-#     eps: float = 1e-12,
-#     calibration_config: Optional[Dict[str, CalibSpec]] = None,
+#     calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
 # ) -> Dict[str, List[Dict[str, Any]]]:
 #     """
-#     Calibrate stored nested-CV model outputs (per model/trial/outer_fold) using a set of
-#     user-specified calibrators (baseline + SmartCal), driven entirely by `calibration_config`.
+#     For each (model, trial, outer_fold) entry in all_results, reconstruct the
+#     outer-train split and compute out-of-fold predicted probabilities via
+#     regular cross-validation (no nesting), then calibrate them using one or
+#     more calibration methods.
 
-#     This function:
-#       1) Reconstructs the outer-train split for each stored result entry.
-#       2) Computes out-of-fold (OOF) *uncalibrated* predicted probabilities on the outer-train split
-#          using cross_val_predict (regular CV, no nesting).
-#       3) Fits each calibrator on those OOF train predictions (vs y_train).
-#       4) Applies the fitted calibrator to:
-#            - the OOF train predictions (to store calibrated OOF train predictions)
-#            - the stored outer-test uncalibrated predictions (to store calibrated test predictions)
+#     Always stores uncalibrated OOF train probabilities as:
 
-#     Parameters
-#     ----------
-#     all_results:
-#         Dict mapping model_name -> list of result dicts. Each result dict must include:
-#           - "outer_train_idx": indices for the outer-train split
-#           - "outer_test_idx" : indices for the outer-test split
-#           - "trial"          : integer used for reproducible CV splitting
-#           - "final_model"    : a fitted (or at least fully specified) estimator to clone and CV-fit
-#           - "y_test_scores"  : uncalibrated test predictions (positive-class probabilities) from nested CV
+#         - "cv_uncalib_train_predictions": np.ndarray of shape (n_train,)
 
-#         This function MUTATES each result dict in-place by adding keys like:
-#           - "cv_uncalib_train_predictions" (always)
-#           - "calibrator_<method>"
-#           - "cv_calib_train_predictions_<method>"
-#           - "calib_test_predictions_<method>"
-#           - plus some baseline keys ("calibrator_platt", "calibrator_beta", etc.)
+#     For each method in calibration_methods, performs calibration and stores:
 
-#     X:
-#         Full feature matrix aligned with the indices stored in all_results (outer_train_idx / outer_test_idx).
+#       If "platt" in calibration_methods:
+#         - "calibration_method_platt"               : str, "platt"
+#         - "calibrator_platt"                       : fitted LogisticRegression
+#         - "cv_calib_train_predictions_platt"       : calibrated probs (train, OOF)
+#         - "calib_test_predictions_platt"           : calibrated probs (test)
 
-#     y:
-#         Full label array aligned with X.
-
-#     model_selection:
-#         CV strategy name passed into your `make_outer_inner_cv`. If you use groups,
-#         set this to "StratifiedGroupKFold" and provide `groups`.
-
-#     n_splits:
-#         Number of splits for the "regular CV" used to generate OOF predictions on the outer-train split.
-
-#     groups:
-#         Optional grouping labels aligned with X/y. Only used when model_selection == "StratifiedGroupKFold".
-
-#     eps:
-#         Numeric stability constant used when clipping probabilities away from {0,1} before:
-#           - converting probabilities to 2-col probability matrices [1-p, p]
-#           - converting probabilities to binary logits [0, logit(p)]
-
-#     calibration_config:
-#         Dict defining which calibrators to run and their parameters.
-#         The keys are method names from the supported set, e.g.:
-#           - "platt", "beta"  (baseline calibrators)
-#           - "smartcal_temperature", "smartcal_histogram", ...
-
-#         Each value can be either:
-#           (A) a FACTORY function returning a new calibrator instance each fold:
-#                 "smartcal_temperature": lambda: TemperatureScalingCalibrator(...)
-#           (B) a (Class, kwargs) tuple:
-#                 "smartcal_histogram": (HistogramCalibrator, {"calibrator_type":"HISTOGRAM", ...})
-
-#         IMPORTANT: do NOT pass a single instantiated calibrator object here unless you are
-#         absolutely sure it will not be reused across folds. Calibrators are stateful after fit().
-
-#     Returns
-#     -------
-#     all_results:
-#         The same dict passed in, mutated in-place with added calibration outputs.
+#       If "beta" in calibration_methods:
+#         - "calibration_method_beta"                : str, "beta"
+#         - "calibrator_beta"                        : fitted BetaCalibration
+#         - "cv_calib_train_predictions_beta"        : calibrated probs (train, OOF)
+#         - "calib_test_predictions_beta"            : calibrated probs (test)
 #     """
+#     # Default: only Platt scaling if user doesn’t specify
+#     if calibration_methods is None:
+#         calibration_methods = ["platt"]
 
-#     # -------------------------
-#     # Basic validation
-#     # -------------------------
-#     if calibration_config is None or len(calibration_config) == 0:
-#         raise ValueError(
-#             "calibration_config must be provided and non-empty. "
-#             "Its keys define which calibration methods will run."
-#         )
+#     if len(calibration_methods) == 0:
+#         raise ValueError("calibration_methods must contain at least one method.")
 
-#     # Methods we currently support in this function (binary pipeline)
-#     supported = {
-#         # baselines
-#         "platt",
-#         "beta",
-#         # SmartCal
-#         "smartcal_beta",
-#         "smartcal_platt",
-#         "smartcal_plattbinner",
-#         "smartcal_plattbinnermarginal",
-#         "smartcal_temperature",
-#         "smartcal_ats_hybrid",
-#         "smartcal_isotonic",
-#         "smartcal_dirichlet",
-#         "smartcal_vectorscaling",
-#         "smartcal_matrixscaling",
-#         "smartcal_empiricalbinning",
-#         "smartcal_histogram",
-#         "smartcal_histogrammarginal",
-#     }
-
-#     # Verify user didn't request unknown methods
-#     unknown = set(calibration_config.keys()) - supported
+#     # Normalize and validate supported methods
+#     calibration_methods = [m.lower() for m in calibration_methods]
+#     supported = {"platt", "beta"}
+#     unknown = set(calibration_methods) - supported
 #     if unknown:
 #         raise ValueError(
-#             f"Unsupported calibration methods in calibration_config: {unknown}. "
+#             f"Unsupported calibration methods: {unknown}. "
 #             f"Supported methods: {supported}."
 #         )
 
-#     # -------------------------
-#     # Helpers (binary pipeline)
-#     # -------------------------
-#     def probs_to_probs_2col(p: np.ndarray) -> np.ndarray:
-#         """
-#         Convert positive-class probabilities p -> 2-column probability matrix [P(y=0), P(y=1)].
-#         """
-#         p = np.asarray(p, dtype=float).reshape(-1)
-#         p = np.clip(p, eps, 1.0 - eps)
-#         return np.column_stack([1.0 - p, p])
-
-#     def probs_to_binary_logits_2col(p: np.ndarray) -> np.ndarray:
-#         """
-#         Convert positive-class probabilities p -> 2-column logits [0, logit(p)].
-
-#         This provides a stable binary "logit-like" representation for SmartCal calibrators
-#         that expect logits (e.g. temperature scaling and other parametric logit-based methods).
-#         """
-#         p = np.asarray(p, dtype=float).reshape(-1)
-#         p = np.clip(p, eps, 1.0 - eps)
-#         s = np.log(p) - np.log1p(-p)  # logit(p) = log(p/(1-p))
-#         return np.column_stack([np.zeros_like(s), s])
-
-#     def make_calibrator(spec: CalibSpec) -> Any:
-#         """
-#         Return a NEW calibrator instance from a factory or (Class, kwargs).
-#         """
-#         if callable(spec):
-#             return spec()
-#         cls, kwargs = spec
-#         return cls(**kwargs)
-
-#     # -------------------------
-#     # Input routing per method
-#     # -------------------------
-#     # Baselines operate on 1D p. SmartCal calibrators typically operate on:
-#     #   - 2-col probs (nonparametric + some parametric ones like Platt/Beta in SmartCal impl)
-#     #   - 2-col logits (temperature scaling, ATS, dirichlet, vector/matrix scaling, etc.)
-#     input_kind = {
-#         # baselines (your original semantics)
-#         "platt": "probs_1d",
-#         "beta": "probs_1d",
-
-#         # SmartCal - parametric calibrators that we feed PROBS_2col
-#         "smartcal_beta": "probs_2col",
-#         "smartcal_platt": "probs_2col",
-#         "smartcal_plattbinner": "probs_2col",
-#         "smartcal_plattbinnermarginal": "probs_2col",
-
-#         # SmartCal - nonparametric calibrators (PROBS_2col)
-#         "smartcal_isotonic": "probs_2col",
-#         "smartcal_empiricalbinning": "probs_2col",
-#         "smartcal_histogram": "probs_2col",
-#         "smartcal_histogrammarginal": "probs_2col",
-
-#         # SmartCal - parametric calibrators that we feed LOGITS_2col
-#         "smartcal_temperature": "logits_2col",
-#         "smartcal_ats_hybrid": "logits_2col",
-#         "smartcal_dirichlet": "logits_2col",
-#         "smartcal_vectorscaling": "logits_2col",
-#         "smartcal_matrixscaling": "logits_2col",
-#     }
-
-#     # -------------------------
-#     # Main loop over stored results
-#     # -------------------------
 #     for model_name, folds in all_results.items():
-#         # Each element in folds corresponds to a (trial, outer_fold) stored result dict
 #         for r in folds:
-#             # Pull outer split indices saved during nested CV
 #             outer_train_idx = r["outer_train_idx"]
 #             outer_test_idx = r["outer_test_idx"]
 
-#             # Rebuild train labels for this outer fold
+#             # Rebuild train/test subset for this outer fold
 #             X_train = X[outer_train_idx]
 #             y_train = y[outer_train_idx]
 
-#             # We don't use X_test/y_test in calibration blocks directly, but keep them for symmetry/debugging
-#             _ = X[outer_test_idx]
-#             _ = y[outer_test_idx]
+#             X_test = X[outer_test_idx]      # not used now, but handy if needed later
+#             y_test = y[outer_test_idx]      # same as above
 
-#             # If using grouped CV, extract groups for outer-train portion
 #             groups_train = None
 #             if (groups is not None) and (model_selection == "StratifiedGroupKFold"):
 #                 groups_train = groups[outer_train_idx]
 
-#             # Clone the tuned final model so CV fits start from a clean estimator each fold
+#             # Unfitted clone of the tuned final model
 #             final_model = r["final_model"]
 #             clf = clone(final_model)
 
-#             # Build a "regular CV" splitter to create out-of-fold predictions on outer-train
+#             # Build a regular CV splitter (no nested CV here)
 #             _, inner_cv = make_outer_inner_cv(
 #                 model_selection=model_selection,
 #                 n_outer_splits=n_splits,   # arbitrary but valid
-#                 n_inner_splits=n_splits,   # this K is what we use for OOF predictions
-#                 outer_trial_idx=r["trial"],  # seed / reproducibility anchor
+#                 n_inner_splits=n_splits,   # this is our K for regular CV
+#                 outer_trial_idx=r["trial"],  # seed for reproducibility
 #             )
 
-#             # Pass groups only when required by the CV splitter
+#             # cross_val_predict with or without groups
 #             cv_kwargs = {}
 #             if groups_train is not None:
 #                 cv_kwargs["groups"] = groups_train
 
-#             # OOF uncalibrated probabilities on outer-train
 #             cv_probs_train = cross_val_predict(
 #                 clf,
 #                 X_train,
@@ -3411,419 +4636,62 @@ def plot_auprc_auroc(
 #                 **cv_kwargs,
 #             )
 
-#             # Positive-class OOF probabilities (binary pipeline)
+#             # Positive-class OOF probabilities on outer-train (UNCALIBRATED)
 #             cv_uncalib_train_predictions = cv_probs_train[:, 1]
 #             r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
 
-#             # Outer-test uncalibrated probabilities already stored from nested CV
+#             # Uncalibrated test scores already stored from nested CV
 #             testset_preds_uncalib = r["y_test_scores"]
 
-#             # ---- Precompute representations once per (trial, outer_fold) ----
-#             # 1D probabilities clipped for numerical safety
-#             p_train_1d = np.clip(cv_uncalib_train_predictions.astype(float), eps, 1.0 - eps)
-#             p_test_1d  = np.clip(testset_preds_uncalib.astype(float),       eps, 1.0 - eps)
+#             # --------------------------------------------------------------
+#             # Apply each requested calibration method
+#             # --------------------------------------------------------------
+#             if "platt" in calibration_methods:
+#                 calibrator_platt = LogisticRegression(C=np.inf,solver="lbfgs", max_iter=200000)
+#                 calibrator_platt.fit(
+#                     cv_uncalib_train_predictions.reshape(-1, 1),
+#                     y_train,
+#                 )
 
-#             # 2-col probabilities for SmartCal probability-based calibrators
-#             probs_train_2 = probs_to_probs_2col(p_train_1d)
-#             probs_test_2  = probs_to_probs_2col(p_test_1d)
+#                 cv_calib_train_predictions_platt = calibrator_platt.predict_proba(
+#                     cv_uncalib_train_predictions.reshape(-1, 1)
+#                 )[:, 1]
 
-#             # 2-col logits for SmartCal logit-based calibrators
-#             logits_train_2 = probs_to_binary_logits_2col(p_train_1d)
-#             logits_test_2  = probs_to_binary_logits_2col(p_test_1d)
+#                 calib_test_predictions_platt = calibrator_platt.predict_proba(
+#                     testset_preds_uncalib.reshape(-1, 1)
+#                 )[:, 1]
 
-#             # -------------------------
-#             # Run exactly what user configured
-#             # -------------------------
-#             for method_name, spec in calibration_config.items():
-#                 # Create a *fresh* calibrator instance for THIS fold (avoid reusing fitted state)
-#                 cal = make_calibrator(spec)
+#                 r["calibration_method_platt"] = "platt"
+#                 r["calibrator_platt"] = calibrator_platt
+#                 r["cv_calib_train_predictions_platt"] = (
+#                     cv_calib_train_predictions_platt
+#                 )
+#                 r["calib_test_predictions_platt"] = calib_test_predictions_platt
 
-#                 # Decide what input representation this calibrator expects
-#                 #   - "probs_1d"   : 1D positive-class probabilities (shape: (n,))
-#                 #   - "probs_2col" : 2-col probabilities [P0, P1]      (shape: (n, 2))
-#                 #   - "logits_2col": 2-col logits [0, logit(p)]        (shape: (n, 2))
-#                 kind = input_kind[method_name]
+#             if "beta" in calibration_methods:
+#                 calibrator_beta = BetaCalibration(parameters='abm')
+#                 calibrator_beta.fit(
+#                     cv_uncalib_train_predictions,
+#                     y_train,
+#                 )
 
-#                 # -------------------------
-#                 # Baselines: 1D probabilities
-#                 # -------------------------
-#                 if kind == "probs_1d":
+#                 cv_calib_train_predictions_beta = calibrator_beta.predict(
+#                     cv_uncalib_train_predictions
+#                 )
 
-#                     # Baseline Platt scaling: logistic regression on the *uncalibrated* probabilities
-#                     # (matches your original "platt" implementation style)
-#                     if method_name == "platt":
-#                         # Fit calibrator on OOF train probabilities vs true labels
-#                         cal.fit(p_train_1d.reshape(-1, 1), y_train)
+#                 calib_test_predictions_beta = calibrator_beta.predict(
+#                     testset_preds_uncalib
+#                 )
 
-#                         # Store calibrator object so you can inspect coefficients later
-#                         r["calibration_method_platt"] = "platt"
-#                         r["calibrator_platt"] = cal
-
-#                         # Calibrated OOF train probabilities (same samples used for fitting calibrator)
-#                         r["cv_calib_train_predictions_platt"] = cal.predict_proba(
-#                             p_train_1d.reshape(-1, 1)
-#                         )[:, 1]
-
-#                         # Calibrated outer-test probabilities (apply calibrator to stored test preds)
-#                         r["calib_test_predictions_platt"] = cal.predict_proba(
-#                             p_test_1d.reshape(-1, 1)
-#                         )[:, 1]
-
-#                     # Baseline Beta calibration: fits a beta calibration model on 1D probabilities
-#                     elif method_name == "beta":
-#                         # Fit calibrator on OOF train probabilities vs true labels
-#                         cal.fit(p_train_1d, y_train)
-
-#                         # Store calibrator object for later inspection
-#                         r["calibration_method_beta"] = "beta"
-#                         r["calibrator_beta"] = cal
-
-#                         # Calibrated OOF train probabilities
-#                         r["cv_calib_train_predictions_beta"] = cal.predict(p_train_1d)
-
-#                         # Calibrated outer-test probabilities
-#                         r["calib_test_predictions_beta"] = cal.predict(p_test_1d)
-
-#                 # -------------------------
-#                 # SmartCal probability-based: 2-col probabilities
-#                 # -------------------------
-#                 elif kind == "probs_2col":
-#                     # Fit SmartCal calibrator on 2-col probabilities [P0, P1]
-#                     # (these are clipped with eps to avoid exact 0/1 issues)
-#                     cal.fit(probs_train_2, y_train)
-
-#                     # Save fitted calibrator
-#                     r[f"calibrator_{method_name}"] = cal
-
-#                     # Calibrated train predictions (same train points used to fit calibrator)
-#                     # predict(...) returns (n,2) so we take column 1 as positive-class prob
-#                     r[f"cv_calib_train_predictions_{method_name}"] = cal.predict(probs_train_2)[:, 1]
-
-#                     # Calibrated test predictions (apply calibrator to outer-test probs)
-#                     r[f"calib_test_predictions_{method_name}"] = cal.predict(probs_test_2)[:, 1]
-
-#                     # Optional: keep your historical tag key for smartcal_beta
-#                     if method_name == "smartcal_beta":
-#                         r["calibration_method_smartcal_beta"] = "smartcal_beta"
-
-#                 # -------------------------
-#                 # SmartCal logit-based: 2-col logits
-#                 # -------------------------
-#                 elif kind == "logits_2col":
-#                     # Fit SmartCal calibrator on 2-col logits [0, logit(p)]
-#                     # This is used for temperature scaling / ATS / scaling / dirichlet family
-#                     cal.fit(logits_train_2, y_train)
-
-#                     # Save fitted calibrator
-#                     r[f"calibrator_{method_name}"] = cal
-
-#                     # Calibrated train predictions (predict returns (n,2), take positive class column)
-#                     r[f"cv_calib_train_predictions_{method_name}"] = cal.predict(logits_train_2)[:, 1]
-
-#                     # Calibrated test predictions
-#                     r[f"calib_test_predictions_{method_name}"] = cal.predict(logits_test_2)[:, 1]
-
-#                     # If this is temperature scaling, store the learned temperature for analysis
-#                     if method_name == "smartcal_temperature" and hasattr(cal, "metadata"):
-#                         r["smartcal_temperature_T"] = cal.metadata.get("params", {}).get("optimized_temperature")
-
-#                 else:
-#                     # Defensive fallback if input_kind mapping is wrong / incomplete
-#                     raise RuntimeError(f"Unknown input kind '{kind}' for method '{method_name}'.")
-
+#                 r["calibration_method_beta"] = "beta"
+#                 r["calibrator_beta"] = calibrator_beta
+#                 r["cv_calib_train_predictions_beta"] = (
+#                     cv_calib_train_predictions_beta
+#                 )
+#                 r["calib_test_predictions_beta"] = calib_test_predictions_beta
 
 #     return all_results
 
-# #  used for testing calibration methods
-# def compare_calibration_outputs(
-#     all_results: Dict[str, List[Dict[str, Any]]],
-#     calibration_methods: List[str],
-#     split: str = "test",  # "test" or "train"
-#     model_name: Optional[str] = None,
-#     pairwise: bool = True,
-#     tol: float = 1e-3,  # <-- NEW: differences smaller than this become 0
-# ) -> Dict[str, Any]:
-#     """
-#     Compare calibrated probabilities between methods, with optional tolerance thresholding.
-
-#     For each (model, trial, outer_fold) record r:
-#       - split="test": uses r["calib_test_predictions_<method>"]
-#       - split="train": uses r["cv_calib_train_predictions_<method>"]
-
-#     Tolerance behavior:
-#       - Computes diff = (method_B - method_A) elementwise
-#       - Sets diff to 0 wherever abs(diff) < tol
-#       - Reports how many diffs were zeroed
-
-#     Returns dict keyed by comparison label (e.g., "beta_v2 - beta"):
-#       - per_record_stats: list[dict]
-#       - overall_stats: dict
-#       - diffs: np.ndarray (thresholded diffs concatenated across folds)
-#     """
-#     if split not in {"test", "train"}:
-#         raise ValueError("split must be 'test' or 'train'")
-
-#     methods = [m.lower() for m in calibration_methods]
-#     if len(methods) < 2:
-#         raise ValueError("Provide at least two calibration_methods to compare.")
-
-#     if tol < 0:
-#         raise ValueError("tol must be >= 0")
-
-#     def key_for(method: str) -> str:
-#         return (
-#             f"calib_test_predictions_{method}"
-#             if split == "test"
-#             else f"cv_calib_train_predictions_{method}"
-#         )
-
-#     model_items = (
-#         [(model_name, all_results[model_name])]
-#         if model_name is not None
-#         else list(all_results.items())
-#     )
-
-#     if pairwise:
-#         base = methods[0]
-#         pairs = [(base, m) for m in methods[1:]]
-#     else:
-#         pairs = []
-#         for i in range(len(methods)):
-#             for j in range(i + 1, len(methods)):
-#                 pairs.append((methods[i], methods[j]))
-
-#     out: Dict[str, Any] = {}
-
-#     for mA, mB in pairs:
-#         label = f"{mB} - {mA}"
-#         per_record_stats = []
-#         all_diffs_concat = []
-
-#         for mname, records in model_items:
-#             for r in records:
-#                 kA, kB = key_for(mA), key_for(mB)
-#                 if kA not in r or kB not in r:
-#                     continue
-
-#                 a = np.asarray(r[kA], dtype=float)
-#                 b = np.asarray(r[kB], dtype=float)
-
-#                 if a.shape != b.shape:
-#                     raise ValueError(
-#                         f"Shape mismatch for {mname} trial={r.get('trial')} fold={r.get('outer_fold')}: "
-#                         f"{kA} {a.shape} vs {kB} {b.shape}"
-#                     )
-
-#                 diff = b - a
-
-#                 # --- NEW: apply tolerance thresholding ---
-#                 if tol > 0:
-#                     mask = np.abs(diff) < tol
-#                     n_zeroed = int(mask.sum())
-#                     diff = diff.copy()
-#                     diff[mask] = 0.0
-#                 else:
-#                     n_zeroed = 0
-
-#                 all_diffs_concat.append(diff)
-
-#                 per_record_stats.append(
-#                     {
-#                         "model_name": mname,
-#                         "trial": r.get("trial"),
-#                         "outer_fold": r.get("outer_fold"),
-#                         "n": int(diff.size),
-#                         "tol": float(tol),
-#                         "n_zeroed": n_zeroed,
-#                         "pct_zeroed": float(n_zeroed / diff.size) if diff.size else 0.0,
-#                         "mean_diff": float(np.mean(diff)),
-#                         "std_diff": float(np.std(diff)),
-#                         "mean_abs_diff": float(np.mean(np.abs(diff))),
-#                         "max_abs_diff": float(np.max(np.abs(diff))),
-#                     }
-#                 )
-
-#         if len(all_diffs_concat) == 0:
-#             out[label] = {
-#                 "per_record_stats": [],
-#                 "overall_stats": None,
-#                 "diffs": None,
-#                 "note": "No comparable records found (missing calibrated outputs?).",
-#             }
-#             continue
-
-#         diffs = np.concatenate(all_diffs_concat, axis=0)
-
-#         n_total = int(diffs.size)
-#         n_zeroed_total = int(np.sum(diffs == 0.0)) if tol > 0 else 0
-
-#         overall_stats = {
-#             "n_total": n_total,
-#             "tol": float(tol),
-#             "n_zeroed": n_zeroed_total,
-#             "pct_zeroed": float(n_zeroed_total / n_total) if n_total else 0.0,
-#             "mean_diff": float(np.mean(diffs)),
-#             "std_diff": float(np.std(diffs)),
-#             "mean_abs_diff": float(np.mean(np.abs(diffs))),
-#             "max_abs_diff": float(np.max(np.abs(diffs))),
-#         }
-
-#         out[label] = {
-#             "per_record_stats": per_record_stats,
-#             "overall_stats": overall_stats,
-#             "diffs": diffs,  # thresholded diffs
-#         }
-
-#     return out
-
-
-def calibrate_nested_cv_results(
-    all_results: Dict[str, List[Dict[str, Any]]],
-    X: np.ndarray,
-    y: np.ndarray,
-    model_selection: str = "StratifiedKFold",
-    n_splits: int = 5,
-    groups: Optional[np.ndarray] = None,
-    calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
-) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    For each (model, trial, outer_fold) entry in all_results, reconstruct the
-    outer-train split and compute out-of-fold predicted probabilities via
-    regular cross-validation (no nesting), then calibrate them using one or
-    more calibration methods.
-
-    Always stores uncalibrated OOF train probabilities as:
-
-        - "cv_uncalib_train_predictions": np.ndarray of shape (n_train,)
-
-    For each method in calibration_methods, performs calibration and stores:
-
-      If "platt" in calibration_methods:
-        - "calibration_method_platt"               : str, "platt"
-        - "calibrator_platt"                       : fitted LogisticRegression
-        - "cv_calib_train_predictions_platt"       : calibrated probs (train, OOF)
-        - "calib_test_predictions_platt"           : calibrated probs (test)
-
-      If "beta" in calibration_methods:
-        - "calibration_method_beta"                : str, "beta"
-        - "calibrator_beta"                        : fitted BetaCalibration
-        - "cv_calib_train_predictions_beta"        : calibrated probs (train, OOF)
-        - "calib_test_predictions_beta"            : calibrated probs (test)
-    """
-    # Default: only Platt scaling if user doesn’t specify
-    if calibration_methods is None:
-        calibration_methods = ["platt"]
-
-    if len(calibration_methods) == 0:
-        raise ValueError("calibration_methods must contain at least one method.")
-
-    # Normalize and validate supported methods
-    calibration_methods = [m.lower() for m in calibration_methods]
-    supported = {"platt", "beta"}
-    unknown = set(calibration_methods) - supported
-    if unknown:
-        raise ValueError(
-            f"Unsupported calibration methods: {unknown}. "
-            f"Supported methods: {supported}."
-        )
-
-    for model_name, folds in all_results.items():
-        for r in folds:
-            outer_train_idx = r["outer_train_idx"]
-            outer_test_idx = r["outer_test_idx"]
-
-            # Rebuild train/test subset for this outer fold
-            X_train = X[outer_train_idx]
-            y_train = y[outer_train_idx]
-
-            X_test = X[outer_test_idx]      # not used now, but handy if needed later
-            y_test = y[outer_test_idx]      # same as above
-
-            groups_train = None
-            if (groups is not None) and (model_selection == "StratifiedGroupKFold"):
-                groups_train = groups[outer_train_idx]
-
-            # Unfitted clone of the tuned final model
-            final_model = r["final_model"]
-            clf = clone(final_model)
-
-            # Build a regular CV splitter (no nested CV here)
-            _, inner_cv = make_outer_inner_cv(
-                model_selection=model_selection,
-                n_outer_splits=n_splits,   # arbitrary but valid
-                n_inner_splits=n_splits,   # this is our K for regular CV
-                outer_trial_idx=r["trial"],  # seed for reproducibility
-            )
-
-            # cross_val_predict with or without groups
-            cv_kwargs = {}
-            if groups_train is not None:
-                cv_kwargs["groups"] = groups_train
-
-            cv_probs_train = cross_val_predict(
-                clf,
-                X_train,
-                y_train,
-                cv=inner_cv,
-                method="predict_proba",
-                **cv_kwargs,
-            )
-
-            # Positive-class OOF probabilities on outer-train (UNCALIBRATED)
-            cv_uncalib_train_predictions = cv_probs_train[:, 1]
-            r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
-
-            # Uncalibrated test scores already stored from nested CV
-            testset_preds_uncalib = r["y_test_scores"]
-
-            # --------------------------------------------------------------
-            # Apply each requested calibration method
-            # --------------------------------------------------------------
-            if "platt" in calibration_methods:
-                calibrator_platt = LogisticRegression(C=np.inf,solver="lbfgs", max_iter=200000)
-                calibrator_platt.fit(
-                    cv_uncalib_train_predictions.reshape(-1, 1),
-                    y_train,
-                )
-
-                cv_calib_train_predictions_platt = calibrator_platt.predict_proba(
-                    cv_uncalib_train_predictions.reshape(-1, 1)
-                )[:, 1]
-
-                calib_test_predictions_platt = calibrator_platt.predict_proba(
-                    testset_preds_uncalib.reshape(-1, 1)
-                )[:, 1]
-
-                r["calibration_method_platt"] = "platt"
-                r["calibrator_platt"] = calibrator_platt
-                r["cv_calib_train_predictions_platt"] = (
-                    cv_calib_train_predictions_platt
-                )
-                r["calib_test_predictions_platt"] = calib_test_predictions_platt
-
-            if "beta" in calibration_methods:
-                calibrator_beta = BetaCalibration(parameters='abm')
-                calibrator_beta.fit(
-                    cv_uncalib_train_predictions,
-                    y_train,
-                )
-
-                cv_calib_train_predictions_beta = calibrator_beta.predict(
-                    cv_uncalib_train_predictions
-                )
-
-                calib_test_predictions_beta = calibrator_beta.predict(
-                    testset_preds_uncalib
-                )
-
-                r["calibration_method_beta"] = "beta"
-                r["calibrator_beta"] = calibrator_beta
-                r["cv_calib_train_predictions_beta"] = (
-                    cv_calib_train_predictions_beta
-                )
-                r["calib_test_predictions_beta"] = calib_test_predictions_beta
-
-    return all_results
 
 # Get slope and intercept of calibration
 def _logit(p: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -5652,59 +6520,71 @@ def combine_permutation_importances_nested_cv(
     return combined_importances_by_model
 
 
+
 def run_permutation_importance_pipeline(
     all_results: Dict[str, List[Dict[str, Any]]],
-    X: np.ndarray,
-    y: np.ndarray,
+    bundle: Mapping[str, Any],
+    cfg: Mapping[str, Any],
     *,
+    x_key: str = "combined_X_raw",
+    y_key: str = "combined_y",
     scoring: str,
     n_repeats: int = 10,
     random_state: int = 42,
     n_jobs: int = -1,
-) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, np.ndarray]]:
+) -> Tuple[
+    Dict[str, List[Dict[str, Any]]],
+    Dict[str, np.ndarray],
+    Dict[str, List[str]],
+]:
     """
-    Run the full permutation-importance workflow as a single pipeline with progress reporting.
+    Run permutation feature-importance for nested-CV results, supporting per-model feature sets.
 
-    This pipeline wraps two steps into one call:
-
-      (1) compute_permutation_importance_nested_cv:
-          Computes permutation feature importance on the OUTER TEST split for each
-          outer fold using the already-fitted `final_model` stored in `all_results`.
-          Results are stored per fold as:
-            - r["permutation_importances"] : np.ndarray (n_features, n_repeats)
-          along with metadata (scoring, n_repeats, random_state, n_jobs).
-
-      (2) combine_permutation_importances_nested_cv:
-          Combines the fold-level importance matrices into a single table per model
-          by concatenating repeats across folds:
-            combined_importances[model_name].shape == (n_features, total_repeats)
-
-    A top-level tqdm progress bar is shown to indicate which pipeline stage is running.
+    This pipeline mirrors the feature-selection logic used during training:
+      - X/y are pulled from `bundle` using `x_key` and `y_key` (e.g., "combined_X_raw"/"combined_y").
+      - For each model in `all_results`, X is sliced ONCE using that model's config:
+          * cfg["models"][model_name]["feature_names"] (exact-name selection), OR
+          * cfg["models"][model_name]["n_features"]   (prefix/top-K selection), OR
+          * neither (use all features).
+      - The existing nested-CV permutation-importance routines are then applied per model:
+          1) compute_permutation_importance_nested_cv(...) on outer test splits
+          2) combine_permutation_importances_nested_cv(...) to aggregate fold matrices
 
     Parameters
     ----------
     all_results:
         Nested-CV results dict structured as:
-          {model_name: [fold_dict_0, fold_dict_1, ...]}
-        Each fold dict must include:
-          - "final_model"     : fitted estimator for that outer fold
-          - "outer_test_idx"  : indices into X/y for the outer test split
-        This object is mutated in-place by step (1) to store permutation importances.
+            {model_name: [fold_dict_0, fold_dict_1, ...]}
+        Each fold dict must include at minimum:
+            - "final_model"    : fitted estimator for that outer fold
+            - "outer_test_idx" : indices into X/y (as selected by x_key/y_key) for outer test split
+        This object is mutated in-place to store per-fold permutation importances and metadata.
 
-    X:
-        Full feature matrix used for nested CV, shape (n_samples, n_features).
+    bundle:
+        Dataset dictionary containing:
+            - bundle[x_key]         : 2D numpy array of shape (n_samples, n_features_full)
+            - bundle[y_key]         : 1D numpy array of shape (n_samples,)
+            - bundle["feature_names"]: list[str] of length n_features_full (column names for bundle[x_key])
 
-    y:
-        Full label vector used for nested CV, shape (n_samples,).
+    cfg:
+        Configuration dictionary that must contain cfg["models"][model_name] for every model in all_results.
+        Supported per-model feature-selection keys:
+            - "feature_names": Optional[list[str]]
+            - "n_features"   : Optional[int]
+            - "feature_strict": bool (default True) passed to prepare_training_bundle
+        Only one of ("feature_names", "n_features") may be set per model.
+
+    x_key, y_key:
+        Keys selecting which dataset level to use from `bundle` (e.g., "combined_X_raw"/"combined_y"
+        for group-aggregated datasets, or "X_raw"/"y" for sample-level datasets).
+        The `outer_test_idx` stored in fold dicts must refer to indices in these arrays.
 
     scoring:
-        Scoring metric name passed to `sklearn.inspection.permutation_importance`,
-        e.g. "roc_auc" or "average_precision". This controls how performance
-        degradation is measured when features are shuffled.
+        Scoring metric name passed to sklearn.inspection.permutation_importance,
+        e.g. "roc_auc" or "average_precision". Measures performance degradation under feature shuffling.
 
     n_repeats:
-        Number of shuffles per feature per fold (higher = more stable estimates,
-        but slower runtime).
+        Number of shuffles per feature per fold (higher = more stable, slower runtime).
 
     random_state:
         Random seed controlling the shuffling for reproducibility.
@@ -5715,101 +6595,209 @@ def run_permutation_importance_pipeline(
     Returns
     -------
     all_results:
-        Same dict as input, mutated in-place with per-fold permutation importances
-        stored under keys like "permutation_importances".
+        Same dict as input, mutated in-place with per-fold permutation importances stored under keys like:
+            - "permutation_importances" : np.ndarray of shape (n_features_model, n_repeats)
+        (Exact key names depend on compute_permutation_importance_nested_cv.)
 
     combined_importances:
-        Dict mapping model_name -> np.ndarray of shape (n_features, total_repeats),
-        where total_repeats is the sum of repeats across all folds.
-        This output is compatible with `plot_permutation_importances_barplot`.
+        Dict mapping model_name -> np.ndarray of shape (n_features_model, total_repeats),
+        where total_repeats is the sum of repeats across all folds for that model.
+
+    model_feature_names:
+        Dict mapping model_name -> list[str] of feature names actually used for that model.
+        This is intended to be passed to plot_permutation_importances_barplot(feature_names=...).
 
     Notes
     -----
-    - This pipeline computes importance on OUTER TEST splits only (consistent with
-      evaluating generalization in nested CV).
-    - If you later want fold-weighted summaries (equal weight per fold), you can
-      compute per-fold means before combining; this pipeline currently concatenates
-      all repeats across folds.
+    - Importance is computed on OUTER TEST splits only (consistent with nested-CV generalization evaluation).
+    - This function assumes `compute_permutation_importance_nested_cv` and
+      `combine_permutation_importances_nested_cv` accept and operate on the provided X/y and outer_test_idx.
     """
-    # Create a simple 2-step progress bar for the pipeline stages.
+
+    # ---- pull X/y from the correct dataset level ----
+    if x_key not in bundle:
+        raise KeyError(f"bundle missing x_key='{x_key}'")
+    if y_key not in bundle:
+        raise KeyError(f"bundle missing y_key='{y_key}'")
+    if "feature_names" not in bundle:
+        raise KeyError("bundle must contain 'feature_names' for feature selection")
+
+    X_full = np.asarray(bundle[x_key])
+    y = np.asarray(bundle[y_key])
+    feature_names_full = list(bundle["feature_names"])
+
+    if X_full.ndim != 2:
+        raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
+    if X_full.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch for keys ({x_key}, {y_key}): "
+            f"X rows={X_full.shape[0]} vs len(y)={len(y)}"
+        )
+    if X_full.shape[1] != len(feature_names_full):
+        raise ValueError(
+            f"Mismatch: X has {X_full.shape[1]} cols but feature_names has {len(feature_names_full)}"
+        )
+
+    # Returned so plotting can label each model correctly (since each model may use different features)
+    model_feature_names: Dict[str, List[str]] = {}
+
+    # ---- pipeline progress ----
     steps = tqdm(total=2, desc="Permutation importance pipeline", unit="step")
 
-    # ---- Step 1: compute permutation importances per outer fold (outer test split) ----
-    steps.set_description("Permutation importance: compute per fold")
-    all_results = compute_permutation_importance_nested_cv(
-        all_results=all_results,
-        X=X,
-        y=y,
-        scoring=scoring,
-        n_repeats=n_repeats,
-        random_state=random_state,
-        n_jobs=n_jobs,
-        show_progress=True,
-    )
+    # ---- Step 1: compute permutation importance (per model) ----
+    steps.set_description("Permutation importance: compute per model")
+
+    for model_name in list(all_results.keys()):
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+
+        m_cfg = cfg["models"][model_name]
+
+        # same knobs as training
+        keep_features = m_cfg.get("feature_names", None)  # list[str] | None
+        n_features_model = m_cfg.get("n_features", None)  # int | None
+
+        if keep_features is not None and n_features_model is not None:
+            raise ValueError(
+                f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
+            )
+
+        # Build the mini-bundle expected by prepare_training_bundle
+        view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
+
+        # Slice ONCE per model (mimics training exactly)
+        if keep_features is not None or n_features_model is not None:
+            mb = prepare_training_bundle(
+                view_bundle,
+                n_features=n_features_model,
+                keep_features=keep_features,
+                strict=m_cfg.get("feature_strict", True),
+                dedupe=True,
+                copy_bundle=True,
+            )
+        else:
+            mb = view_bundle
+
+        X_model = np.asarray(mb["X_raw"])
+        model_feature_names[model_name] = list(mb["feature_names"])
+
+        # (Optional) stash for traceability in fold dicts
+        for r in all_results[model_name]:
+            r["pi_feature_names"] = model_feature_names[model_name]
+            r["pi_x_key"] = x_key
+            r["pi_y_key"] = y_key
+
+        # Run your existing compute function on ONLY this model,
+        # using X_model so dimensions match what the model was trained on.
+        sub_results = {model_name: all_results[model_name]}
+        sub_results = compute_permutation_importance_nested_cv(
+            all_results=sub_results,
+            X=X_model,
+            y=y,
+            scoring=scoring,
+            n_repeats=n_repeats,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            show_progress=True,
+        )
+
+        # Write back (compute_* mutates in-place, but explicit assignment is clearer)
+        all_results[model_name] = sub_results[model_name]
+
     steps.update(1)
 
-    # ---- Step 2: combine fold-level matrices into one table per model ----
+    # ---- Step 2: combine (unchanged) ----
     steps.set_description("Permutation importance: combine folds")
     combined_importances = combine_permutation_importances_nested_cv(all_results)
     steps.update(1)
 
-    # Close the progress bar cleanly.
     steps.close()
 
-    # Return both the enriched all_results and the combined importances dict.
-    return all_results, combined_importances
+    return all_results, combined_importances, model_feature_names
 
 
 def plot_permutation_importances_barplot(
     combined_importances: Dict[str, np.ndarray],
-    model_name: str | Sequence[str] | None = None,
-    feature_names: Optional[List[str]] = None,
+    model_name: Union[str, Sequence[str], None] = None,
+    feature_names: Optional[Union[List[str], Dict[str, List[str]]]] = None,
     top_n: Optional[int] = None,
     scoring: str = "average_precision",
-    figsize=(10, 6),
+    figsize: tuple[float, float] = (10, 6),
     font_size: int = 12,
     color: str = "#69b3a2",
     x_tick_rotation: float = 90,
-    method_alias: Mapping[str, str] | None = None,  # NEW
-):
+    method_alias: Optional[Mapping[str, str]] = None,
+) -> None:
     """
-    Barplot of permutation importances for one or more models.
+    Plot permutation feature importances as barplots for one or more models.
+
+    The input `combined_importances` is typically produced by
+    combine_permutation_importances_nested_cv(all_results) (or by run_permutation_importance_pipeline).
+
+    For each selected model, this function:
+      - Computes mean importance per feature across all concatenated repeats
+      - Sorts features by mean importance (descending)
+      - Optionally keeps only the top_n features
+      - Builds a tidy DataFrame with one row per (feature, repeat) and plots a barplot
+        with error bars representing standard deviation across repeats.
 
     Parameters
     ----------
-    combined_importances : dict
-        Output of combine_permutation_importances_nested_cv(all_results), e.g.:
-        {
-          "logistic_regression": np.ndarray of shape (n_features, total_repeats),
-          "random_forest":       np.ndarray of shape (n_features, total_repeats),
-        }
+    combined_importances:
+        Dict mapping model_name -> np.ndarray of shape (n_features, total_repeats).
+        Each entry corresponds to a single model's permutation importances, concatenated across folds.
 
-    model_name : str | sequence[str] | None
-        Which model(s) to plot. None = all models in combined_importances.
+    model_name:
+        Which model(s) to plot:
+          - None: plot all models found in combined_importances
+          - str: plot that single model
+          - sequence[str]: plot those models in the given order
 
-    feature_names : list[str] or None, default=None
-        Names of features. If None, features will be labeled as "f0", "f1", ...
+    feature_names:
+        Feature name labels to use on the x-axis:
+          - None: labels default to "f0", "f1", ... per model
+          - list[str]: a single shared list of names (must match n_features for the model being plotted)
+          - dict[str, list[str]]: per-model feature names (recommended when models use different feature sets)
 
-    top_n : int or None, default=None
-        If provided, only the top_n features (by mean importance) are plotted.
+    top_n:
+        If provided, plot only the top_n features by mean importance for each model.
 
-    scoring : str, default="average_precision"
-        Name of the scoring metric used in permutation_importance, for labeling.
+    scoring:
+        Label used in the y-axis text (e.g., "AUROC" or "AUPRC"). This does not change computation
+        (computation already happened upstream).
 
-    figsize : tuple
-        Size of the matplotlib figure.
+    figsize:
+        Matplotlib figure size.
 
-    font_size : int
-        Base font size for labels and ticks.
+    font_size:
+        Base font size for plot text.
 
-    color : str, default="#69b3a2"
-        Color for the bars.
+    color:
+        Bar color.
 
-    x_tick_rotation : float, default=90
-        Rotation angle (in degrees) for x-axis tick labels.
+    x_tick_rotation:
+        Rotation (degrees) for x-axis tick labels.
 
-    method_alias : dict or None
-        Optional mapping model_key -> display name (used in the plot title only).
+    method_alias:
+        Optional mapping from model_name (dict key) to a nicer display name for the title.
+
+    Raises
+    ------
+    KeyError:
+        If requested model_name(s) are not present in combined_importances, or if feature_names is a dict
+        missing an entry for a selected model.
+
+    ValueError:
+        If feature_names length does not match the number of features for a model,
+        or if combined_importances arrays are not 2D.
+
+    Notes
+    -----
+    - If you provide per-model feature names, pass the dict returned by
+      run_permutation_importance_pipeline(...)[2] (model_feature_names).
+    - Error bars show standard deviation across repeats (concatenated across folds).
     """
     if method_alias is None:
         method_alias = {}
@@ -5831,31 +6819,47 @@ def plot_permutation_importances_barplot(
 
     for m in selected:
         imp = np.asarray(combined_importances[m])  # (n_features, total_repeats)
-        n_features, total_repeats = imp.shape
+        if imp.ndim != 2:
+            raise ValueError(f"combined_importances['{m}'] must be 2D, got shape {imp.shape}")
+        n_features, _total_repeats = imp.shape
 
-        # Feature names
+        # Feature names (supports per-model dict)
         if feature_names is None:
             fnames = [f"f{i}" for i in range(n_features)]
-        else:
-            if len(feature_names) != n_features:
+        elif isinstance(feature_names, dict):
+            if m not in feature_names:
+                raise KeyError(
+                    f"feature_names dict missing key '{m}'. Available: {list(feature_names.keys())}"
+                )
+            fnames = list(feature_names[m])
+            if len(fnames) != n_features:
                 raise ValueError(
-                    f"len(feature_names)={len(feature_names)} does not match "
+                    f"len(feature_names['{m}'])={len(fnames)} does not match "
                     f"n_features={n_features} for model '{m}'."
                 )
-            fnames = feature_names
+        else:
+            fnames = list(feature_names)
+            if len(fnames) != n_features:
+                raise ValueError(
+                    f"len(feature_names)={len(fnames)} does not match "
+                    f"n_features={n_features} for model '{m}'."
+                )
 
         # Order features by mean importance (descending)
         means = np.mean(imp, axis=1)
         feature_indices = np.argsort(means)[::-1]
         if top_n is not None:
-            feature_indices = feature_indices[:top_n]
+            top_n_int = int(top_n)
+            if top_n_int <= 0:
+                raise ValueError("top_n must be > 0 if provided")
+            feature_indices = feature_indices[:top_n_int]
 
         # Build tidy DataFrame: one row per (feature, repeat)
-        rows = []
+        rows: List[Dict[str, object]] = []
         for idx in feature_indices:
             fname = fnames[idx]
             for val in imp[idx, :]:
-                rows.append({"feature": fname, "importance": val})
+                rows.append({"feature": fname, "importance": float(val)})
 
         df = pd.DataFrame(rows)
         ordered_features = [fnames[i] for i in feature_indices]
@@ -5870,6 +6874,7 @@ def plot_permutation_importances_barplot(
             estimator=np.mean,
             errorbar=("sd"),
             color=color,
+            saturation=1,
         )
 
         y_label = f"Permutation impact on {scoring}"
@@ -5889,6 +6894,244 @@ def plot_permutation_importances_barplot(
         plt.tight_layout()
         plt.show()
 
+
+
+
+# def run_permutation_importance_pipeline(
+#     all_results: Dict[str, List[Dict[str, Any]]],
+#     X: np.ndarray,
+#     y: np.ndarray,
+#     *,
+#     scoring: str,
+#     n_repeats: int = 10,
+#     random_state: int = 42,
+#     n_jobs: int = -1,
+# ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, np.ndarray]]:
+#     """
+#     Run the full permutation-importance workflow as a single pipeline with progress reporting.
+
+#     This pipeline wraps two steps into one call:
+
+#       (1) compute_permutation_importance_nested_cv:
+#           Computes permutation feature importance on the OUTER TEST split for each
+#           outer fold using the already-fitted `final_model` stored in `all_results`.
+#           Results are stored per fold as:
+#             - r["permutation_importances"] : np.ndarray (n_features, n_repeats)
+#           along with metadata (scoring, n_repeats, random_state, n_jobs).
+
+#       (2) combine_permutation_importances_nested_cv:
+#           Combines the fold-level importance matrices into a single table per model
+#           by concatenating repeats across folds:
+#             combined_importances[model_name].shape == (n_features, total_repeats)
+
+#     A top-level tqdm progress bar is shown to indicate which pipeline stage is running.
+
+#     Parameters
+#     ----------
+#     all_results:
+#         Nested-CV results dict structured as:
+#           {model_name: [fold_dict_0, fold_dict_1, ...]}
+#         Each fold dict must include:
+#           - "final_model"     : fitted estimator for that outer fold
+#           - "outer_test_idx"  : indices into X/y for the outer test split
+#         This object is mutated in-place by step (1) to store permutation importances.
+
+#     X:
+#         Full feature matrix used for nested CV, shape (n_samples, n_features).
+
+#     y:
+#         Full label vector used for nested CV, shape (n_samples,).
+
+#     scoring:
+#         Scoring metric name passed to `sklearn.inspection.permutation_importance`,
+#         e.g. "roc_auc" or "average_precision". This controls how performance
+#         degradation is measured when features are shuffled.
+
+#     n_repeats:
+#         Number of shuffles per feature per fold (higher = more stable estimates,
+#         but slower runtime).
+
+#     random_state:
+#         Random seed controlling the shuffling for reproducibility.
+
+#     n_jobs:
+#         Number of parallel jobs used by permutation_importance (-1 uses all cores).
+
+#     Returns
+#     -------
+#     all_results:
+#         Same dict as input, mutated in-place with per-fold permutation importances
+#         stored under keys like "permutation_importances".
+
+#     combined_importances:
+#         Dict mapping model_name -> np.ndarray of shape (n_features, total_repeats),
+#         where total_repeats is the sum of repeats across all folds.
+#         This output is compatible with `plot_permutation_importances_barplot`.
+
+#     Notes
+#     -----
+#     - This pipeline computes importance on OUTER TEST splits only (consistent with
+#       evaluating generalization in nested CV).
+#     - If you later want fold-weighted summaries (equal weight per fold), you can
+#       compute per-fold means before combining; this pipeline currently concatenates
+#       all repeats across folds.
+#     """
+#     # Create a simple 2-step progress bar for the pipeline stages.
+#     steps = tqdm(total=2, desc="Permutation importance pipeline", unit="step")
+
+#     # ---- Step 1: compute permutation importances per outer fold (outer test split) ----
+#     steps.set_description("Permutation importance: compute per fold")
+#     all_results = compute_permutation_importance_nested_cv(
+#         all_results=all_results,
+#         X=X,
+#         y=y,
+#         scoring=scoring,
+#         n_repeats=n_repeats,
+#         random_state=random_state,
+#         n_jobs=n_jobs,
+#         show_progress=True,
+#     )
+#     steps.update(1)
+
+#     # ---- Step 2: combine fold-level matrices into one table per model ----
+#     steps.set_description("Permutation importance: combine folds")
+#     combined_importances = combine_permutation_importances_nested_cv(all_results)
+#     steps.update(1)
+
+#     # Close the progress bar cleanly.
+#     steps.close()
+
+#     # Return both the enriched all_results and the combined importances dict.
+#     return all_results, combined_importances
+
+# def plot_permutation_importances_barplot(
+#     combined_importances: Dict[str, np.ndarray],
+#     model_name: str | Sequence[str] | None = None,
+#     feature_names: Optional[List[str]] = None,
+#     top_n: Optional[int] = None,
+#     scoring: str = "average_precision",
+#     figsize=(10, 6),
+#     font_size: int = 12,
+#     color: str = "#69b3a2",
+#     x_tick_rotation: float = 90,
+#     method_alias: Mapping[str, str] | None = None,  # NEW
+# ):
+#     """
+#     Barplot of permutation importances for one or more models.
+
+#     Parameters
+#     ----------
+#     combined_importances : dict
+#         Output of combine_permutation_importances_nested_cv(all_results), e.g.:
+#         {
+#           "logistic_regression": np.ndarray of shape (n_features, total_repeats),
+#           "random_forest":       np.ndarray of shape (n_features, total_repeats),
+#         }
+
+#     model_name : str | sequence[str] | None
+#         Which model(s) to plot. None = all models in combined_importances.
+
+#     feature_names : list[str] or None, default=None
+#         Names of features. If None, features will be labeled as "f0", "f1", ...
+
+#     top_n : int or None, default=None
+#         If provided, only the top_n features (by mean importance) are plotted.
+
+#     scoring : str, default="average_precision"
+#         Name of the scoring metric used in permutation_importance, for labeling.
+
+#     figsize : tuple
+#         Size of the matplotlib figure.
+
+#     font_size : int
+#         Base font size for labels and ticks.
+
+#     color : str, default="#69b3a2"
+#         Color for the bars.
+
+#     x_tick_rotation : float, default=90
+#         Rotation angle (in degrees) for x-axis tick labels.
+
+#     method_alias : dict or None
+#         Optional mapping model_key -> display name (used in the plot title only).
+#     """
+#     if method_alias is None:
+#         method_alias = {}
+
+#     # choose models
+#     if model_name is None:
+#         selected = list(combined_importances.keys())
+#     elif isinstance(model_name, str):
+#         selected = [model_name]
+#     else:
+#         selected = list(model_name)
+
+#     missing = [m for m in selected if m not in combined_importances]
+#     if missing:
+#         raise KeyError(
+#             f"Model(s) not found in combined_importances: {missing}. "
+#             f"Available: {list(combined_importances.keys())}"
+#         )
+
+#     for m in selected:
+#         imp = np.asarray(combined_importances[m])  # (n_features, total_repeats)
+#         n_features, total_repeats = imp.shape
+
+#         # Feature names
+#         if feature_names is None:
+#             fnames = [f"f{i}" for i in range(n_features)]
+#         else:
+#             if len(feature_names) != n_features:
+#                 raise ValueError(
+#                     f"len(feature_names)={len(feature_names)} does not match "
+#                     f"n_features={n_features} for model '{m}'."
+#                 )
+#             fnames = feature_names
+
+#         # Order features by mean importance (descending)
+#         means = np.mean(imp, axis=1)
+#         feature_indices = np.argsort(means)[::-1]
+#         if top_n is not None:
+#             feature_indices = feature_indices[:top_n]
+
+#         # Build tidy DataFrame: one row per (feature, repeat)
+#         rows = []
+#         for idx in feature_indices:
+#             fname = fnames[idx]
+#             for val in imp[idx, :]:
+#                 rows.append({"feature": fname, "importance": val})
+
+#         df = pd.DataFrame(rows)
+#         ordered_features = [fnames[i] for i in feature_indices]
+
+#         sns.set(style="whitegrid")
+#         plt.figure(figsize=figsize)
+#         ax = sns.barplot(
+#             data=df,
+#             x="feature",
+#             y="importance",
+#             order=ordered_features,
+#             estimator=np.mean,
+#             errorbar=("sd"),
+#             color=color,
+#         )
+
+#         y_label = f"Permutation impact on {scoring}"
+#         display = method_alias.get(m, m)
+#         title = f"Permutation feature importance (model: {display}, test set)"
+
+#         ax.set_xlabel("Feature", fontsize=font_size, fontweight="bold")
+#         ax.set_ylabel(y_label, fontsize=font_size, fontweight="bold")
+#         ax.set_title(title, fontsize=font_size + 2, fontweight="bold")
+
+#         ax.tick_params(axis="both", labelsize=font_size)
+#         for label in ax.get_xticklabels() + ax.get_yticklabels():
+#             label.set_fontweight("bold")
+
+#         ax.tick_params(axis="x", labelrotation=x_tick_rotation)
+
+#         plt.tight_layout()
+#         plt.show()
 
 # def compute_permutation_importance_nested_cv(
 #     all_results: Dict[str, List[Dict[str, Any]]],
@@ -6352,7 +7595,6 @@ def aggregate_pdp_nested_cv(
     # Return dict of aggregated DataFrames per model.
     return aggregated
 
-
 def add_interpolated_mean_pdp_to_agg(
     pdp_agg: Dict[str, pd.DataFrame],
     n_points: int = 100,
@@ -6525,10 +7767,6 @@ def add_interpolated_mean_pdp_to_agg(
     return pdp_agg
 
 
-
-
-
-
 def add_grid_value_raw_to_pdp_agg(
     pdp_agg: Dict[str, pd.DataFrame],
     scaler_bundle: Optional[Dict[str, Any]] = None,
@@ -6657,161 +7895,239 @@ def add_grid_value_raw_to_pdp_agg(
     return out
 
 
-
 def run_pdp_pipeline(
     all_results: Dict[str, List[Dict[str, Any]]],
-    X: np.ndarray,
-    y: np.ndarray,
-    feature_names: Optional[Sequence[str]] = None,
+    bundle: Mapping[str, Any],
+    cfg: Mapping[str, Any],
     *,
+    x_key: str = "combined_X_raw",
+    y_key: str = "combined_y",
     data_source: str = "test",
     grid_resolution: int = 100,
     percentiles: Tuple[float, float] = (0.0, 1.0),
     centered: bool = False,
     n_points: int = 20,
     discrete_threshold: int = 10,
-    scaler_bundle: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, pd.DataFrame]]:
+    scaler_bundle: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, pd.DataFrame], Dict[str, List[str]]]:
     """
-    Run the full PDP workflow as a single pipeline with progress reporting.
+    Run a nested-CV Partial Dependence Plot (PDP) workflow, supporting per-model feature sets.
 
-    This pipeline wraps up to four steps into one call:
+    This pipeline mirrors the same per-model feature selection used during training and
+    permutation importance:
+      - X/y are pulled from `bundle` using `x_key` and `y_key` (e.g., group-aggregated arrays).
+      - For each model, X is sliced ONCE using that model's config:
+          * cfg["models"][model_name]["feature_names"] (exact-name selection), OR
+          * cfg["models"][model_name]["n_features"]   (prefix/top-K selection), OR
+          * neither (use all features).
+      - The existing PDP routines are then applied on a per-model basis so that
+        fold indices (outer_train_idx / outer_test_idx) remain valid and the feature
+        dimension matches the fitted `final_model`.
 
-      (1) compute_pdp_nested_cv:
-          Computes per-fold partial dependence (PDP) curves for each model and
-          stores the results back into `all_results` under keys like:
-            - "pdp_grid_values_test" / "pdp_average_values_test"
-            - "pdp_grid_values_train" / "pdp_average_values_train"
-          Note: PDP arrays are NaN-padded per feature so that low-cardinality
-          features (e.g., binary) can have fewer grid points without breaking
-          array stacking.
+    Pipeline stages
+    --------------
+    (1) compute_pdp_nested_cv (per model):
+        Computes per-fold PDP arrays for the requested split(s) (train/test/both) and stores
+        them in each fold dict inside `all_results[model_name]`. Low-cardinality features may
+        have fewer grid points; your implementation may NaN-pad to allow stacking.
 
-      (2) aggregate_pdp_nested_cv:
-          Converts the per-fold (padded) PDP arrays into a single long-format
-          DataFrame per model, skipping any NaN-padded entries.
+    (2) aggregate_pdp_nested_cv (per model):
+        Converts per-fold PDP arrays into a single long-format DataFrame per model.
+        Feature naming is handled per-model by passing that model's selected feature list.
 
-      (3) add_interpolated_mean_pdp_to_agg:
-          For each model and each feature, creates a canonical x-grid and
-          interpolates each fold's PDP curve onto it, then computes mean/std
-          across folds, storing results as:
+    (3) add_interpolated_mean_pdp_to_agg (all models):
+        Interpolates each fold's PDP onto a canonical grid per feature and computes mean/std
+        across folds, writing results into:
             pdp_agg[f"{model_name}_mean_pdp"].
 
-      (4) add_grid_value_raw_to_pdp_agg (optional):
-          If `scaler_bundle` is provided, converts standardized/scaled PDP
-          x-values (grid_value) back into raw feature units and appends a
-          `grid_value_raw` column to each DataFrame in `pdp_agg`.
-
-    A top-level tqdm progress bar is shown to indicate which pipeline stage
-    is running.
+    (4) add_grid_value_raw_to_pdp_agg (optional, per model):
+        If `scaler_bundle` is provided, converts PDP grid x-values back into "raw" units
+        and adds a `grid_value_raw` column. (The exact logic depends on your
+        add_grid_value_raw_to_pdp_agg implementation.)
 
     Parameters
     ----------
     all_results:
-        Nested-CV results dict with structure:
-          {model_name: [fold_dict_0, fold_dict_1, ...]}
-        Each fold dict must include:
-          - "final_model": fitted estimator for that fold
-          - "outer_train_idx": indices into X for outer-train split
-          - "outer_test_idx": indices into X for outer-test split
-        This object is mutated in-place by step (1) to store PDP arrays.
+        Nested-CV results dict structured as:
+            {model_name: [fold_dict_0, fold_dict_1, ...]}
+        Each fold dict is expected to include:
+            - "final_model": fitted estimator for that fold
+            - "outer_train_idx": indices into bundle[x_key] / bundle[y_key]
+            - "outer_test_idx": indices into bundle[x_key] / bundle[y_key]
+        This object is mutated in-place to store PDP arrays/metadata.
 
-    X:
-        Full feature matrix used for the nested CV, shape (n_samples, n_features).
-        PDP computations slice this matrix using outer_train_idx / outer_test_idx.
+    bundle:
+        Dataset dictionary containing:
+            - bundle[x_key]: 2D numpy array, shape (n_samples, n_features_full)
+            - bundle[y_key]: 1D numpy array, shape (n_samples,)
+            - bundle["feature_names"]: list[str] of length n_features_full
 
-    y:
-        Label vector, shape (n_samples,). Included for API symmetry with other
-        code paths; not used directly for PDP computations.
+    cfg:
+        Configuration dictionary with per-model feature selection keys under cfg["models"][model_name]:
+            - "feature_names": Optional[list[str]]  (exact names)
+            - "n_features": Optional[int]           (keep first K columns)
+            - "feature_strict": bool (default True) passed to prepare_training_bundle
+        Only one of ("feature_names", "n_features") may be set per model.
 
-    feature_names:
-        Optional list/sequence of feature names (length must equal n_features).
-        If provided, aggregations include a "feature_name" column.
+    x_key, y_key:
+        Keys selecting which dataset level to use from the bundle (e.g., "combined_X_raw"/"combined_y"
+        for group-level data, or "X_raw"/"y" for sample-level).
+        The fold indices in all_results must refer to these arrays.
 
     data_source:
-        Which outer split to compute PDPs on in step (1):
-          - "train": compute PDP on outer-train split only
-          - "test":  compute PDP on outer-test split only
-          - "both":  compute PDP on both outer-train and outer-test splits
-        Note: step (2) aggregates a single source at a time; if you pass "both",
-        this pipeline will aggregate "test" by default unless you extend it.
+        Which outer split(s) to compute PDPs on:
+            - "train": compute on outer-train split
+            - "test": compute on outer-test split
+            - "both": compute on both (aggregation defaults to "test" unless your aggregator supports both)
 
     grid_resolution:
-        Requested number of grid points for continuous features in
-        `PartialDependenceDisplay.from_estimator`. Low-cardinality features may
-        produce fewer grid points (handled via NaN padding).
+        Requested number of grid points for continuous features for scikit-learn PDP computation.
+        Discrete features may yield fewer points.
 
     percentiles:
-        Percentile range used by scikit-learn to define PDP grid boundaries
-        (e.g., (0.05, 0.95) trims extremes). Use (0.0, 1.0) to include full range.
+        Percentile range (0..1) for PDP grid boundaries. (0.0, 1.0) uses full observed range.
 
     centered:
-        Passed to `PartialDependenceDisplay.from_estimator`. If True, centers
-        the PDP curves.
+        Whether to center PDP curves (passed through to your PDP computation routine).
 
     n_points:
-        Number of points used for the canonical grid when a feature is treated
-        as continuous in step (3). Larger values produce smoother mean curves.
+        Canonical grid size used when interpolating/averaging PDP curves across folds (continuous features).
 
     discrete_threshold:
-        If a feature has <= this many unique x-values across folds, treat it
-        as discrete in step (3) and use the observed unique values as the
-        canonical grid (instead of creating a dense linspace).
+        If a feature has <= this many unique values across folds, treat it as discrete when building
+        the canonical grid (use observed unique values rather than a dense linspace).
 
     scaler_bundle:
-        Optional object (as returned by your `load_all_results`) containing the
-        scaler needed to invert standardized/scaled feature values.
-        If provided, step (4) runs and adds `grid_value_raw` to each DataFrame
-        in `pdp_agg`. If None, step (4) is skipped.
+        Optional object used by add_grid_value_raw_to_pdp_agg to convert grid values back into raw units.
+        If None, the raw-value step is skipped.
 
     Returns
     -------
     all_results:
-        Same nested-CV results dict as input, mutated in-place with PDP arrays
-        added per fold.
+        Same dict as input, mutated in-place with fold-level PDP arrays stored inside each fold dict.
 
     pdp_agg:
-        Dict mapping:
-          - pdp_agg[model_name] = long-format PDP points across folds
-          - pdp_agg[f"{model_name}_mean_pdp"] = mean/std PDP curves per feature
-        If scaler_bundle is provided, each DataFrame also includes:
-          - grid_value_raw (inverse-transformed grid values)
+        Dict of DataFrames containing aggregated PDP points and mean/std tables per model:
+            - pdp_agg[model_name]                 : long-format PDP points (across folds)
+            - pdp_agg[f"{model_name}_mean_pdp"]   : mean/std PDP curves per feature
+
+    model_feature_names:
+        Dict mapping model_name -> list[str] of feature names actually used for that model
+        (useful for labeling plots, and for sanity-checking feature selection).
 
     Notes
     -----
-    - Recommended pattern: load scaler_bundle outside this pipeline (I/O),
-      then pass the in-memory object into `run_pdp_pipeline`.
+    - The critical requirement is that the X passed into compute_pdp_nested_cv for a given model
+      has the same feature dimension/order that the model was trained on.
+    - This function assumes outer indices stored in all_results refer to the rows of bundle[x_key]/bundle[y_key].
     """
 
-    # Decide how many pipeline stages we will run (3 base + optional raw-grid stage).
-    n_steps = 4 if scaler_bundle is not None else 3
+    # ---- pull X/y from bundle ----
+    if x_key not in bundle:
+        raise KeyError(f"bundle missing x_key='{x_key}'")
+    if y_key not in bundle:
+        raise KeyError(f"bundle missing y_key='{y_key}'")
+    if "feature_names" not in bundle:
+        raise KeyError("bundle must contain 'feature_names' for feature selection")
 
-    # Create a progress bar for the pipeline stages.
+    X_full = np.asarray(bundle[x_key])
+    y = np.asarray(bundle[y_key])
+    feature_names_full = list(bundle["feature_names"])
+
+    if X_full.ndim != 2:
+        raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
+    if X_full.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
+        )
+    if X_full.shape[1] != len(feature_names_full):
+        raise ValueError(
+            f"Mismatch: X has {X_full.shape[1]} cols but feature_names has {len(feature_names_full)}"
+        )
+
+    model_feature_names: Dict[str, List[str]] = {}
+
+    # 3 base steps + optional raw-grid step
+    n_steps = 4 if scaler_bundle is not None else 3
     steps = tqdm(total=n_steps, desc="PDP pipeline", unit="step")
 
-    # ---- Step 1: compute per-fold PDP arrays and store them in all_results ----
-    steps.set_description("PDP pipeline: compute PDP per fold")
-    all_results = compute_pdp_nested_cv(
-        all_results=all_results,
-        X=X,
-        y=y,
-        grid_resolution=grid_resolution,
-        percentiles=percentiles,
-        data_source=data_source,
-        centered=centered,
-    )
+    # ---- Step 1: compute PDP per model (model-specific X) ----
+    steps.set_description("PDP pipeline: compute PDP per model")
+
+    for model_name in list(all_results.keys()):
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+
+        m_cfg = cfg["models"][model_name]
+
+        keep_features = m_cfg.get("feature_names", None)   # list[str] | None
+        n_features_model = m_cfg.get("n_features", None)   # int | None
+
+        if keep_features is not None and n_features_model is not None:
+            raise ValueError(
+                f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
+            )
+
+        # Mini-bundle expected by prepare_training_bundle
+        view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
+
+        # Slice ONCE per model (exactly like training / permutation importance)
+        if keep_features is not None or n_features_model is not None:
+            mb = prepare_training_bundle(
+                view_bundle,
+                n_features=n_features_model,
+                keep_features=keep_features,
+                strict=m_cfg.get("feature_strict", True),
+                dedupe=True,
+                copy_bundle=True,
+            )
+        else:
+            mb = view_bundle
+
+        X_model = np.asarray(mb["X_raw"])
+        fnames_model = list(mb["feature_names"])
+        model_feature_names[model_name] = fnames_model
+
+        # Optional: stash feature names per fold for traceability
+        for r in all_results[model_name]:
+            r["pdp_feature_names"] = fnames_model
+            r["pdp_x_key"] = x_key
+            r["pdp_y_key"] = y_key
+
+        # Run your EXISTING compute function on ONLY this model
+        sub_results = {model_name: all_results[model_name]}
+        sub_results = compute_pdp_nested_cv(
+            all_results=sub_results,
+            X=X_model,
+            y=y,
+            grid_resolution=grid_resolution,
+            percentiles=percentiles,
+            data_source=data_source,
+            centered=centered,
+        )
+        all_results[model_name] = sub_results[model_name]
+
     steps.update(1)
 
-    # ---- Step 2: aggregate per-fold PDP arrays into long-format DataFrames ----
+    # ---- Step 2: aggregate per model (so each model gets its own feature_names) ----
     steps.set_description("PDP pipeline: aggregate folds")
     agg_source = data_source if data_source in ("train", "test") else "test"
-    pdp_agg = aggregate_pdp_nested_cv(
-        all_results=all_results,
-        source=agg_source,
-        feature_names=feature_names,
-    )
+
+    pdp_agg: Dict[str, pd.DataFrame] = {}
+    for model_name in list(all_results.keys()):
+        sub_results = {model_name: all_results[model_name]}
+        sub_agg = aggregate_pdp_nested_cv(
+            all_results=sub_results,
+            source=agg_source,
+            feature_names=model_feature_names[model_name],  # <-- per-model feature names
+        )
+        pdp_agg.update(sub_agg)
+
     steps.update(1)
 
-    # ---- Step 3: compute mean/std PDP curves across folds per feature ----
+    # ---- Step 3: mean/std curves across folds ----
     steps.set_description("PDP pipeline: mean/std curves")
     pdp_agg = add_interpolated_mean_pdp_to_agg(
         pdp_agg=pdp_agg,
@@ -6820,26 +8136,35 @@ def run_pdp_pipeline(
     )
     steps.update(1)
 
-    # ---- Step 4 (optional): add inverse-transformed raw grid values ----
+    # ---- Step 4: add raw grid values (optional) ----
+    # Keep it simple: do it per model so each model's mean_pdp table maps correctly.
     if scaler_bundle is not None:
         steps.set_description("PDP pipeline: add raw grid values")
-        pdp_agg = add_grid_value_raw_to_pdp_agg(
-            pdp_agg=pdp_agg,
-            scaler_bundle=scaler_bundle,
-        )
+
+        for model_name in list(all_results.keys()):
+            keys = [model_name, f"{model_name}_mean_pdp"]
+            sub_pdp_agg = {k: pdp_agg[k] for k in keys if k in pdp_agg}
+
+            sub_pdp_agg = add_grid_value_raw_to_pdp_agg(
+                pdp_agg=sub_pdp_agg,
+                scaler_bundle=scaler_bundle,
+            )
+
+            # write back
+            for k, v in sub_pdp_agg.items():
+                pdp_agg[k] = v
+
         steps.update(1)
 
-    # Close the progress bar cleanly.
     steps.close()
-
-    # Return both the enriched all_results and the aggregated DataFrames.
-    return all_results, pdp_agg
+    return all_results, pdp_agg, model_feature_names
 
 
 def plot_all_mean_pdp_with_std(
     pdp_agg: Mapping[str, Any],
-    model_name: str | Sequence[str] | None = None,  # None -> all models found in pdp_agg
+    model_name: Union[str, Sequence[str], None] = None,
     *,
+    feature_names: Optional[Union[List[str], Dict[str, List[str]]]] = None,
     x_scale: Literal["scaled", "raw"] = "scaled",
     figsize: tuple[float, float] = (8, 4),
     font_size: int = 12,
@@ -6849,12 +8174,97 @@ def plot_all_mean_pdp_with_std(
     sns_style: str = "whitegrid",
     fill_alpha: float = 0.2,
     fill_edgecolor: Optional[str] = None,
-    method_alias: Mapping[str, str] | None = None,  # NEW
+    method_alias: Optional[Mapping[str, str]] = None,
 ) -> None:
     """
-    Plot mean PDP ± std for ALL features, for one or more models.
+    Plot mean PDP ± std for all features, for one or more models.
 
-    (Same behavior as before; `method_alias` only affects the displayed model name in the title.)
+    This function expects the mean/std PDP tables produced by add_interpolated_mean_pdp_to_agg,
+    stored in pdp_agg under keys like:
+        pdp_agg[f"{model_name}_mean_pdp"].
+
+    For each selected model, and for each feature within that model, it produces a separate figure
+    showing:
+        - mean PDP curve across outer folds
+        - shaded band of ± 1 standard deviation across folds
+
+    Feature labeling supports both global and per-model feature-name lists, similar to the updated
+    permutation-importance plotting:
+      - If the mean PDP table contains a "feature_name" column, that is used.
+      - Otherwise, `feature_names` may be provided:
+          * None -> labels default to "feature_idx={i}"
+          * list[str] -> shared names (must align to feature_idx)
+          * dict[str, list[str]] -> per-model names (recommended when models use different feature sets)
+
+    Parameters
+    ----------
+    pdp_agg:
+        Mapping containing PDP aggregation tables. Must include keys ending in "_mean_pdp".
+        For a given model `m`, expected key:
+            pdp_agg[f"{m}_mean_pdp"] -> pandas DataFrame.
+
+        Required columns in each mean PDP DataFrame:
+            - "feature_idx" : int feature index within the model
+            - "grid_value"  : float x-grid value (scaled space)
+            - "mean_pdp"    : float mean predicted response across folds
+            - "std_pdp"     : float standard deviation across folds
+        Optional columns:
+            - "feature_name"     : str, used for labeling if present
+            - "grid_value_raw"   : float, required if x_scale="raw"
+
+    model_name:
+        Which model(s) to plot:
+          - None: plot all models found via "*_mean_pdp" keys
+          - str: plot that single model
+          - sequence[str]: plot those models
+
+    feature_names:
+        Optional feature names for labeling:
+          - None: use "feature_name" column if present, else fallback to indices
+          - list[str]: shared list (only appropriate if all models have identical feature sets)
+          - dict[str, list[str]]: per-model names (recommended when models differ)
+
+    x_scale:
+        Which x-axis values to plot:
+          - "scaled": uses "grid_value"
+          - "raw": uses "grid_value_raw" (requires that add_grid_value_raw_to_pdp_agg was run)
+
+    figsize:
+        Figure size for each feature plot.
+
+    font_size:
+        Base font size for labels and ticks.
+
+    y_lim:
+        Optional y-axis limits as (ymin, ymax).
+
+    line_color, fill_color:
+        Colors for the PDP mean line and the ±std shaded band.
+
+    sns_style:
+        Seaborn style passed to sns.set(...).
+
+    fill_alpha:
+        Transparency for the shaded ±std region.
+
+    fill_edgecolor:
+        Optional edge color for the shaded region.
+
+    method_alias:
+        Optional mapping model_key -> display name used in the plot title.
+
+    Raises
+    ------
+    KeyError:
+        If requested models are missing, or if x_scale="raw" but "grid_value_raw" is absent.
+
+    ValueError / TypeError:
+        If pdp_agg entries are missing required columns or are not DataFrames.
+
+    Notes
+    -----
+    - This plots one feature per figure to keep each PDP readable.
+    - If you want a multi-panel grid layout, you can build on the same df grouping logic.
     """
 
     if method_alias is None:
@@ -6880,7 +8290,6 @@ def plot_all_mean_pdp_with_std(
     else:
         selected_models = list(model_name)
 
-    # Validate requested models exist
     missing = [m for m in selected_models if f"{m}{suffix}" not in pdp_agg]
     if missing:
         raise KeyError(
@@ -6925,14 +8334,40 @@ def plot_all_mean_pdp_with_std(
                 f"Run add_grid_value_raw_to_pdp_agg(...) on the mean-PDP tables first."
             )
 
-        has_feature_name = "feature_name" in df.columns
         model_display = method_alias.get(m, m)
+
+        # Determine a fallback feature name list for this model (if df lacks feature_name)
+        fnames_model: Optional[List[str]] = None
+        if "feature_name" not in df.columns:
+            if feature_names is None:
+                fnames_model = None
+            elif isinstance(feature_names, dict):
+                if m not in feature_names:
+                    raise KeyError(
+                        f"feature_names dict missing key '{m}'. Available: {list(feature_names.keys())}"
+                    )
+                fnames_model = list(feature_names[m])
+            else:
+                fnames_model = list(feature_names)
+
+        # Validate fallback length if provided
+        if fnames_model is not None:
+            n_feat_in_df = int(df["feature_idx"].max()) + 1
+            # Note: this assumes feature_idx are 0..(n-1). If not, you can relax this.
+            if len(fnames_model) < n_feat_in_df:
+                raise ValueError(
+                    f"feature_names for model '{m}' has length {len(fnames_model)} "
+                    f"but mean PDP table implies at least {n_feat_in_df} features."
+                )
 
         for feature_id, df_feat in df.groupby("feature_idx"):
             df_feat = df_feat.sort_values(x_col)
 
-            if has_feature_name:
+            # Feature label logic (prefer df column; fallback to provided names; else idx)
+            if "feature_name" in df.columns:
                 feat_label = str(df_feat["feature_name"].iloc[0])
+            elif fnames_model is not None and int(feature_id) < len(fnames_model):
+                feat_label = fnames_model[int(feature_id)]
             else:
                 feat_label = f"feature_idx={feature_id}"
 
@@ -6943,7 +8378,7 @@ def plot_all_mean_pdp_with_std(
                 x=x_col,
                 y="mean_pdp",
                 marker="o",
-                color=line_color,
+                color=line_color, 
             )
 
             x = df_feat[x_col].to_numpy()
@@ -6977,6 +8412,324 @@ def plot_all_mean_pdp_with_std(
             plt.tight_layout()
             plt.show()
 
+
+# def run_pdp_pipeline(
+#     all_results: Dict[str, List[Dict[str, Any]]],
+#     X: np.ndarray,
+#     y: np.ndarray,
+#     feature_names: Optional[Sequence[str]] = None,
+#     *,
+#     data_source: str = "test",
+#     grid_resolution: int = 100,
+#     percentiles: Tuple[float, float] = (0.0, 1.0),
+#     centered: bool = False,
+#     n_points: int = 20,
+#     discrete_threshold: int = 10,
+#     scaler_bundle: Optional[Dict[str, Any]] = None,
+# ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, pd.DataFrame]]:
+#     """
+#     Run the full PDP workflow as a single pipeline with progress reporting.
+
+#     This pipeline wraps up to four steps into one call:
+
+#       (1) compute_pdp_nested_cv:
+#           Computes per-fold partial dependence (PDP) curves for each model and
+#           stores the results back into `all_results` under keys like:
+#             - "pdp_grid_values_test" / "pdp_average_values_test"
+#             - "pdp_grid_values_train" / "pdp_average_values_train"
+#           Note: PDP arrays are NaN-padded per feature so that low-cardinality
+#           features (e.g., binary) can have fewer grid points without breaking
+#           array stacking.
+
+#       (2) aggregate_pdp_nested_cv:
+#           Converts the per-fold (padded) PDP arrays into a single long-format
+#           DataFrame per model, skipping any NaN-padded entries.
+
+#       (3) add_interpolated_mean_pdp_to_agg:
+#           For each model and each feature, creates a canonical x-grid and
+#           interpolates each fold's PDP curve onto it, then computes mean/std
+#           across folds, storing results as:
+#             pdp_agg[f"{model_name}_mean_pdp"].
+
+#       (4) add_grid_value_raw_to_pdp_agg (optional):
+#           If `scaler_bundle` is provided, converts standardized/scaled PDP
+#           x-values (grid_value) back into raw feature units and appends a
+#           `grid_value_raw` column to each DataFrame in `pdp_agg`.
+
+#     A top-level tqdm progress bar is shown to indicate which pipeline stage
+#     is running.
+
+#     Parameters
+#     ----------
+#     all_results:
+#         Nested-CV results dict with structure:
+#           {model_name: [fold_dict_0, fold_dict_1, ...]}
+#         Each fold dict must include:
+#           - "final_model": fitted estimator for that fold
+#           - "outer_train_idx": indices into X for outer-train split
+#           - "outer_test_idx": indices into X for outer-test split
+#         This object is mutated in-place by step (1) to store PDP arrays.
+
+#     X:
+#         Full feature matrix used for the nested CV, shape (n_samples, n_features).
+#         PDP computations slice this matrix using outer_train_idx / outer_test_idx.
+
+#     y:
+#         Label vector, shape (n_samples,). Included for API symmetry with other
+#         code paths; not used directly for PDP computations.
+
+#     feature_names:
+#         Optional list/sequence of feature names (length must equal n_features).
+#         If provided, aggregations include a "feature_name" column.
+
+#     data_source:
+#         Which outer split to compute PDPs on in step (1):
+#           - "train": compute PDP on outer-train split only
+#           - "test":  compute PDP on outer-test split only
+#           - "both":  compute PDP on both outer-train and outer-test splits
+#         Note: step (2) aggregates a single source at a time; if you pass "both",
+#         this pipeline will aggregate "test" by default unless you extend it.
+
+#     grid_resolution:
+#         Requested number of grid points for continuous features in
+#         `PartialDependenceDisplay.from_estimator`. Low-cardinality features may
+#         produce fewer grid points (handled via NaN padding).
+
+#     percentiles:
+#         Percentile range used by scikit-learn to define PDP grid boundaries
+#         (e.g., (0.05, 0.95) trims extremes). Use (0.0, 1.0) to include full range.
+
+#     centered:
+#         Passed to `PartialDependenceDisplay.from_estimator`. If True, centers
+#         the PDP curves.
+
+#     n_points:
+#         Number of points used for the canonical grid when a feature is treated
+#         as continuous in step (3). Larger values produce smoother mean curves.
+
+#     discrete_threshold:
+#         If a feature has <= this many unique x-values across folds, treat it
+#         as discrete in step (3) and use the observed unique values as the
+#         canonical grid (instead of creating a dense linspace).
+
+#     scaler_bundle:
+#         Optional object (as returned by your `load_all_results`) containing the
+#         scaler needed to invert standardized/scaled feature values.
+#         If provided, step (4) runs and adds `grid_value_raw` to each DataFrame
+#         in `pdp_agg`. If None, step (4) is skipped.
+
+#     Returns
+#     -------
+#     all_results:
+#         Same nested-CV results dict as input, mutated in-place with PDP arrays
+#         added per fold.
+
+#     pdp_agg:
+#         Dict mapping:
+#           - pdp_agg[model_name] = long-format PDP points across folds
+#           - pdp_agg[f"{model_name}_mean_pdp"] = mean/std PDP curves per feature
+#         If scaler_bundle is provided, each DataFrame also includes:
+#           - grid_value_raw (inverse-transformed grid values)
+
+#     Notes
+#     -----
+#     - Recommended pattern: load scaler_bundle outside this pipeline (I/O),
+#       then pass the in-memory object into `run_pdp_pipeline`.
+#     """
+
+#     # Decide how many pipeline stages we will run (3 base + optional raw-grid stage).
+#     n_steps = 4 if scaler_bundle is not None else 3
+
+#     # Create a progress bar for the pipeline stages.
+#     steps = tqdm(total=n_steps, desc="PDP pipeline", unit="step")
+
+#     # ---- Step 1: compute per-fold PDP arrays and store them in all_results ----
+#     steps.set_description("PDP pipeline: compute PDP per fold")
+#     all_results = compute_pdp_nested_cv(
+#         all_results=all_results,
+#         X=X,
+#         y=y,
+#         grid_resolution=grid_resolution,
+#         percentiles=percentiles,
+#         data_source=data_source,
+#         centered=centered,
+#     )
+#     steps.update(1)
+
+#     # ---- Step 2: aggregate per-fold PDP arrays into long-format DataFrames ----
+#     steps.set_description("PDP pipeline: aggregate folds")
+#     agg_source = data_source if data_source in ("train", "test") else "test"
+#     pdp_agg = aggregate_pdp_nested_cv(
+#         all_results=all_results,
+#         source=agg_source,
+#         feature_names=feature_names,
+#     )
+#     steps.update(1)
+
+#     # ---- Step 3: compute mean/std PDP curves across folds per feature ----
+#     steps.set_description("PDP pipeline: mean/std curves")
+#     pdp_agg = add_interpolated_mean_pdp_to_agg(
+#         pdp_agg=pdp_agg,
+#         n_points=n_points,
+#         discrete_threshold=discrete_threshold,
+#     )
+#     steps.update(1)
+
+#     # ---- Step 4 (optional): add inverse-transformed raw grid values ----
+#     if scaler_bundle is not None:
+#         steps.set_description("PDP pipeline: add raw grid values")
+#         pdp_agg = add_grid_value_raw_to_pdp_agg(
+#             pdp_agg=pdp_agg,
+#             scaler_bundle=scaler_bundle,
+#         )
+#         steps.update(1)
+
+#     # Close the progress bar cleanly.
+#     steps.close()
+
+#     # Return both the enriched all_results and the aggregated DataFrames.
+#     return all_results, pdp_agg
+
+# def plot_all_mean_pdp_with_std(
+#     pdp_agg: Mapping[str, Any],
+#     model_name: str | Sequence[str] | None = None,  # None -> all models found in pdp_agg
+#     *,
+#     x_scale: Literal["scaled", "raw"] = "scaled",
+#     figsize: tuple[float, float] = (8, 4),
+#     font_size: int = 12,
+#     y_lim: Optional[tuple[float, float]] = None,
+#     line_color: str = "darkblue",
+#     fill_color: str = "blue",
+#     sns_style: str = "whitegrid",
+#     fill_alpha: float = 0.2,
+#     fill_edgecolor: Optional[str] = None,
+#     method_alias: Mapping[str, str] | None = None,  # NEW
+# ) -> None:
+#     """
+#     Plot mean PDP ± std for ALL features, for one or more models.
+
+#     (Same behavior as before; `method_alias` only affects the displayed model name in the title.)
+#     """
+
+#     if method_alias is None:
+#         method_alias = {}
+
+#     # -------------------------
+#     # Decide which models to plot
+#     # -------------------------
+#     suffix = "_mean_pdp"
+#     available_models = sorted(
+#         [k[: -len(suffix)] for k in pdp_agg.keys() if isinstance(k, str) and k.endswith(suffix)]
+#     )
+
+#     if model_name is None:
+#         selected_models = available_models
+#         if not selected_models:
+#             raise KeyError(
+#                 "No '*_mean_pdp' keys found in pdp_agg. "
+#                 "Make sure you called add_interpolated_mean_pdp_to_agg first."
+#             )
+#     elif isinstance(model_name, str):
+#         selected_models = [model_name]
+#     else:
+#         selected_models = list(model_name)
+
+#     # Validate requested models exist
+#     missing = [m for m in selected_models if f"{m}{suffix}" not in pdp_agg]
+#     if missing:
+#         raise KeyError(
+#             f"Model(s) not found in pdp_agg mean PDP keys: {missing}. "
+#             f"Available: {available_models}"
+#         )
+
+#     # Choose x column + xlabel based on requested x_scale
+#     if x_scale == "raw":
+#         x_col = "grid_value_raw"
+#         x_label = "Feature value (raw)"
+#     else:
+#         x_col = "grid_value"
+#         x_label = "Feature value (scaled)"
+
+#     sns.set(style=sns_style)
+
+#     # -------------------------
+#     # Plot: for each model, for each feature -> one figure
+#     # -------------------------
+#     for m in selected_models:
+#         mean_key = f"{m}{suffix}"
+#         df = pdp_agg[mean_key]
+
+#         if df is None or (hasattr(df, "empty") and df.empty):
+#             raise ValueError(f"No mean PDP data available for model '{m}' (key: '{mean_key}').")
+
+#         if not isinstance(df, pd.DataFrame):
+#             raise TypeError(f"pdp_agg['{mean_key}'] must be a pandas DataFrame; got {type(df)}")
+
+#         required_cols = {"feature_idx", "grid_value", "mean_pdp", "std_pdp"}
+#         missing_cols = required_cols - set(df.columns)
+#         if missing_cols:
+#             raise KeyError(
+#                 f"Missing required columns in pdp_agg['{mean_key}']: {sorted(missing_cols)}. "
+#                 f"Found columns: {list(df.columns)}"
+#             )
+
+#         if x_scale == "raw" and x_col not in df.columns:
+#             raise KeyError(
+#                 f"You requested x_scale='raw' but '{x_col}' is missing in pdp_agg['{mean_key}']. "
+#                 f"Run add_grid_value_raw_to_pdp_agg(...) on the mean-PDP tables first."
+#             )
+
+#         has_feature_name = "feature_name" in df.columns
+#         model_display = method_alias.get(m, m)
+
+#         for feature_id, df_feat in df.groupby("feature_idx"):
+#             df_feat = df_feat.sort_values(x_col)
+
+#             if has_feature_name:
+#                 feat_label = str(df_feat["feature_name"].iloc[0])
+#             else:
+#                 feat_label = f"feature_idx={feature_id}"
+
+#             plt.figure(figsize=figsize)
+
+#             ax = sns.lineplot(
+#                 data=df_feat,
+#                 x=x_col,
+#                 y="mean_pdp",
+#                 marker="o",
+#                 color=line_color,
+#             )
+
+#             x = df_feat[x_col].to_numpy()
+#             mean = df_feat["mean_pdp"].to_numpy()
+#             std = df_feat["std_pdp"].to_numpy()
+
+#             ax.fill_between(
+#                 x,
+#                 mean - std,
+#                 mean + std,
+#                 alpha=fill_alpha,
+#                 color=fill_color,
+#                 edgecolor=fill_edgecolor,
+#             )
+
+#             ax.set_xlabel(x_label, fontsize=font_size, fontweight="bold")
+#             ax.set_ylabel("Predicted probability", fontsize=font_size, fontweight="bold")
+#             ax.set_title(
+#                 f"Mean PDP ± std for {feat_label}\nModel: {model_display}",
+#                 fontsize=font_size + 2,
+#                 fontweight="bold",
+#             )
+
+#             if y_lim is not None:
+#                 ax.set_ylim(*y_lim)
+
+#             ax.tick_params(axis="both", labelsize=font_size)
+#             for label in ax.get_xticklabels() + ax.get_yticklabels():
+#                 label.set_fontweight("bold")
+
+#             plt.tight_layout()
+#             plt.show()
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -7533,193 +9286,757 @@ def plot_risk_distributions_by_outcome(
 
 
 
+# def build_long_predictions_df(
+#     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
+#     *,
+#     model_name: str,
+#     groups_all: Optional[np.ndarray] = None,
+#     group_id_to_key: Optional[Mapping[int, Tuple[str, str]]] = None,  # group -> (label_str, subject_id)
+#     methods: Optional[Sequence[str]] = None,
+#     include_uncalibrated: bool = True,
+#     include_test: bool = True,
+#     include_train_oof: bool = False,
+#     # NEW: what to use as unit id when groups aren't available
+#     unit_col: str = "idx",  # in non-grouped setting, unit id is just idx
+# ) -> pd.DataFrame:
+#     """
+#     Build a long table with one row per (idx, fold, variant, split).
+
+#     If groups_all and group_id_to_key are provided, adds:
+#       - group (patient/group id)
+#       - group_label (e.g., "ASD"/"TD")
+#       - subject_id (e.g., NDAR...)
+
+#     Otherwise, omits those fields and uses unit_col (default "idx") as the unit identifier.
+
+#     Output columns (always):
+#       ["model","variant","split","trial","outer_fold","idx","y","p"]
+
+#     Output columns (only if grouping info provided):
+#       + ["group","group_label","subject_id"]
+#     """
+#     if model_name not in all_results:
+#         raise KeyError(f"Model '{model_name}' not found in all_results.")
+
+#     folds = all_results[model_name]
+
+#     have_groups = (groups_all is not None) and (group_id_to_key is not None)
+#     if have_groups:
+#         groups_all = np.asarray(groups_all)
+
+#     # Discover calibration methods if not provided
+#     if methods is None:
+#         discovered = set()
+#         for r in folds:
+#             for k in r.keys():
+#                 if k.startswith("calib_test_predictions_"):
+#                     discovered.add(k.replace("calib_test_predictions_", "", 1))
+#         methods_list = sorted(discovered)
+#     else:
+#         methods_list = list(methods)
+
+#     variants: List[str] = []
+#     if include_uncalibrated:
+#         variants.append("uncalib")
+#     variants.extend(methods_list)
+
+#     rows: List[Dict[str, Any]] = []
+
+#     def _append_rows(
+#         *,
+#         idx_arr: np.ndarray,
+#         y_arr: np.ndarray,
+#         p_arr: np.ndarray,
+#         split_name: str,
+#         trial: Any,
+#         outer_fold: Any,
+#         variant: str,
+#     ) -> None:
+#         idx_arr = np.asarray(idx_arr, dtype=int)
+#         y_arr = np.asarray(y_arr, dtype=int)
+#         p_arr = np.asarray(p_arr, dtype=float)
+
+#         if len(idx_arr) != len(y_arr) or len(idx_arr) != len(p_arr):
+#             raise ValueError(
+#                 f"Length mismatch: trial={trial}, outer_fold={outer_fold}, variant={variant}, split={split_name} "
+#                 f"len(idx)={len(idx_arr)}, len(y)={len(y_arr)}, len(p)={len(p_arr)}"
+#             )
+
+#         if have_groups:
+#             assert groups_all is not None and group_id_to_key is not None
+
+#             if idx_arr.max(initial=-1) >= len(groups_all) or idx_arr.min(initial=0) < 0:
+#                 raise IndexError(
+#                     f"Some idx values are out of bounds for groups_all (len={len(groups_all)}). "
+#                     f"idx range: [{idx_arr.min()}, {idx_arr.max()}]"
+#                 )
+
+#             g_arr = groups_all[idx_arr]
+
+#             # lookup label_str and subject_id per group
+#             label_strs = []
+#             subject_ids = []
+#             for g in g_arr:
+#                 lab, sid = group_id_to_key.get(int(g), (None, None))
+#                 label_strs.append(lab)
+#                 subject_ids.append(sid)
+
+#             for i, g, lab, sid, yy, pp in zip(idx_arr, g_arr, label_strs, subject_ids, y_arr, p_arr):
+#                 rows.append({
+#                     "model": model_name,
+#                     "variant": variant,
+#                     "split": split_name,
+#                     "trial": trial,
+#                     "outer_fold": outer_fold,
+#                     "idx": int(i),
+#                     "group": int(g),
+#                     "group_label": lab,
+#                     "subject_id": sid,
+#                     "y": int(yy),
+#                     "p": float(pp),
+#                 })
+#         else:
+#             # Non-grouped case: unit is just idx (or whatever you pass as unit_col).
+#             # We do NOT invent group_label/subject_id here because the function doesn't know them.
+#             for i, yy, pp in zip(idx_arr, y_arr, p_arr):
+#                 rows.append({
+#                     "model": model_name,
+#                     "variant": variant,
+#                     "split": split_name,
+#                     "trial": trial,
+#                     "outer_fold": outer_fold,
+#                     "idx": int(i),
+#                     unit_col: int(i) if unit_col != "idx" else int(i),  # keep explicit for clarity
+#                     "y": int(yy),
+#                     "p": float(pp),
+#                 })
+
+#     for r in folds:
+#         trial = r.get("trial", None)
+#         outer_fold = r.get("outer_fold", None)
+
+#         # ---------- outer test ----------
+#         if include_test:
+#             idx = np.asarray(r["outer_test_idx"], dtype=int)
+#             y = np.asarray(r["y_test"], dtype=int)
+
+#             for v in variants:
+#                 key = "y_test_scores" if v == "uncalib" else f"calib_test_predictions_{v}"
+#                 if key not in r:
+#                     continue
+#                 p = np.asarray(r[key], dtype=float)
+
+#                 _append_rows(
+#                     idx_arr=idx,
+#                     y_arr=y,
+#                     p_arr=p,
+#                     split_name="test",
+#                     trial=trial,
+#                     outer_fold=outer_fold,
+#                     variant=v,
+#                 )
+
+#         # ---------- train OOF (optional) ----------
+#         if include_train_oof:
+#             idx_tr = np.asarray(r["outer_train_idx"], dtype=int)
+#             y_tr = np.asarray(r["y_train"], dtype=int)
+
+#             for v in variants:
+#                 key = "cv_uncalib_train_predictions" if v == "uncalib" else f"cv_calib_train_predictions_{v}"
+#                 if key not in r:
+#                     continue
+#                 p_tr = np.asarray(r[key], dtype=float)
+
+#                 _append_rows(
+#                     idx_arr=idx_tr,
+#                     y_arr=y_tr,
+#                     p_arr=p_tr,
+#                     split_name="train_oof",
+#                     trial=trial,
+#                     outer_fold=outer_fold,
+#                     variant=v,
+#                 )
+
+#     df = pd.DataFrame(rows)
+
+#     # dtypes
+#     if not df.empty:
+#         df["model"] = df["model"].astype(str)
+#         df["variant"] = df["variant"].astype(str)
+#         df["split"] = df["split"].astype(str)
+#         df["idx"] = df["idx"].astype(int)
+#         df["y"] = df["y"].astype(int)
+#         df["p"] = df["p"].astype(float)
+
+#         if have_groups:
+#             df["group"] = df["group"].astype(int)
+
+#     return df
+
+# def pooled_patient_risk_summary(
+#     df_long: pd.DataFrame,
+#     *,
+#     agg: Literal["mean", "median", "max", "quantile", "softmax"] = "mean",
+#     quantile: float = 0.75,
+#     beta: float = 5.0,
+#     eps: float = 1e-6,
+#     lower_q: float = 0.05,
+#     upper_q: float = 0.95,
+#     ddof: int = 0,
+#     grouping: Literal["all_trials", "per_trial_fold"] = "all_trials",
+#     unit_col: Optional[str] = "group",
+#     # guardrail (optional)
+#     min_expected_rows_per_unit: Optional[int] = None,
+# ) -> pd.DataFrame:
+#     """
+#     Aggregate window-/row-level predicted probabilities to patient-level summaries.
+
+#     Context / why this exists
+#     -------------------------
+#     In your EEG setting, each patient (a.k.a. *group*) contributes many rows/windows that all share
+#     the same clinical label. During repeated/nested cross-validation, a patient may appear in the outer-test
+#     set multiple times (across trials/seeds and outer folds). Therefore, for a given patient you can end up
+#     with many out-of-sample predicted probabilities:
+#       - variability across EEG windows within the patient
+#       - variability across CV repetitions / train-test splits (different fitted models)
+
+#     This function is designed to support BOTH common aggregation choices with the SAME code path:
+
+#     Parameters
+#     ----------
+#     df_long:
+#         Long table with at least columns:
+#         ["model","variant","split","trial","outer_fold","group","subject_id","group_label","y","p"].
+#         Each row is typically a window/epoch prediction for a patient/group.
+#         Notes:
+#         - trial/outer_fold must be present if grouping="per_trial_fold".
+#         - p should be numeric probabilities in [0, 1]. Non-numeric values are coerced to NaN and dropped
+#             within each group.
+
+#     grouping:
+#         Controls what constitutes a “patient aggregation unit” (i.e., the groupby key).
+#         - "all_trials":      ["model","variant","split","group"]
+#             Pools window-level predictions for a patient across ALL CV runs (trial × outer_fold).
+#             Interpretation: for each patient, pool *all* out-of-sample window-level predictions across all runs,
+#             then compute a single patient-level center + spread.
+
+#         - "per_trial_fold":  ["model","variant","split","trial","outer_fold","group"]
+#             Computes one patient summary per run (trial × outer_fold), isolating within-run window variability.
+#             Interpretation: compute one patient-level summary per CV run (trial × outer_fold), using only that run’s
+#             window-level predictions for the patient. This isolates within-patient window heterogeneity per run.
+
+#     agg:
+#         Aggregation used to produce a single patient-level probability summary from the (optionally winsorized)
+#         window probabilities.
+#         - "mean": mean of p_used within group
+#         - "median": median of p_used within group
+#         - "max": max of p_used within group (max pooling)
+#         - "quantile": quantile(p_used, quantile) within group (quantile pooling)
+#         - "softmax": softmax-pooled weighted mean of probabilities within group
+#             weights = softmax(beta * logit(p_used))
+#             p_softmax = sum_i w_i * p_used_i
+#             (Output remains in [0, 1] because it is a convex combination of probabilities.)
+
+#     quantile:
+#         Quantile used when agg="quantile". Must be in [0, 1]. Default 0.75.
+#         Example: quantile=0.90 returns the 90th percentile of the within-group (winsorized) probabilities.
+
+#     beta:
+#         Softmax sharpness used when agg="softmax". Must be > 0. Default 5.0.
+#         Interpretation:
+#         - beta -> 0: weights become nearly uniform (approaches mean pooling)
+#         - larger beta: weights concentrate on the highest-evidence windows (more max-like)
+
+#     eps:
+#         Numerical stability clip used when agg="softmax". Default 1e-6.
+#         Probabilities are clipped to [eps, 1-eps] before computing logit(p) to avoid infinities.
+
+#     lower_q, upper_q:
+#         Winsorization quantile cutoffs in [0, 1], with lower_q < upper_q.
+#         These are applied within each group defined by `grouping`.
+#         - lower_q == 0.0 disables LOWER capping (no lower winsorization)
+#         - upper_q == 1.0 disables UPPER capping (no upper winsorization)
+#         If a side is disabled, its reported cap value (p_cap_low or p_cap_high) is set to NaN to avoid
+#         implying a cap was applied.
+#         Setting lower_q=0.0 and upper_q=1.0 disables winsorization entirely (p_used == p).
+
+#     ddof:
+#         Degrees of freedom used for standard deviation of p_used within each group (np.std).
+#         Default 0. (ddof=1 gives the sample standard deviation.)
+
+#     unit_col:
+#         Column that identifies the “unit” you are aggregating to.
+#         - EEG windowed setting: unit_col="group" (patient id for GroupKFold)
+#         - Single-row-per-patient setting: unit_col="idx" (unique patient row id)
+#         If unit_col is None, the function will attempt to infer one from ["group","subject_id","idx"].
+
+#     min_expected_rows_per_unit:
+#         Optional guardrail. If set (e.g., 2 or 10), the function raises if median rows per unit is below this,
+#         which helps catch mistakes like using a per-row unique id in a windowed dataset.
+#         Leave as None for the future "one row per patient" case where n_rows_per_unit == 1 is expected.        
+#     Returns
+#     -------
+#     pd.DataFrame
+#         One row per unique key defined by `grouping`, containing:
+#         - the grouping key columns (e.g., model/variant/split/group, plus trial/outer_fold if per_trial_fold),
+#         - subject_id, group_label, y (taken as the first value within the group),
+#         - n_windows: number of non-NaN window probabilities used,
+#         - p_mean / p_median / p_max / p_qXX / p_softmax: the chosen patient-level probability summary,
+#         - p_total_std: std of p_used within group (interpreted according to the chosen grouping),
+#         - lower_q, upper_q and realized cap values p_cap_low / p_cap_high,
+#         - for softmax: beta, eps
+#         - for quantile: quantile
+
+#     """
+#     # -------------------------
+#     # Infer unit_col if needed
+#     # -------------------------
+#     if unit_col is None:
+#         for cand in ("group", "subject_id", "idx"):
+#             if cand in df_long.columns:
+#                 unit_col = cand
+#                 break
+#         if unit_col is None:
+#             raise KeyError("Could not infer unit_col. Please pass unit_col='group' or 'idx' (or another id column).")
+
+#     if unit_col not in df_long.columns:
+#         raise KeyError(f"unit_col='{unit_col}' not found in df_long columns.")
+
+#     # -------------------------
+#     # Grouping schemes (built from unit_col)
+#     # -------------------------
+#     GROUPING_SCHEMES: Dict[str, list[str]] = {
+#         "all_trials": ["model", "variant", "split", unit_col],
+#         "per_trial_fold": ["model", "variant", "split", "trial", "outer_fold", unit_col],
+#     }
+#     if grouping not in GROUPING_SCHEMES:
+#         raise ValueError(f"Unknown grouping='{grouping}'. Choose one of {list(GROUPING_SCHEMES)}")
+
+#     group_cols = GROUPING_SCHEMES[grouping]
+
+#     # -------------------------
+#     # Validation
+#     # -------------------------
+#     if agg not in ("mean", "median", "max", "quantile", "softmax"):
+#         raise ValueError("agg must be one of {'mean','median','max','quantile','softmax'}")
+
+#     if agg == "quantile" and not (0.0 <= quantile <= 1.0):
+#         raise ValueError(f"quantile must be in [0,1] for quantile pooling. Got {quantile}")
+
+#     if agg == "softmax":
+#         if beta <= 0:
+#             raise ValueError(f"beta must be > 0 for softmax pooling. Got {beta}")
+#         if eps <= 0 or eps >= 0.1:
+#             raise ValueError(f"eps should be small and positive (e.g. 1e-6). Got {eps}")
+
+#     if not (0.0 <= lower_q <= 1.0 and 0.0 <= upper_q <= 1.0 and lower_q < upper_q):
+#         raise ValueError(f"Require 0 <= lower_q < upper_q <= 1. Got {lower_q}, {upper_q}")
+
+#     required_base = {"model", "variant", "split", "subject_id", "group_label", "y", "p", unit_col}
+#     missing = required_base - set(df_long.columns)
+#     if missing:
+#         raise KeyError(f"df_long missing required columns: {sorted(missing)}")
+
+#     need_cols = set(group_cols) - set(df_long.columns)
+#     if need_cols:
+#         raise KeyError(f"grouping='{grouping}' requires missing columns: {sorted(need_cols)}")
+
+#     d = df_long.copy()
+#     d["p"] = pd.to_numeric(d["p"], errors="coerce")
+
+#     # -------------------------
+#     # Optional guardrail
+#     # -------------------------
+#     if min_expected_rows_per_unit is not None:
+#         # compute within the filtered dataframe d (not grouped by run)
+#         counts = d.groupby([unit_col], sort=False).size()
+#         if len(counts) > 0:
+#             med = float(np.median(counts.to_numpy()))
+#             if med < float(min_expected_rows_per_unit):
+#                 raise ValueError(
+#                     f"Guardrail: median rows per unit ({unit_col}) is {med:.1f}, "
+#                     f"below min_expected_rows_per_unit={min_expected_rows_per_unit}. "
+#                     f"Did you accidentally set unit_col to a per-row unique id?"
+#                 )
+
+#     # -------------------------
+#     # Output column naming
+#     # -------------------------
+#     if agg == "quantile":
+#         q_tag = int(round(quantile * 100))
+#         center_col = f"p_q{q_tag}"
+#     elif agg == "softmax":
+#         center_col = "p_softmax"
+#     else:
+#         center_col = {"mean": "p_mean", "median": "p_median", "max": "p_max"}[agg]
+
+#     out_rows: list[dict] = []
+
+#     # Independent-sided winsorization flags
+#     apply_low = (lower_q > 0.0)
+#     apply_high = (upper_q < 1.0)
+
+#     for keys, gdf in d.groupby(group_cols, sort=False):
+#         p = gdf["p"].to_numpy(dtype=float)
+#         p = p[~np.isnan(p)]
+#         if p.size == 0:
+#             continue
+
+#         # Winsorize (optional, per side)
+#         if not apply_low and not apply_high:
+#             lo = np.nan
+#             hi = np.nan
+#             p_used = p
+#         else:
+#             lo = float(np.quantile(p, lower_q)) if apply_low else np.nan
+#             hi = float(np.quantile(p, upper_q)) if apply_high else np.nan
+#             lo_clip = lo if apply_low else -np.inf
+#             hi_clip = hi if apply_high else np.inf
+#             p_used = np.clip(p, lo_clip, hi_clip)
+
+#         # Aggregate
+#         if agg == "mean":
+#             p_center = float(np.mean(p_used))
+#         elif agg == "median":
+#             p_center = float(np.median(p_used))
+#         elif agg == "max":
+#             p_center = float(np.max(p_used))
+#         elif agg == "quantile":
+#             p_center = float(np.quantile(p_used, quantile))
+#         else:  # "softmax"
+#             p_clip = np.clip(p_used, eps, 1.0 - eps)
+#             s = np.log(p_clip) - np.log1p(-p_clip)  # logit(p)
+#             t = beta * s
+#             t = t - np.max(t)
+#             w = np.exp(t)
+#             w_sum = np.sum(w)
+#             if not np.isfinite(w_sum) or w_sum == 0.0:
+#                 p_center = float(np.mean(p_used))
+#             else:
+#                 w = w / w_sum
+#                 p_center = float(np.sum(w * p_used))
+
+#         # Spread (on winsorized values, regardless of agg)
+#         p_std = float(np.std(p_used, ddof=ddof))
+
+#         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+#         row.update(
+#             {
+#                 "grouping": grouping,
+#                 "unit_col": unit_col,
+#                 "subject_id": gdf["subject_id"].iloc[0],
+#                 "group_label": gdf["group_label"].iloc[0],
+#                 "y": int(gdf["y"].iloc[0]),
+#                 "n_windows": int(p.size),
+#                 center_col: p_center,
+#                 "p_total_std": p_std,
+#                 "lower_q": float(lower_q),
+#                 "upper_q": float(upper_q),
+#                 "p_cap_low": lo,
+#                 "p_cap_high": hi,
+#             }
+#         )
+
+#         if agg == "quantile":
+#             row["quantile"] = float(quantile)
+#         if agg == "softmax":
+#             row["beta"] = float(beta)
+#             row["eps"] = float(eps)
+
+#         out_rows.append(row)
+
+#     return pd.DataFrame(out_rows)
+
+
+
+
 def build_long_predictions_df(
     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
-    model_name: str,
+    model_name: str | Sequence[str] | None = None,   
     groups_all: Optional[np.ndarray] = None,
     group_id_to_key: Optional[Mapping[int, Tuple[str, str]]] = None,  # group -> (label_str, subject_id)
     methods: Optional[Sequence[str]] = None,
     include_uncalibrated: bool = True,
     include_test: bool = True,
     include_train_oof: bool = False,
-    # NEW: what to use as unit id when groups aren't available
-    unit_col: str = "idx",  # in non-grouped setting, unit id is just idx
+    unit_col: str = "idx",
 ) -> pd.DataFrame:
     """
-    Build a long table with one row per (idx, fold, variant, split).
+    Build a long-form predictions table with one row per predicted example, optionally across
+    multiple models.
 
-    If groups_all and group_id_to_key are provided, adds:
-      - group (patient/group id)
-      - group_label (e.g., "ASD"/"TD")
-      - subject_id (e.g., NDAR...)
+    This function converts `all_results` (a dict keyed by model name, where each value is a
+    sequence of per-fold result dictionaries) into a single tidy/long pandas DataFrame suitable
+    for downstream aggregation (e.g., patient pooling) and plotting.
 
-    Otherwise, omits those fields and uses unit_col (default "idx") as the unit identifier.
+    Row granularity
+    ---------------
+    Each output row corresponds to a single prediction for a single index `idx` within a given:
+      - model
+      - variant (uncalibrated or a calibration method)
+      - split ("test" and/or "train_oof")
+      - trial and outer_fold
 
-    Output columns (always):
-      ["model","variant","split","trial","outer_fold","idx","y","p"]
+    Group / patient metadata (optional)
+    -----------------------------------
+    If both `groups_all` and `group_id_to_key` are provided, the function adds group-level
+    identifiers for each row by mapping `idx -> group` and then `group -> (group_label, subject_id)`:
+      - group: integer patient/group id
+      - group_label: e.g., "ASD" / "TD"
+      - subject_id: e.g., "NDAR..."
 
-    Output columns (only if grouping info provided):
-      + ["group","group_label","subject_id"]
+    If grouping info is not provided, group-level columns are omitted and `unit_col` may be
+    included as an identifier for downstream aggregation.
+
+    Parameters
+    ----------
+    all_results:
+        Mapping from model name -> sequence of fold dictionaries (trial/outer_fold) containing
+        indices, labels, and prediction arrays (including optional calibrated predictions).
+
+    model_name:
+        Controls which models to include:
+          - None (default): include ALL models in `all_results`
+          - str: include a single model
+          - Sequence[str]: include only the specified models
+        Model names must match keys in `all_results`.
+
+    methods:
+        Calibration methods to include (e.g., ["beta"]).
+        If None, methods are discovered per model by scanning keys that start with
+        "calib_test_predictions_" in that model's fold dictionaries.
+
+    include_uncalibrated:
+        If True, include the uncalibrated variant ("uncalib") using:
+          - test:  "y_test_scores"
+          - train: "cv_uncalib_train_predictions" (when include_train_oof=True)
+
+    include_test:
+        If True, include outer test predictions (split="test") using "outer_test_idx"/"y_test".
+
+    include_train_oof:
+        If True, include outer-train out-of-fold predictions (split="train_oof") using
+        "outer_train_idx"/"y_train" and CV prediction keys.
+
+    unit_col:
+        In the non-grouped setting (no groups_all / group_id_to_key), an additional identifier
+        column name to include per row (default "idx"). This can be useful if downstream code
+        expects a "unit id" column even when patient groups are unavailable.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form predictions table.
+
+        Always included columns:
+          ["model", "variant", "split", "trial", "outer_fold", "idx", "y", "p"]
+
+        Included only when grouping info is provided:
+          + ["group", "group_label", "subject_id"]
+
+        Included only in the non-grouped case:
+          + [unit_col] (if unit_col is not "idx", it will still be present explicitly)
+
+    Raises
+    ------
+    KeyError:
+        If requested model(s) are not present in `all_results`, or required prediction keys are missing.
+    ValueError:
+        If idx/y/p lengths mismatch for any fold/variant/split.
+    IndexError:
+        If idx values are out of bounds for `groups_all` when grouping info is provided.
     """
-    if model_name not in all_results:
-        raise KeyError(f"Model '{model_name}' not found in all_results.")
 
-    folds = all_results[model_name]
+    # -------------------------
+    # Resolve model list
+    # -------------------------
+    if model_name is None:
+        model_names: List[str] = list(all_results.keys())
+    elif isinstance(model_name, str):
+        model_names = [model_name]
+    else:
+        model_names = list(model_name)
+
+    missing = [m for m in model_names if m not in all_results]
+    if missing:
+        raise KeyError(
+            f"Model(s) not found in all_results: {missing}. "
+            f"Available: {list(all_results.keys())}"
+        )
 
     have_groups = (groups_all is not None) and (group_id_to_key is not None)
     if have_groups:
         groups_all = np.asarray(groups_all)
 
-    # Discover calibration methods if not provided
-    if methods is None:
-        discovered = set()
-        for r in folds:
-            for k in r.keys():
-                if k.startswith("calib_test_predictions_"):
-                    discovered.add(k.replace("calib_test_predictions_", "", 1))
-        methods_list = sorted(discovered)
-    else:
-        methods_list = list(methods)
+    all_dfs: List[pd.DataFrame] = []
 
-    variants: List[str] = []
-    if include_uncalibrated:
-        variants.append("uncalib")
-    variants.extend(methods_list)
+    # -------------------------
+    # Loop models, reuse your existing logic
+    # -------------------------
+    for mname in model_names:
+        folds = all_results[mname]
 
-    rows: List[Dict[str, Any]] = []
-
-    def _append_rows(
-        *,
-        idx_arr: np.ndarray,
-        y_arr: np.ndarray,
-        p_arr: np.ndarray,
-        split_name: str,
-        trial: Any,
-        outer_fold: Any,
-        variant: str,
-    ) -> None:
-        idx_arr = np.asarray(idx_arr, dtype=int)
-        y_arr = np.asarray(y_arr, dtype=int)
-        p_arr = np.asarray(p_arr, dtype=float)
-
-        if len(idx_arr) != len(y_arr) or len(idx_arr) != len(p_arr):
-            raise ValueError(
-                f"Length mismatch: trial={trial}, outer_fold={outer_fold}, variant={variant}, split={split_name} "
-                f"len(idx)={len(idx_arr)}, len(y)={len(y_arr)}, len(p)={len(p_arr)}"
-            )
-
-        if have_groups:
-            assert groups_all is not None and group_id_to_key is not None
-
-            if idx_arr.max(initial=-1) >= len(groups_all) or idx_arr.min(initial=0) < 0:
-                raise IndexError(
-                    f"Some idx values are out of bounds for groups_all (len={len(groups_all)}). "
-                    f"idx range: [{idx_arr.min()}, {idx_arr.max()}]"
-                )
-
-            g_arr = groups_all[idx_arr]
-
-            # lookup label_str and subject_id per group
-            label_strs = []
-            subject_ids = []
-            for g in g_arr:
-                lab, sid = group_id_to_key.get(int(g), (None, None))
-                label_strs.append(lab)
-                subject_ids.append(sid)
-
-            for i, g, lab, sid, yy, pp in zip(idx_arr, g_arr, label_strs, subject_ids, y_arr, p_arr):
-                rows.append({
-                    "model": model_name,
-                    "variant": variant,
-                    "split": split_name,
-                    "trial": trial,
-                    "outer_fold": outer_fold,
-                    "idx": int(i),
-                    "group": int(g),
-                    "group_label": lab,
-                    "subject_id": sid,
-                    "y": int(yy),
-                    "p": float(pp),
-                })
+        # Discover calibration methods if not provided (PER MODEL)
+        if methods is None:
+            discovered = set()
+            for r in folds:
+                for k in r.keys():
+                    if k.startswith("calib_test_predictions_"):
+                        discovered.add(k.replace("calib_test_predictions_", "", 1))
+            methods_list = sorted(discovered)
         else:
-            # Non-grouped case: unit is just idx (or whatever you pass as unit_col).
-            # We do NOT invent group_label/subject_id here because the function doesn't know them.
-            for i, yy, pp in zip(idx_arr, y_arr, p_arr):
-                rows.append({
-                    "model": model_name,
-                    "variant": variant,
-                    "split": split_name,
-                    "trial": trial,
-                    "outer_fold": outer_fold,
-                    "idx": int(i),
-                    unit_col: int(i) if unit_col != "idx" else int(i),  # keep explicit for clarity
-                    "y": int(yy),
-                    "p": float(pp),
-                })
+            methods_list = list(methods)
 
-    for r in folds:
-        trial = r.get("trial", None)
-        outer_fold = r.get("outer_fold", None)
+        variants: List[str] = []
+        if include_uncalibrated:
+            variants.append("uncalib")
+        variants.extend(methods_list)
 
-        # ---------- outer test ----------
-        if include_test:
-            idx = np.asarray(r["outer_test_idx"], dtype=int)
-            y = np.asarray(r["y_test"], dtype=int)
+        rows: List[Dict[str, Any]] = []
 
-            for v in variants:
-                key = "y_test_scores" if v == "uncalib" else f"calib_test_predictions_{v}"
-                if key not in r:
-                    continue
-                p = np.asarray(r[key], dtype=float)
+        def _append_rows(
+            *,
+            idx_arr: np.ndarray,
+            y_arr: np.ndarray,
+            p_arr: np.ndarray,
+            split_name: str,
+            trial: Any,
+            outer_fold: Any,
+            variant: str,
+        ) -> None:
+            idx_arr = np.asarray(idx_arr, dtype=int)
+            y_arr = np.asarray(y_arr, dtype=int)
+            p_arr = np.asarray(p_arr, dtype=float)
 
-                _append_rows(
-                    idx_arr=idx,
-                    y_arr=y,
-                    p_arr=p,
-                    split_name="test",
-                    trial=trial,
-                    outer_fold=outer_fold,
-                    variant=v,
+            if len(idx_arr) != len(y_arr) or len(idx_arr) != len(p_arr):
+                raise ValueError(
+                    f"Length mismatch: model={mname}, trial={trial}, outer_fold={outer_fold}, "
+                    f"variant={variant}, split={split_name} "
+                    f"len(idx)={len(idx_arr)}, len(y)={len(y_arr)}, len(p)={len(p_arr)}"
                 )
 
-        # ---------- train OOF (optional) ----------
-        if include_train_oof:
-            idx_tr = np.asarray(r["outer_train_idx"], dtype=int)
-            y_tr = np.asarray(r["y_train"], dtype=int)
+            if have_groups:
+                assert groups_all is not None and group_id_to_key is not None
 
-            for v in variants:
-                key = "cv_uncalib_train_predictions" if v == "uncalib" else f"cv_calib_train_predictions_{v}"
-                if key not in r:
-                    continue
-                p_tr = np.asarray(r[key], dtype=float)
+                if idx_arr.max(initial=-1) >= len(groups_all) or idx_arr.min(initial=0) < 0:
+                    raise IndexError(
+                        f"Some idx values are out of bounds for groups_all (len={len(groups_all)}). "
+                        f"idx range: [{idx_arr.min()}, {idx_arr.max()}]"
+                    )
 
-                _append_rows(
-                    idx_arr=idx_tr,
-                    y_arr=y_tr,
-                    p_arr=p_tr,
-                    split_name="train_oof",
-                    trial=trial,
-                    outer_fold=outer_fold,
-                    variant=v,
-                )
+                g_arr = groups_all[idx_arr]
 
-    df = pd.DataFrame(rows)
+                # lookup label_str and subject_id per group
+                label_strs: List[Optional[str]] = []
+                subject_ids: List[Optional[str]] = []
+                for g in g_arr:
+                    lab, sid = group_id_to_key.get(int(g), (None, None))
+                    label_strs.append(lab)
+                    subject_ids.append(sid)
 
-    # dtypes
-    if not df.empty:
-        df["model"] = df["model"].astype(str)
-        df["variant"] = df["variant"].astype(str)
-        df["split"] = df["split"].astype(str)
-        df["idx"] = df["idx"].astype(int)
-        df["y"] = df["y"].astype(int)
-        df["p"] = df["p"].astype(float)
+                for i, g, lab, sid, yy, pp in zip(idx_arr, g_arr, label_strs, subject_ids, y_arr, p_arr):
+                    rows.append({
+                        "model": mname,
+                        "variant": variant,
+                        "split": split_name,
+                        "trial": trial,
+                        "outer_fold": outer_fold,
+                        "idx": int(i),
+                        "group": int(g),
+                        "group_label": lab,
+                        "subject_id": sid,
+                        "y": int(yy),
+                        "p": float(pp),
+                    })
+            else:
+                for i, yy, pp in zip(idx_arr, y_arr, p_arr):
+                    rows.append({
+                        "model": mname,
+                        "variant": variant,
+                        "split": split_name,
+                        "trial": trial,
+                        "outer_fold": outer_fold,
+                        "idx": int(i),
+                        unit_col: int(i) if unit_col != "idx" else int(i),
+                        "y": int(yy),
+                        "p": float(pp),
+                    })
 
-        if have_groups:
-            df["group"] = df["group"].astype(int)
+        for r in folds:
+            trial = r.get("trial", None)
+            outer_fold = r.get("outer_fold", None)
 
-    return df
+            # ---------- outer test ----------
+            if include_test:
+                idx = np.asarray(r["outer_test_idx"], dtype=int)
+                y = np.asarray(r["y_test"], dtype=int)
 
+                for v in variants:
+                    key = "y_test_scores" if v == "uncalib" else f"calib_test_predictions_{v}"
+                    if key not in r:
+                        continue
+                    p = np.asarray(r[key], dtype=float)
+
+                    _append_rows(
+                        idx_arr=idx,
+                        y_arr=y,
+                        p_arr=p,
+                        split_name="test",
+                        trial=trial,
+                        outer_fold=outer_fold,
+                        variant=v,
+                    )
+
+            # ---------- train OOF (optional) ----------
+            if include_train_oof:
+                idx_tr = np.asarray(r["outer_train_idx"], dtype=int)
+                y_tr = np.asarray(r["y_train"], dtype=int)
+
+                for v in variants:
+                    key = "cv_uncalib_train_predictions" if v == "uncalib" else f"cv_calib_train_predictions_{v}"
+                    if key not in r:
+                        continue
+                    p_tr = np.asarray(r[key], dtype=float)
+
+                    _append_rows(
+                        idx_arr=idx_tr,
+                        y_arr=y_tr,
+                        p_arr=p_tr,
+                        split_name="train_oof",
+                        trial=trial,
+                        outer_fold=outer_fold,
+                        variant=v,
+                    )
+
+        df_m = pd.DataFrame(rows)
+
+        # dtypes
+        if not df_m.empty:
+            df_m["model"] = df_m["model"].astype(str)
+            df_m["variant"] = df_m["variant"].astype(str)
+            df_m["split"] = df_m["split"].astype(str)
+            df_m["idx"] = df_m["idx"].astype(int)
+            df_m["y"] = df_m["y"].astype(int)
+            df_m["p"] = df_m["p"].astype(float)
+            if have_groups:
+                df_m["group"] = df_m["group"].astype(int)
+
+        all_dfs.append(df_m)
+
+    # Combine across models
+    if len(all_dfs) == 0:
+        return pd.DataFrame()
+
+    df_all = pd.concat(all_dfs, ignore_index=True)
+
+    # Optional: stable ordering (nice for debugging)
+    sort_cols = ["model", "variant", "split", "trial", "outer_fold", "idx"]
+    sort_cols = [c for c in sort_cols if c in df_all.columns]
+    if sort_cols:
+        df_all = df_all.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    return df_all
 
 
 
@@ -7733,129 +10050,147 @@ def pooled_patient_risk_summary(
     lower_q: float = 0.05,
     upper_q: float = 0.95,
     ddof: int = 0,
-    grouping: Literal["all_trials", "per_trial_fold"] = "all_trials",
+    grouping: Literal["all_trials", "per_trial_fold"] | None = "all_trials",
     unit_col: Optional[str] = "group",
-    # guardrail (optional)
-    min_expected_rows_per_unit: Optional[int] = None,
+    splits: Optional[Sequence[str]] = None,
+    include_test: bool = True,
+    include_train_oof: bool = False,
 ) -> pd.DataFrame:
     """
-    Aggregate window-/row-level predicted probabilities to patient-level summaries.
+    Aggregate row-/window-level predicted probabilities into unit-level (e.g., patient-level) summaries.
 
-    Context / why this exists
-    -------------------------
-    In your EEG setting, each patient (a.k.a. *group*) contributes many rows/windows that all share
-    the same clinical label. During repeated/nested cross-validation, a patient may appear in the outer-test
-    set multiple times (across trials/seeds and outer folds). Therefore, for a given patient you can end up
-    with many out-of-sample predicted probabilities:
-      - variability across EEG windows within the patient
-      - variability across CV repetitions / train-test splits (different fitted models)
+    This function takes a "long" prediction table where each unit (patient/subject) may appear multiple
+    times (e.g., many EEG windows, and/or repeated cross-validation runs), and returns one row per unit
+    (within each model/variant/split), summarizing the distribution of predicted probabilities.
 
-    This function is designed to support BOTH common aggregation choices with the SAME code path:
+    Expected input (df_long)
+    ------------------------
+    Must include:
+    - model:   model name/identifier
+    - variant: calibration/variant label (e.g., "beta", "uncalib")
+    - split:   split label (e.g., "test", "train_oof")
+    - p:       predicted probability in [0, 1]
+    - y:       true label (0/1)
+    - unit_col: column identifying the unit you want to aggregate to (default "group"; can be "idx")
+
+    May include (optional):
+    - subject_id: string subject identifier
+    - group_label: human-readable label (if missing, the output uses y as group_label)
+
+    If grouping="per_trial_fold", df_long must also include:
+    - trial, outer_fold
+
+    Key idea
+    --------
+    Within each grouping bucket, probabilities are optionally winsorized (capped at within-bucket
+    quantiles), then aggregated to a single "center" probability (mean/median/max/quantile/softmax),
+    and a within-bucket spread (std) is computed.
 
     Parameters
     ----------
-    df_long:
-        Long table with at least columns:
-        ["model","variant","split","trial","outer_fold","group","subject_id","group_label","y","p"].
-        Each row is typically a window/epoch prediction for a patient/group.
-        Notes:
-        - trial/outer_fold must be present if grouping="per_trial_fold".
-        - p should be numeric probabilities in [0, 1]. Non-numeric values are coerced to NaN and dropped
-            within each group.
-
-    grouping:
-        Controls what constitutes a “patient aggregation unit” (i.e., the groupby key).
-        - "all_trials":      ["model","variant","split","group"]
-            Pools window-level predictions for a patient across ALL CV runs (trial × outer_fold).
-            Interpretation: for each patient, pool *all* out-of-sample window-level predictions across all runs,
-            then compute a single patient-level center + spread.
-
-        - "per_trial_fold":  ["model","variant","split","trial","outer_fold","group"]
-            Computes one patient summary per run (trial × outer_fold), isolating within-run window variability.
-            Interpretation: compute one patient-level summary per CV run (trial × outer_fold), using only that run’s
-            window-level predictions for the patient. This isolates within-patient window heterogeneity per run.
-
     agg:
-        Aggregation used to produce a single patient-level probability summary from the (optionally winsorized)
-        window probabilities.
-        - "mean": mean of p_used within group
-        - "median": median of p_used within group
-        - "max": max of p_used within group (max pooling)
-        - "quantile": quantile(p_used, quantile) within group (quantile pooling)
-        - "softmax": softmax-pooled weighted mean of probabilities within group
-            weights = softmax(beta * logit(p_used))
-            p_softmax = sum_i w_i * p_used_i
-            (Output remains in [0, 1] because it is a convex combination of probabilities.)
-
+        How to summarize probabilities within each unit bucket:
+        - "mean": mean(p_used)
+        - "median": median(p_used)
+        - "max": max(p_used)
+        - "quantile": quantile(p_used, quantile)
+        - "softmax": softmax-pooled weighted mean emphasizing higher-evidence windows
+            weights = softmax(beta * logit(p_used)), p_softmax = sum_i w_i * p_used_i
     quantile:
-        Quantile used when agg="quantile". Must be in [0, 1]. Default 0.75.
-        Example: quantile=0.90 returns the 90th percentile of the within-group (winsorized) probabilities.
-
-    beta:
-        Softmax sharpness used when agg="softmax". Must be > 0. Default 5.0.
-        Interpretation:
-        - beta -> 0: weights become nearly uniform (approaches mean pooling)
-        - larger beta: weights concentrate on the highest-evidence windows (more max-like)
-
-    eps:
-        Numerical stability clip used when agg="softmax". Default 1e-6.
-        Probabilities are clipped to [eps, 1-eps] before computing logit(p) to avoid infinities.
-
+        Quantile used when agg="quantile" (e.g., 0.75 for 75th percentile).
+    beta, eps:
+        Softmax sharpness and numerical stability when agg="softmax".
     lower_q, upper_q:
-        Winsorization quantile cutoffs in [0, 1], with lower_q < upper_q.
-        These are applied within each group defined by `grouping`.
-        - lower_q == 0.0 disables LOWER capping (no lower winsorization)
-        - upper_q == 1.0 disables UPPER capping (no upper winsorization)
-        If a side is disabled, its reported cap value (p_cap_low or p_cap_high) is set to NaN to avoid
-        implying a cap was applied.
-        Setting lower_q=0.0 and upper_q=1.0 disables winsorization entirely (p_used == p).
-
+        Winsorization cutoffs applied *within each group bucket*.
+        - lower_q == 0.0 disables lower capping
+        - upper_q == 1.0 disables upper capping
+        - lower_q=0.0 and upper_q=1.0 disables winsorization entirely (p_used == p)
     ddof:
-        Degrees of freedom used for standard deviation of p_used within each group (np.std).
-        Default 0. (ddof=1 gives the sample standard deviation.)
-
+        Degrees of freedom for std computation (np.std).
+    grouping:
+        Defines the groupby key (the aggregation unit):
+        - "all_trials":      ["model","variant","split", unit_col]
+            Pools all rows for a unit across all trials/folds (if present).
+        - "per_trial_fold":  ["model","variant","split","trial","outer_fold", unit_col]
+            Produces one unit summary per CV run (trial × outer_fold).
+        - None: alias for "all_trials".
     unit_col:
-        Column that identifies the “unit” you are aggregating to.
-        - EEG windowed setting: unit_col="group" (patient id for GroupKFold)
-        - Single-row-per-patient setting: unit_col="idx" (unique patient row id)
-        If unit_col is None, the function will attempt to infer one from ["group","subject_id","idx"].
+        Column name identifying the unit being summarized (e.g., "group" or "idx").
+    splits / include_test / include_train_oof:
+        Controls which split rows are kept before aggregation.
+        If `splits` is provided it is used directly; otherwise it is built from the include_* flags.
 
-    min_expected_rows_per_unit:
-        Optional guardrail. If set (e.g., 2 or 10), the function raises if median rows per unit is below this,
-        which helps catch mistakes like using a per-row unique id in a windowed dataset.
-        Leave as None for the future "one row per patient" case where n_rows_per_unit == 1 is expected.        
     Returns
     -------
     pd.DataFrame
-        One row per unique key defined by `grouping`, containing:
-        - the grouping key columns (e.g., model/variant/split/group, plus trial/outer_fold if per_trial_fold),
-        - subject_id, group_label, y (taken as the first value within the group),
-        - n_windows: number of non-NaN window probabilities used,
-        - p_mean / p_median / p_max / p_qXX / p_softmax: the chosen patient-level probability summary,
-        - p_total_std: std of p_used within group (interpreted according to the chosen grouping),
-        - lower_q, upper_q and realized cap values p_cap_low / p_cap_high,
-        - for softmax: beta, eps
-        - for quantile: quantile
+        One row per grouping key with:
+        - grouping key columns (depends on grouping)
+        - subject_id (if present, else NaN)
+        - group_label (if present, else y)
+        - y
+        - n_windows: number of non-NaN probabilities used
+        - p_mean / p_median / p_max / p_qXX / p_softmax (depending on agg)
+        - p_total_std: std of p_used within the bucket
+        - winsorization metadata: lower_q, upper_q, p_cap_low, p_cap_high
+        - softmax metadata: beta, eps (if agg="softmax")
+        - quantile metadata: quantile (if agg="quantile")
+"""
 
-    """
+    # -------------------------
+    # Split filtering
+    # -------------------------
+    if "split" not in df_long.columns:
+        raise KeyError("df_long must contain a 'split' column for split filtering.")
+
+    if splits is not None:
+        splits_list = list(splits)
+        if len(splits_list) == 0:
+            raise ValueError("If provided, splits must be a non-empty list/sequence of split names.")
+    else:
+        splits_list = []
+        if include_test:
+            splits_list.append("test")
+        if include_train_oof:
+            splits_list.append("train_oof")
+        if len(splits_list) == 0:
+            raise ValueError(
+                "No splits selected. Set include_test/include_train_oof to True, "
+                "or pass splits=['test', 'train_oof', ...]."
+            )
+
+    d = df_long[df_long["split"].isin(splits_list)].copy()
+
+    if d.empty:
+        present = sorted(df_long["split"].dropna().unique().tolist())
+        raise ValueError(
+            f"After filtering, no rows remain for splits={splits_list}. "
+            f"Splits present in df_long: {present}"
+        )
+
     # -------------------------
     # Infer unit_col if needed
     # -------------------------
     if unit_col is None:
         for cand in ("group", "subject_id", "idx"):
-            if cand in df_long.columns:
+            if cand in d.columns:
                 unit_col = cand
                 break
         if unit_col is None:
             raise KeyError("Could not infer unit_col. Please pass unit_col='group' or 'idx' (or another id column).")
 
-    if unit_col not in df_long.columns:
+    if unit_col not in d.columns:
         raise KeyError(f"unit_col='{unit_col}' not found in df_long columns.")
 
     # -------------------------
-    # Grouping schemes (built from unit_col)
+    # grouping=None -> "all_trials" (minimal change)
     # -------------------------
-    GROUPING_SCHEMES: Dict[str, list[str]] = {
+    if grouping is None:
+        grouping = "all_trials"
+
+    # -------------------------
+    # Grouping schemes
+    # -------------------------
+    GROUPING_SCHEMES = {
         "all_trials": ["model", "variant", "split", unit_col],
         "per_trial_fold": ["model", "variant", "split", "trial", "outer_fold", unit_col],
     }
@@ -7865,49 +10200,18 @@ def pooled_patient_risk_summary(
     group_cols = GROUPING_SCHEMES[grouping]
 
     # -------------------------
-    # Validation
+    # Validation (minimal: subject_id/group_label optional)
     # -------------------------
-    if agg not in ("mean", "median", "max", "quantile", "softmax"):
-        raise ValueError("agg must be one of {'mean','median','max','quantile','softmax'}")
-
-    if agg == "quantile" and not (0.0 <= quantile <= 1.0):
-        raise ValueError(f"quantile must be in [0,1] for quantile pooling. Got {quantile}")
-
-    if agg == "softmax":
-        if beta <= 0:
-            raise ValueError(f"beta must be > 0 for softmax pooling. Got {beta}")
-        if eps <= 0 or eps >= 0.1:
-            raise ValueError(f"eps should be small and positive (e.g. 1e-6). Got {eps}")
-
-    if not (0.0 <= lower_q <= 1.0 and 0.0 <= upper_q <= 1.0 and lower_q < upper_q):
-        raise ValueError(f"Require 0 <= lower_q < upper_q <= 1. Got {lower_q}, {upper_q}")
-
-    required_base = {"model", "variant", "split", "subject_id", "group_label", "y", "p", unit_col}
-    missing = required_base - set(df_long.columns)
+    required_base = {"model", "variant", "split", "y", "p", unit_col}
+    missing = required_base - set(d.columns)
     if missing:
         raise KeyError(f"df_long missing required columns: {sorted(missing)}")
 
-    need_cols = set(group_cols) - set(df_long.columns)
+    need_cols = set(group_cols) - set(d.columns)
     if need_cols:
         raise KeyError(f"grouping='{grouping}' requires missing columns: {sorted(need_cols)}")
 
-    d = df_long.copy()
     d["p"] = pd.to_numeric(d["p"], errors="coerce")
-
-    # -------------------------
-    # Optional guardrail
-    # -------------------------
-    if min_expected_rows_per_unit is not None:
-        # compute within the filtered dataframe d (not grouped by run)
-        counts = d.groupby([unit_col], sort=False).size()
-        if len(counts) > 0:
-            med = float(np.median(counts.to_numpy()))
-            if med < float(min_expected_rows_per_unit):
-                raise ValueError(
-                    f"Guardrail: median rows per unit ({unit_col}) is {med:.1f}, "
-                    f"below min_expected_rows_per_unit={min_expected_rows_per_unit}. "
-                    f"Did you accidentally set unit_col to a per-row unique id?"
-                )
 
     # -------------------------
     # Output column naming
@@ -7922,7 +10226,6 @@ def pooled_patient_risk_summary(
 
     out_rows: list[dict] = []
 
-    # Independent-sided winsorization flags
     apply_low = (lower_q > 0.0)
     apply_high = (upper_q < 1.0)
 
@@ -7966,7 +10269,7 @@ def pooled_patient_risk_summary(
                 w = w / w_sum
                 p_center = float(np.sum(w * p_used))
 
-        # Spread (on winsorized values, regardless of agg)
+        # Spread
         p_std = float(np.std(p_used, ddof=ddof))
 
         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
@@ -7974,8 +10277,8 @@ def pooled_patient_risk_summary(
             {
                 "grouping": grouping,
                 "unit_col": unit_col,
-                "subject_id": gdf["subject_id"].iloc[0],
-                "group_label": gdf["group_label"].iloc[0],
+                "subject_id": gdf["subject_id"].iloc[0] if "subject_id" in gdf.columns else np.nan,
+                "group_label": gdf["group_label"].iloc[0] if "group_label" in gdf.columns else int(gdf["y"].iloc[0]),
                 "y": int(gdf["y"].iloc[0]),
                 "n_windows": int(p.size),
                 center_col: p_center,
@@ -7986,6 +10289,7 @@ def pooled_patient_risk_summary(
                 "p_cap_high": hi,
             }
         )
+                
 
         if agg == "quantile":
             row["quantile"] = float(quantile)
@@ -7996,6 +10300,293 @@ def pooled_patient_risk_summary(
         out_rows.append(row)
 
     return pd.DataFrame(out_rows)
+
+
+
+# def pooled_patient_risk_summary(
+#     df_long: pd.DataFrame,
+#     *,
+#     agg: Literal["mean", "median", "max", "quantile", "softmax"] = "mean",
+#     quantile: float = 0.75,
+#     beta: float = 5.0,
+#     eps: float = 1e-6,
+#     lower_q: float = 0.05,
+#     upper_q: float = 0.95,
+#     ddof: int = 0,
+#     grouping: Literal["all_trials", "per_trial_fold"] = "all_trials",
+#     unit_col: Optional[str] = "group",
+#     splits: Optional[Sequence[str]] = None,
+#     include_test: bool = True,
+#     include_train_oof: bool = False,
+# ) -> pd.DataFrame:
+#     """
+#     Aggregate window-/row-level predicted probabilities to patient-level summaries.
+
+#     Context / why this exists
+#     -------------------------
+#     In your EEG setting, each patient (a.k.a. *group*) contributes many rows/windows that all share
+#     the same clinical label. During repeated/nested cross-validation, a patient may appear in the outer-test
+#     set multiple times (across trials/seeds and outer folds). Therefore, for a given patient you can end up
+#     with many out-of-sample predicted probabilities:
+#       - variability across EEG windows within the patient
+#       - variability across CV repetitions / train-test splits (different fitted models)
+
+#     This function is designed to support BOTH common aggregation choices with the SAME code path:
+
+#     Parameters
+#     ----------
+#     df_long:
+#         Long table with at least columns:
+#         ["model","variant","split","trial","outer_fold","group","subject_id","group_label","y","p"].
+#         Each row is typically a window/epoch prediction for a patient/group.
+#         Notes:
+#         - trial/outer_fold must be present if grouping="per_trial_fold".
+#         - p should be numeric probabilities in [0, 1]. Non-numeric values are coerced to NaN and dropped
+#             within each group.
+
+#     grouping:
+#         Controls what constitutes a “patient aggregation unit” (i.e., the groupby key).
+#         - "all_trials":      ["model","variant","split","group"]
+#             Pools window-level predictions for a patient across ALL CV runs (trial × outer_fold).
+#             Interpretation: for each patient, pool *all* out-of-sample window-level predictions across all runs,
+#             then compute a single patient-level center + spread.
+
+#         - "per_trial_fold":  ["model","variant","split","trial","outer_fold","group"]
+#             Computes one patient summary per run (trial × outer_fold), isolating within-run window variability.
+#             Interpretation: compute one patient-level summary per CV run (trial × outer_fold), using only that run’s
+#             window-level predictions for the patient. This isolates within-patient window heterogeneity per run.
+
+#     agg:
+#         Aggregation used to produce a single patient-level probability summary from the (optionally winsorized)
+#         window probabilities.
+#         - "mean": mean of p_used within group
+#         - "median": median of p_used within group
+#         - "max": max of p_used within group (max pooling)
+#         - "quantile": quantile(p_used, quantile) within group (quantile pooling)
+#         - "softmax": softmax-pooled weighted mean of probabilities within group
+#             weights = softmax(beta * logit(p_used))
+#             p_softmax = sum_i w_i * p_used_i
+#             (Output remains in [0, 1] because it is a convex combination of probabilities.)
+
+#     quantile:
+#         Quantile used when agg="quantile". Must be in [0, 1]. Default 0.75.
+#         Example: quantile=0.90 returns the 90th percentile of the within-group (winsorized) probabilities.
+
+#     beta:
+#         Softmax sharpness used when agg="softmax". Must be > 0. Default 5.0.
+#         Interpretation:
+#         - beta -> 0: weights become nearly uniform (approaches mean pooling)
+#         - larger beta: weights concentrate on the highest-evidence windows (more max-like)
+
+#     eps:
+#         Numerical stability clip used when agg="softmax". Default 1e-6.
+#         Probabilities are clipped to [eps, 1-eps] before computing logit(p) to avoid infinities.
+
+#     lower_q, upper_q:
+#         Winsorization quantile cutoffs in [0, 1], with lower_q < upper_q.
+#         These are applied within each group defined by `grouping`.
+#         - lower_q == 0.0 disables LOWER capping (no lower winsorization)
+#         - upper_q == 1.0 disables UPPER capping (no upper winsorization)
+#         If a side is disabled, its reported cap value (p_cap_low or p_cap_high) is set to NaN to avoid
+#         implying a cap was applied.
+#         Setting lower_q=0.0 and upper_q=1.0 disables winsorization entirely (p_used == p).
+
+#     ddof:
+#         Degrees of freedom used for standard deviation of p_used within each group (np.std).
+#         Default 0. (ddof=1 gives the sample standard deviation.)
+
+#     unit_col:
+#         Column that identifies the “unit” you are aggregating to.
+#         - EEG windowed setting: unit_col="group" (patient id for GroupKFold)
+#         - Single-row-per-patient setting: unit_col="idx" (unique patient row id)
+#         If unit_col is None, the function will attempt to infer one from ["group","subject_id","idx"].
+    
+#     Split filtering    
+#     If `splits` is provided, only those splits are included.
+#     Otherwise, splits are selected based on include_test/include_train_oof:
+#       - include_test=True      -> include split == "test"
+#       - include_train_oof=True -> include split == "train_oof" 
+      
+#     Returns
+#     -------
+#     pd.DataFrame
+#         One row per unique key defined by `grouping`, containing:
+#         - the grouping key columns (e.g., model/variant/split/group, plus trial/outer_fold if per_trial_fold),
+#         - subject_id, group_label, y (taken as the first value within the group),
+#         - n_windows: number of non-NaN window probabilities used,
+#         - p_mean / p_median / p_max / p_qXX / p_softmax: the chosen patient-level probability summary,
+#         - p_total_std: std of p_used within group (interpreted according to the chosen grouping),
+#         - lower_q, upper_q and realized cap values p_cap_low / p_cap_high,
+#         - for softmax: beta, eps
+#         - for quantile: quantile
+
+#     """
+#     # -------------------------
+#     # Split filtering (NEW)
+#     # -------------------------
+#     if "split" not in df_long.columns:
+#         raise KeyError("df_long must contain a 'split' column for split filtering.")
+
+#     if splits is not None:
+#         splits_list = list(splits)
+#         if len(splits_list) == 0:
+#             raise ValueError("If provided, splits must be a non-empty list/sequence of split names.")
+#     else:
+#         splits_list = []
+#         if include_test:
+#             splits_list.append("test")
+#         if include_train_oof:
+#             splits_list.append("train_oof")
+
+#         if len(splits_list) == 0:
+#             raise ValueError(
+#                 "No splits selected. Set include_test/include_train_oof to True, "
+#                 "or pass splits=['test', 'train_oof', ...]."
+#             )
+
+#     # Filter early so everything downstream (guardrails, grouping) applies to the chosen split(s)
+#     d = df_long[df_long["split"].isin(splits_list)].copy()
+
+#     # Optional: fail fast if you filtered everything away
+#     if d.empty:
+#         present = sorted(df_long["split"].dropna().unique().tolist())
+#         raise ValueError(
+#             f"After filtering, no rows remain for splits={splits_list}. "
+#             f"Splits present in df_long: {present}"
+#         )
+
+#     # -------------------------
+#     # Infer unit_col if needed
+#     # -------------------------
+#     if unit_col is None:
+#         for cand in ("group", "subject_id", "idx"):
+#             if cand in d.columns:
+#                 unit_col = cand
+#                 break
+#         if unit_col is None:
+#             raise KeyError("Could not infer unit_col. Please pass unit_col='group' or 'idx' (or another id column).")
+
+#     if unit_col not in d.columns:
+#         raise KeyError(f"unit_col='{unit_col}' not found in df_long columns.")
+
+#     # -------------------------
+#     # Grouping schemes
+#     # -------------------------
+#     GROUPING_SCHEMES = {
+#         "all_trials": ["model", "variant", "split", unit_col],
+#         "per_trial_fold": ["model", "variant", "split", "trial", "outer_fold", unit_col],
+#     }
+#     if grouping not in GROUPING_SCHEMES:
+#         raise ValueError(f"Unknown grouping='{grouping}'. Choose one of {list(GROUPING_SCHEMES)}")
+
+#     group_cols = GROUPING_SCHEMES[grouping]
+
+#     # -------------------------
+#     # Validation (use `d`, not df_long)
+#     # -------------------------
+#     required_base = {"model", "variant", "split", "subject_id", "group_label", "y", "p", unit_col}
+#     missing = required_base - set(d.columns)
+#     if missing:
+#         raise KeyError(f"df_long missing required columns: {sorted(missing)}")
+
+#     need_cols = set(group_cols) - set(d.columns)
+#     if need_cols:
+#         raise KeyError(f"grouping='{grouping}' requires missing columns: {sorted(need_cols)}")
+
+#     d["p"] = pd.to_numeric(d["p"], errors="coerce")
+
+
+
+#     # -------------------------
+#     # Output column naming
+#     # -------------------------
+#     if agg == "quantile":
+#         q_tag = int(round(quantile * 100))
+#         center_col = f"p_q{q_tag}"
+#     elif agg == "softmax":
+#         center_col = "p_softmax"
+#     else:
+#         center_col = {"mean": "p_mean", "median": "p_median", "max": "p_max"}[agg]
+
+#     out_rows: list[dict] = []
+
+#     # Independent-sided winsorization flags
+#     apply_low = (lower_q > 0.0)
+#     apply_high = (upper_q < 1.0)
+
+#     for keys, gdf in d.groupby(group_cols, sort=False):
+#         p = gdf["p"].to_numpy(dtype=float)
+#         p = p[~np.isnan(p)]
+#         if p.size == 0:
+#             continue
+
+#         # Winsorize (optional, per side)
+#         if not apply_low and not apply_high:
+#             lo = np.nan
+#             hi = np.nan
+#             p_used = p
+#         else:
+#             lo = float(np.quantile(p, lower_q)) if apply_low else np.nan
+#             hi = float(np.quantile(p, upper_q)) if apply_high else np.nan
+#             lo_clip = lo if apply_low else -np.inf
+#             hi_clip = hi if apply_high else np.inf
+#             p_used = np.clip(p, lo_clip, hi_clip)
+
+#         # Aggregate
+#         if agg == "mean":
+#             p_center = float(np.mean(p_used))
+#         elif agg == "median":
+#             p_center = float(np.median(p_used))
+#         elif agg == "max":
+#             p_center = float(np.max(p_used))
+#         elif agg == "quantile":
+#             p_center = float(np.quantile(p_used, quantile))
+#         else:  # "softmax"
+#             p_clip = np.clip(p_used, eps, 1.0 - eps)
+#             s = np.log(p_clip) - np.log1p(-p_clip)  # logit(p)
+#             t = beta * s
+#             t = t - np.max(t)
+#             w = np.exp(t)
+#             w_sum = np.sum(w)
+#             if not np.isfinite(w_sum) or w_sum == 0.0:
+#                 p_center = float(np.mean(p_used))
+#             else:
+#                 w = w / w_sum
+#                 p_center = float(np.sum(w * p_used))
+
+#         # Spread (on winsorized values, regardless of agg)
+#         p_std = float(np.std(p_used, ddof=ddof))
+
+#         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+#         row.update(
+#             {
+#                 "grouping": grouping,
+#                 "unit_col": unit_col,
+#                 "subject_id": gdf["subject_id"].iloc[0],
+#                 "group_label": gdf["group_label"].iloc[0],
+#                 "y": int(gdf["y"].iloc[0]),
+#                 "n_windows": int(p.size),
+#                 center_col: p_center,
+#                 "p_total_std": p_std,
+#                 "lower_q": float(lower_q),
+#                 "upper_q": float(upper_q),
+#                 "p_cap_low": lo,
+#                 "p_cap_high": hi,
+#             }
+#         )
+
+#         if agg == "quantile":
+#             row["quantile"] = float(quantile)
+#         if agg == "softmax":
+#             row["beta"] = float(beta)
+#             row["eps"] = float(eps)
+
+#         out_rows.append(row)
+
+#     return pd.DataFrame(out_rows)
+
+
+
 
 
 def plot_ranked_patients_patient_level(

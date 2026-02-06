@@ -1,6 +1,6 @@
 # utils.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping, Literal, Callable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping, Literal, Callable, MutableMapping, Hashable
 from pathlib import Path
 from tqdm.auto import tqdm
 import pandas as pd
@@ -17,9 +17,229 @@ from .eeg_preprocess import eeg_preprocess_pipeline, plot_pipeline_text, config_
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from numpy.typing import NDArray
+
+AggName = Literal["mean", "median","nanmean", "nanmedian", "sum", "min", "max"]
+AggFn = Callable[[NDArray[np.floating], int], NDArray[np.floating]]  # not used directly, see note below
+Agg = Union[AggName, Callable[..., Any]]  # accept np.mean / np.median etc.
 
 
 
+def aggregate_bundle_by_group(
+    bundle: Mapping[str, Any],
+    agg: Agg = "mean",
+    *,
+    x_key: str = "X_raw",
+    out_prefix: str = "combined_",
+    keep_original: bool = True,
+) -> Dict[str, Any]:
+    """
+    Aggregate a sample-level dataset ("bundle") into a group-level dataset by grouping rows
+    using `bundle["groups"]` and applying an aggregation function (default: mean) to the
+    feature rows in `bundle[x_key]`.
+
+    This is designed for the common setting where you have multiple samples per subject
+    (or per recording/session), and you want exactly one row per group.
+
+    Expected input structure (minimum required keys):
+        - bundle[x_key]: 2D numpy array of shape (N, D) with per-sample features
+        - bundle["groups"]: 1D numpy int array of shape (N,) with group ids per sample
+
+    Optional metadata keys (recommended):
+        - bundle["group_id_to_key"]: dict[int, (label_str, subject_id)] mapping each group id
+          to a tuple like ("ASD", "NDAR...").
+        - bundle["label_to_id"]: dict[str, int] mapping class name (e.g., "ASD") to numeric id
+
+    Label aggregation:
+        - If both `group_id_to_key` and `label_to_id` exist, group labels are constructed
+          from them (preferred; deterministic and consistent with your metadata).
+        - Otherwise, it falls back to using sample-level `bundle["y"]` and takes either:
+            * the unique label if all samples in a group match, OR
+            * majority vote if mixed labels are present.
+
+    Assumptions:
+        - Group ids are contiguous integers starting at 0 with no gaps:
+              groups ∈ {0, 1, ..., G-1}
+          If this is violated (e.g., missing group id), a ValueError is raised.
+
+    Parameters
+    ----------
+    bundle:
+        Input mapping containing arrays and metadata (your dataset dictionary).
+    agg:
+        Aggregation to apply within each group. You may pass:
+          - strings: {"mean","median","nanmean","nanmedian","sum","min","max"} OR
+          - callable: e.g., np.mean, np.nanmean, np.median, np.nanmedian (must accept axis=0)
+    x_key:
+        Key in `bundle` that points to the feature matrix to aggregate (default: "X_raw").
+    out_prefix:
+        Prefix for new keys when `keep_original=True`. Default "combined_".
+        Example outputs: "combined_X_raw", "combined_y", ...
+    keep_original:
+        If True (default), preserve original sample-level arrays and *add* aggregated arrays
+        under new keys.
+        If False, overwrite `x_key`, "y", and "groups" with aggregated versions.
+
+    Returns
+    -------
+    Dict[str, Any]
+        A deep-copied, updated dictionary containing aggregated arrays.
+
+        If keep_original=True (default), new keys added include:
+            - f"{out_prefix}{x_key}": aggregated features, shape (G, D)
+            - f"{out_prefix}y": aggregated labels, shape (G,)
+            - f"{out_prefix}groups": group ids, shape (G,) typically [0..G-1]
+            - f"{out_prefix}n_per_group": sample counts per group, shape (G,)
+            - f"{out_prefix}agg": name of aggregation used
+
+        If keep_original=False, the above are stored as:
+            - bundle[x_key], bundle["y"], bundle["groups"], plus "n_per_group" and "agg"
+
+    Raises
+    ------
+    KeyError:
+        If required keys (x_key or "groups") are missing.
+    ValueError:
+        If shapes are inconsistent, `bundle[x_key]` is not 2D, or group ids are not contiguous.
+
+    Examples
+    --------
+    >>> bundle2 = aggregate_bundle_by_group(bundle, agg="mean")
+    >>> Xg = bundle2["combined_X_raw"]  # (G, D)
+    >>> yg = bundle2["combined_y"]      # (G,)
+    >>> counts = bundle2["combined_n_per_group"]
+
+    >>> # Overwrite in-place style (but returned as a new dict)
+    >>> bundle_group = aggregate_bundle_by_group(bundle, agg=np.median, keep_original=False)
+    >>> bundle_group["X_raw"].shape
+    (G, D)
+    """
+    # --------- Extract core arrays ---------
+    if x_key not in bundle:
+        raise KeyError(f"Missing key '{x_key}' in bundle.")
+    if "groups" not in bundle:
+        raise KeyError("Missing key 'groups' in bundle.")
+
+    X: NDArray[np.floating] = np.asarray(bundle[x_key])
+    groups: NDArray[np.integer] = np.asarray(bundle["groups"])
+
+    # --------- Validate shapes ---------
+    if X.ndim != 2:
+        raise ValueError(f"{x_key} must be a 2D array of shape (N, D). Got shape {X.shape}.")
+    if groups.ndim != 1:
+        raise ValueError(f"'groups' must be a 1D array of shape (N,). Got shape {groups.shape}.")
+    if groups.shape[0] != X.shape[0]:
+        raise ValueError(
+            f"Length mismatch: {x_key} has N={X.shape[0]} rows but groups has length {groups.shape[0]}."
+        )
+
+    # --------- Infer number of groups (contiguous 0..G-1) ---------
+    # Because ids are contiguous with no gaps, we can safely use max+1.
+    g_min = int(groups.min())
+    g_max = int(groups.max())
+    if g_min != 0:
+        raise ValueError(f"Expected group ids to start at 0. Found min(groups)={g_min}.")
+
+    G = g_max + 1  # total groups
+
+    # Compute samples-per-group and verify no gaps (counts==0 indicates missing group id)
+    counts: NDArray[np.int64] = np.bincount(groups.astype(np.int64), minlength=G)
+    if np.any(counts == 0):
+        # This contradicts the stated assumption "no gaps", so fail loudly.
+        missing = np.where(counts == 0)[0]
+        raise ValueError(f"Found gaps: these group ids have zero samples: {missing[:20]}{'...' if missing.size>20 else ''}")
+
+    # --------- Resolve aggregation function ---------
+    # We accept either a known string or a callable like np.mean/np.median that supports axis=0.
+    if isinstance(agg, str):
+        agg_map: Dict[str, Callable[..., Any]] = {
+            "mean": np.mean,
+            "median": np.median,
+            "nanmean": np.nanmean,       
+            "nanmedian": np.nanmedian,   
+            "sum": np.sum,
+            "min": np.min,
+            "max": np.max,
+        }
+        if agg not in agg_map:
+            raise ValueError(f"Unknown agg='{agg}'. Use {list(agg_map.keys())} or pass a callable.")
+        agg_fn = agg_map[agg]
+        agg_name = agg
+    elif callable(agg):
+        agg_fn = agg
+        agg_name = getattr(agg, "__name__", "custom")
+    else:
+        raise ValueError("agg must be a string or a callable (e.g., np.mean).")
+
+    # --------- Aggregate X per group ---------
+    # Pre-allocate output as float32 (matching your X_raw dtype) unless you prefer float64.
+    Xg: NDArray[np.float32] = np.empty((G, X.shape[1]), dtype=np.float32)
+
+    # Main loop: for each group, select its rows and reduce along axis=0 to get one D-dim vector
+    for g in range(G):
+        mask = (groups == g)  # boolean mask for samples in group g
+        X_block = X[mask]     # shape (n_g, D)
+
+        # Apply aggregation across the rows within this group => shape (D,)
+        # Note: agg_fn must support axis=0 (np.mean/np.median/... do).
+        Xg[g] = agg_fn(X_block, axis=0)
+
+    # --------- Aggregate y per group ---------
+    group_id_to_key: Optional[Mapping[int, Tuple[str, str]]] = bundle.get("group_id_to_key")
+    label_to_id: Optional[Mapping[str, int]] = bundle.get("label_to_id")
+
+    if group_id_to_key is not None and label_to_id is not None:
+        # Preferred: use metadata mapping group -> label_str -> label_id
+        yg: NDArray[np.int32] = np.empty((G,), dtype=np.int32)
+        for g in range(G):
+            label_str, _subject_id = group_id_to_key[g]
+            try:
+                yg[g] = int(label_to_id[label_str])
+            except KeyError as e:
+                raise KeyError(f"label_to_id missing label '{label_str}' for group {g}.") from e
+    else:
+        # Fallback: derive group label from sample-level y via uniqueness / majority vote
+        if "y" not in bundle:
+            raise KeyError("Missing key 'y' in bundle and cannot infer group labels without metadata.")
+
+        y: NDArray[np.integer] = np.asarray(bundle["y"])
+        if y.shape[0] != X.shape[0]:
+            raise ValueError(f"Length mismatch: y has length {y.shape[0]} but X has {X.shape[0]} rows.")
+
+        yg = np.empty((G,), dtype=np.int32)
+        for g in range(G):
+            vals = y[groups == g]
+            uniq = np.unique(vals)
+
+            if uniq.size == 1:
+                # Clean case: all samples in the group share the same class id
+                yg[g] = int(uniq[0])
+            else:
+                # Mixed-label group: choose majority class id
+                # NOTE: This indicates potential data issues; you may prefer to raise instead.
+                yg[g] = int(np.bincount(vals.astype(np.int64)).argmax())
+
+    # After aggregation, each row corresponds 1:1 to a group id 0..G-1
+    group_ids: NDArray[np.int32] = np.arange(G, dtype=np.int32)
+
+    # --------- Build returned bundle (deep copy to avoid mutating original) ---------
+    new_bundle: Dict[str, Any] = deepcopy(dict(bundle))
+
+    # Store results either under new keys or overwrite existing keys
+    if keep_original:
+        new_bundle[f"{out_prefix}{x_key}"] = Xg
+        new_bundle[f"{out_prefix}y"] = yg
+        new_bundle[f"{out_prefix}groups"] = group_ids
+        new_bundle[f"{out_prefix}n_per_group"] = counts.astype(np.int32)
+        new_bundle[f"{out_prefix}agg"] = agg_name
+    else:
+        new_bundle[x_key] = Xg
+        new_bundle["y"] = yg
+        new_bundle["groups"] = group_ids
+        new_bundle["n_per_group"] = counts.astype(np.int32)
+        new_bundle["agg"] = agg_name
+
+    return new_bundle
 
 
 def plot_total_and_value_counts(
