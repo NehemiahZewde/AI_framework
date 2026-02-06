@@ -93,10 +93,4 @@ pip install -e .
 * Additional modality examples (tabular clinical + imaging-derived features)
 
 ---
-
-## Disclaimer
-
-Research code. Not a medical device. Not intended for clinical decision-making.
-
-```
 ```
