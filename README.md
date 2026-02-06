@@ -3,6 +3,8 @@ Al modeling framework for clinical data
 
 A Python AI framework for EEG feature extraction and modeling.
 
+<img width="1804" height="910" alt="image" src="https://github.com/user-attachments/assets/3942bcac-593b-403f-9c79-83bf3252def1" />
+
 ## Requirements
 - Python 3.9+
 
