@@ -1,9 +1,8 @@
 # AI Framework for Clinical ML
 
 Standardized, leakage-safe, end-to-end modeling framework for clinical data:
-**data preparation → calibration → model training → evaluation → interpretation**.
+**data preparation → model training → calibration → evaluation → interpretation**.
 
-> EEG is included as an example module (feature extraction + demo pipeline).  
 > The framework is modality-agnostic and intended for clinical ML across indications.
 
 <img width="1797" height="880" alt="image" src="https://github.com/user-attachments/assets/534cfa21-109f-4e3e-993a-0a7b6844aced" />
