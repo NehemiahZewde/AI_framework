@@ -61,21 +61,8 @@ Applicable across disease areas and modalities (examples include neurology, immu
 ### Option 1: Install directly from GitHub
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
-
-## Requirements
-- Python 3.9+
-
-## Installation
-
-### Option 1: Install directly from GitHub (recommended)
-This installs the latest code from the `main` branch:
-
-```bash
-pip install git+https://github.com/NehemiahZewde/AI_framework.git
 ```
-
 ### Option 2: Clone and install (editable)
-
 ```bash
 git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
