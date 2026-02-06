@@ -81,7 +81,7 @@ pip install -e .
 ## Project layout
 
 * `ai_framework/` — core pipeline building blocks (data prep, training, evaluation, calibration, reporting)
-* `tutorial/` — end-to-end examples (includes an EEG example module)
+* `tutorial/` — end-to-end examples
 
 ---
 
