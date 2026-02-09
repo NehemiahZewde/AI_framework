@@ -62,7 +62,7 @@ Applicable across disease areas and modalities (examples include neurology, immu
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
 ````
-### Option 2: Clone and install (editable)
+### Option 2: Clone and install
 ```bash
 git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
