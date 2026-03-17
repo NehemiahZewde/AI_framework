@@ -18,6 +18,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from numpy.typing import NDArray
+from scipy.io import loadmat
 
 AggName = Literal["mean", "median","nanmean", "nanmedian", "sum", "min", "max"]
 AggFn = Callable[[NDArray[np.floating], int], NDArray[np.floating]]  # not used directly, see note below
@@ -378,6 +379,98 @@ def plot_total_and_value_counts(
     plt.show()
 
 
+def plot_histogram(
+    df: pd.DataFrame,
+    *,
+    col: str,
+    bins: int | str = "auto",          # int, "auto", "fd", "sturges", etc.
+    figsize=(12, 5),
+    font_size: int = 12,
+    title: str | None = None,
+    xlabel: str | None = None,
+    ylabel: str = "Count",
+    sns_style: str = "whitegrid",
+    kde: bool = False,
+    show_missing_bar: bool = True,
+    missing_label: str = "Missing",
+    missing_color: str = "gray",
+    annotate: bool = True,
+):
+    """
+    Presentation-ready histogram for ONE numeric column.
+    - Plots histogram of non-missing numeric values
+    - Optionally adds a separate bar showing the count of missing values
+    - Optional KDE overlay
+    """
+
+    if col not in df.columns:
+        raise KeyError(f"col '{col}' not found. Available columns: {list(df.columns)}")
+
+    sns.set_style(sns_style)
+
+    # Coerce to numeric (non-numeric -> NaN)
+    s = pd.to_numeric(df[col], errors="coerce")
+    n_total = len(s)
+    n_missing = int(s.isna().sum())
+    s_nonmissing = s.dropna()
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Histogram (non-missing)
+    sns.histplot(
+        s_nonmissing,
+        bins=bins,
+        kde=kde,
+        ax=ax,
+    )
+
+    ax.set_title(title or f"Histogram of {col}", fontsize=font_size + 2, fontweight="bold")
+    ax.set_xlabel(xlabel or col, fontsize=font_size, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=font_size, fontweight="bold")
+
+    ax.tick_params(axis="x", labelsize=font_size)
+    ax.tick_params(axis="y", labelsize=font_size)
+    for t in ax.get_xticklabels() + ax.get_yticklabels():
+        t.set_fontweight("bold")
+
+    # Optional missing bar on a twin axis (so it doesn't distort histogram scale)
+    if show_missing_bar and n_missing > 0:
+        ax2 = ax.twinx()
+        ax2.bar([0], [n_missing], color=missing_color, alpha=0.35, width=0.6)
+        ax2.set_ylabel(f"{missing_label} count", fontsize=font_size, fontweight="bold")
+        ax2.tick_params(axis="y", labelsize=font_size)
+        for t in ax2.get_yticklabels():
+            t.set_fontweight("bold")
+        ax2.set_xticks([])
+
+        if annotate:
+            ax2.text(
+                0,
+                n_missing,
+                f"{missing_label}: N={n_missing} ({(n_missing/n_total)*100:.1f}%)",
+                ha="center",
+                va="bottom",
+                fontsize=font_size - 1,
+                fontweight="bold",
+            )
+
+    # Annotate overall non-missing N
+    if annotate:
+        ax.text(
+            0.99,
+            0.98,
+            f"Non-missing N={len(s_nonmissing)} ({(len(s_nonmissing)/n_total)*100:.1f}%)",
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=font_size - 1,
+            fontweight="bold",
+        )
+
+    plt.tight_layout()
+    plt.show()
+
+
 
 def find_files_with_hints(
     in_dir: str | Path,
@@ -555,6 +648,8 @@ def _load_subject_mapping(
     return None
 
 
+
+
 def load_raw_eeg(p: str | Path, preload: bool = False) -> mne.io.BaseRaw:
     """
     Load an EEG file using the appropriate MNE-Python reader.
@@ -567,7 +662,7 @@ def load_raw_eeg(p: str | Path, preload: bool = False) -> mne.io.BaseRaw:
     ----------
     p : str or Path
         Path to an EEG file. Supported formats include:
-        .bdf, .edf, .cnt, .set, .fif, .mff, .egi, .raw, .gdf
+        .bdf, .edf, .cnt, .set, .fif, .mff, .egi, .raw, .gdf, .vhdr, .vmrk, .eeg, .mat
 
     preload : bool
         Whether to preload the data into memory.
@@ -605,6 +700,10 @@ def load_raw_eeg(p: str | Path, preload: bool = False) -> mne.io.BaseRaw:
         ".egi": mne.io.read_raw_egi,
         ".raw": mne.io.read_raw_egi,
         ".gdf": mne.io.read_raw_gdf,
+        ".vhdr": mne.io.read_raw_brainvision,
+        ".vmrk": mne.io.read_raw_brainvision,
+        ".eeg": mne.io.read_raw_brainvision,
+        ".mat": mne.io.read_raw_fieldtrip,
     }
 
     # Check support
@@ -612,10 +711,86 @@ def load_raw_eeg(p: str | Path, preload: bool = False) -> mne.io.BaseRaw:
         raise ValueError(f"Unsupported EEG extension: '{ext}'")
 
     # Select correct reader and load file
-    loader = loaders[ext]
-    raw = loader(p, preload=preload)
+    if ext in ['.mat']:
+        loader = loaders[ext]
+        raw = loader(fname=p, info=None, data_name="ft" )
+    else:
+        loader = loaders[ext]
+        raw = loader(p, preload=preload)
 
     return raw
+
+
+def _rebuild_fieldtrip_raw_with_clean_info(
+    raw: mne.io.BaseRaw,
+    montage: mne.channels.DigMontage,
+) -> mne.io.BaseRaw:
+    """
+    Rebuild a Raw object imported from a FieldTrip `.mat` file using a fresh
+    MNE `Info`, then apply the requested montage.
+
+    This helper is intended for Raw objects created via
+    `mne.io.read_raw_fieldtrip(..., info=None)`. In that import path, MNE only
+    extracts limited metadata, so channel type and sensor-location information
+    may be incomplete or inconsistent. Rebuilding the Raw with a clean `Info`
+    avoids montage-assignment failures caused by the imported metadata.
+
+    The rebuilt object preserves:
+    - channel names
+    - sampling frequency
+    - signal data
+    - annotations, if present
+
+    Channel typing rule
+    -------------------
+    - Channels whose names appear in `montage.ch_names` are assigned type
+      `"eeg"`.
+    - Channels not present in the montage are assigned type `"misc"`.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Raw object loaded from a FieldTrip `.mat` file.
+
+    montage : mne.channels.DigMontage
+        Standard or custom montage to apply to the rebuilt Raw object.
+
+    Returns
+    -------
+    mne.io.BaseRaw
+        A new `RawArray` with fresh channel metadata and the montage applied.
+
+    Notes
+    -----
+    This function is only needed for the FieldTrip import path. Other EEG
+    readers usually provide more complete metadata and can typically use
+    `raw.set_montage()` directly.
+    """
+    data = raw.get_data()
+    sfreq = raw.info["sfreq"]
+    ch_names = raw.ch_names
+
+    montage_chs = set(montage.ch_names)
+    eeg_chs = [ch for ch in ch_names if ch in montage_chs]
+    misc_chs = [ch for ch in ch_names if ch not in montage_chs]
+    ch_types = ["eeg" if ch in montage_chs else "misc" for ch in ch_names]
+
+    print(
+        "[FieldTrip fix] Rebuilding Raw with clean Info before montage "
+        f"({len(eeg_chs)} EEG channels, {len(misc_chs)} MISC channels)."
+    )
+
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types=ch_types)
+    new_raw = mne.io.RawArray(data, info)
+    new_raw.set_montage(montage)
+
+    if raw.annotations is not None and len(raw.annotations):
+        new_raw.set_annotations(raw.annotations)
+
+    print("[FieldTrip fix] Montage successfully applied after rebuild.")
+
+    return new_raw
+
 
 
 def load_abcct_mat_metadata(p: str | Path) -> Dict[str, Any]:
@@ -1132,6 +1307,8 @@ def resolve_to_metadata_id(file_id: str, meta_ids: list[str]) -> str | None:
     return None
 
 
+
+
 def scan_eeg_directory(
     in_dir: str | Path = "abcct_data_raw",
     pattern: str = "*_r.mat",
@@ -1149,6 +1326,7 @@ def scan_eeg_directory(
     # ---- Small H5 value reading knob ----
     max_value_elems: int = 16,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    
     """
     Scan EEG files inside a directory (optionally with folder hints) and return
     a summary table containing lightweight metadata for each file, merged with
@@ -1158,6 +1336,16 @@ def scan_eeg_directory(
       - folder structures differ (use folder_hints)
       - filenames differ (use subject_id_borders)
       - HDF5 top-level keys differ (loop keys dynamically; no key name hardcoding)
+
+    Many datasets have non-informative filenames like "EEG1.bdf". In those cases,
+    we cannot derive the Subject_ID from the filename. We now add a robust rule:
+
+      If any Subject_ID from the metadata file appears in the *full file path*
+      (boundary-aware token match), we override the file-derived subject_id with
+      that metadata Subject_ID.
+
+    This keeps the old behavior working (when filenames contain IDs like CU0009),
+    while also supporting datasets where the ID is only present in folder names.
 
     Parameters
     ----------
@@ -1244,6 +1432,30 @@ def scan_eeg_directory(
 
     """
 
+    """
+    Scan EEG files inside a directory (optionally with folder hints) and return
+    a summary table containing lightweight metadata for each file, merged with
+    label metadata from a CSV/XLSX mapping file.
+
+    UPDATE (Feb 2026):
+    ------------------
+    Many datasets have non-informative filenames like "EEG1.bdf". In those cases,
+    we cannot derive the Subject_ID from the filename. We now add a robust rule:
+
+      If any Subject_ID from the metadata file appears in the *full file path*
+      (boundary-aware token match), we override the file-derived subject_id with
+      that metadata Subject_ID.
+
+    This keeps the old behavior working (when filenames contain IDs like CU0009),
+    while also supporting datasets where the ID is only present in folder names.
+
+    Returns
+    -------
+    (df, uunmatched_df)
+      - df: one row per EEG file
+      - uunmatched_df: subset of df with match_status == "unmatched_file_id"
+    """
+
     # ----------------------------------------------------------------------
     # 0) Metadata is required
     # ----------------------------------------------------------------------
@@ -1270,10 +1482,10 @@ def scan_eeg_directory(
         # Plain recursive glob
         files = sorted(in_dir.rglob(pattern))
 
-    # Nothing found -> return empty DataFrame early
+    # Nothing found -> return empty DataFrames early (must return 2 items)
     if not files:
         print(f"No files found in {in_dir} with pattern='{pattern}' and backend='{backend}'.")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     # ----------------------------------------------------------------------
     # 2) Load metadata mapping (subject_id + label)
@@ -1289,20 +1501,26 @@ def scan_eeg_directory(
     if normalize_numeric_subject_ids:
         subj_map["subject_id"] = subj_map["subject_id"].map(_normalize_subject_id).astype("string")
 
+    # Precompute metadata IDs as plain strings for path-matching override
+    # (this is the "ground truth" list of valid Subject_ID tokens)
+    meta_ids: list[str] = subj_map["subject_id"].dropna().astype(str).unique().tolist()
 
     # ----------------------------------------------------------------------
     # 3) Process each EEG file
     # ----------------------------------------------------------------------
     for p in tqdm(files, desc="Scanning EEG files", unit="file"):
-    
-        # Get ID
-        file_id_raw  = subject_id_from_borders(p, subject_id_borders)  # e.g. "sub-0026"
-        # Build the minimal per-file record (no hardcoded None scaffolding)
+
+        # --------------------------
+        # A) Default: derive ID from filename stem using borders (old behavior)
+        # --------------------------
+        file_id_raw = subject_id_from_borders(p, subject_id_borders)
+
         info = {
             "filepath": str(p),
             "filename": p.name,
-            "subject_id_raw": file_id_raw,  # Keep the raw ID for readability/debugging
-            "subject_id": file_id_raw,   # Use this as the merge key (we will normalize it later if flag is on)
+            "subject_id_raw": file_id_raw,     # raw derived id (debug)
+            "subject_id": file_id_raw,         # working id for merge
+            "subject_id_source": "filename",   # NEW: where subject_id came from
             "error": None,
         }
 
@@ -1310,19 +1528,52 @@ def scan_eeg_directory(
         if normalize_numeric_subject_ids:
             info["subject_id"] = _normalize_subject_id(info["subject_id"])
 
+        # --------------------------
+        # B) NEW: Path-based override using metadata Subject_ID list
+        # --------------------------
+        # If a metadata Subject_ID appears in the full file path, prefer it.
+        # This fixes cases like ".../CU_CU0009_1R1_eeg/EEG1.bdf".
+        #
+        # We only do this override when NOT using numeric normalization mode,
+        # because normalization mode expects separate logic for numeric-like IDs.
+        if not normalize_numeric_subject_ids:
+            # Resolve a unique metadata id from the full path (boundary-aware).
+            # Uses your existing helper logic style (safe vs false positives).
+            path_match = resolve_to_metadata_id(str(p), meta_ids)
+
+            if path_match is not None:
+                info["subject_id_raw"] = path_match
+                info["subject_id"] = path_match
+                info["subject_id_source"] = "path_match"
+
+    
+        # C) Refined: ONLY prepend subject_id if it's not already in the original filename
+        #    - case-insensitive
+        #    - boundary-aware via existing _boundary_contains helper
+        subj = str(info["subject_id"]) if info["subject_id"] is not None else ""
+        orig_name = p.name
+
+        # Case-insensitive token match: compare using lowercased strings
+        has_id_in_name = bool(subj) and _boundary_contains(subj.lower(), orig_name.lower())
+
+        if not has_id_in_name:
+            info["filename"] = f"{subj}_{orig_name}" if subj else orig_name
+        else:
+            info["filename"] = orig_name  # keep as-is
+
         try:
+
             # --------------------------
             # H5 backend: dynamic key loop
             # --------------------------
-            if backend == "h5":                
+            if backend == "h5":
                 # Always safe/lightweight: list top-level keys
                 info.update(load_h5_keys(p))  # {"keys": [...]}
 
                 # Loop through EVERY key and:
-                #  1) try to infer EEG dims from dataset shapes (2D or 3D)
+                #  1) infer EEG dims from dataset shapes (2D or 3D)
                 #  2) read small dataset values into "<key>_value"
                 for k in info.get("keys", []):
-                    # Lightweight inspection (type, shape, dtype) without loading arrays
                     d = explore_h5_key(p, k)
 
                     # We only care about datasets here (groups have no shapes/values)
@@ -1339,31 +1590,24 @@ def scan_eeg_directory(
                             max_times=max_times,
                         )
 
-                        # If dims inference succeeded, store it ONCE (first match wins)
-                        # This avoids overwriting dims if multiple datasets exist.
+                        # Store dims ONCE (first match wins)
                         if dims and not any(key in info for key in ("n_times", "n_channels", "n_segments")):
                             info.update(dims)
 
                     # ---- 2) Read small dataset values (scalar-ish) ----
-                    # Example: samplingRate stored as 1x1 -> returns 1000.0 after unwrap
                     val = read_h5_dataset_value(p, k, max_elems=max_value_elems)
                     if val is not None:
                         info[f"{k}_value"] = val
 
                 # Compute duration after we've collected dims + samplingRate_value
                 info.update(compute_durations(info))
+
             # --------------------------
-            # MNE backend: keep your current approach
+            # MNE backend
             # --------------------------
             elif backend == "mne":
-                # If your load_raw_eeg returns a dict, info.update(meta) will just work.
-                # If it returns an MNE Raw object, adapt as needed.
                 meta = load_raw_eeg(p, preload=False)
 
-                # If you currently return an MNE Raw object, you can compute inline:
-                # raw = meta
-                # info.update({...})
-                #
                 # If your load_raw_eeg already returns a dict, this is fine:
                 if isinstance(meta, dict):
                     info.update(meta)
@@ -1391,7 +1635,6 @@ def scan_eeg_directory(
             # Catch errors per-file so one bad file doesn't kill the whole scan
             info["error"] = str(e)
 
-        # Save this file's record
         rows.append(info)
 
     # Convert to DataFrame (pandas will handle missing keys as NaN)
@@ -1399,16 +1642,9 @@ def scan_eeg_directory(
 
     # ----------------------------------------------------------------------
     # 4) Merge label metadata
-    #
-    # We support two ID-matching modes:
-    #   - normalize_numeric_subject_ids=True:
-    #       Normalize numeric-like IDs on BOTH sides (e.g., "0046", "sub-0046", 46 -> "46"),
-    #       then do an exact merge.
-    #   - normalize_numeric_subject_ids=False:
-    #       Filenames may contain "decorated" IDs (prefix/suffix/date/run). Resolve each
-    #       df ID to a metadata ID using boundary-aware containment (not naive substring),
-    #       then do an exact merge.
     # ----------------------------------------------------------------------
+    uunmatched_df = pd.DataFrame()  # ensure defined even if df empty
+
     if not df.empty:
 
         # Ensure consistent dtype for safe merging (<NA> preserved)
@@ -1420,6 +1656,9 @@ def scan_eeg_directory(
             df["subject_id_merge"] = df["subject_id"].map(_normalize_subject_id).astype("string")
             subj_map["subject_id_merge"] = subj_map["subject_id"].map(_normalize_subject_id).astype("string")
         else:
+            # NOTE:
+            # We keep this logic, but now df["subject_id"] is often already the
+            # exact metadata Subject_ID thanks to the path-based override above.
             meta_ids = subj_map["subject_id"].dropna().astype(str).unique().tolist()
             df["subject_id_merge"] = (
                 df["subject_id"].astype(str)
@@ -1427,7 +1666,6 @@ def scan_eeg_directory(
                 .astype("string")
             )
             subj_map["subject_id_merge"] = subj_map["subject_id"].astype("string")
-
 
         # Safety: one row per subject in metadata
         subj_map = subj_map.drop_duplicates(subset=["subject_id_merge"], keep="first")
@@ -1448,8 +1686,7 @@ def scan_eeg_directory(
             .where(df["subject_id_merge"].notna(), np.nan)
         )
 
-
-        # Human-friendly match status (keep _merge too if you want)
+        # Human-friendly match status
         df["match_status"] = df["_merge"].map({
             "both": "matched",
             "left_only": "unmatched_file_id",
@@ -1471,14 +1708,13 @@ def scan_eeg_directory(
         print("[info] match_status counts:")
         print(df["match_status"].value_counts(dropna=False))
 
-
         uunmatched_df = df.loc[
-                            df["match_status"] == "unmatched_file_id",
-                            ["subject_id_raw", "subject_id", "subject_id_merge", "filename"]
-                        ]
-
+            df["match_status"] == "unmatched_file_id",
+            ["subject_id_raw", "subject_id", "subject_id_merge", "filename", "filepath", "subject_id_source"],
+        ].copy()
 
     return df, uunmatched_df
+
 
 def convert_scan_to_mne_fif(
     df: pd.DataFrame,
@@ -1706,14 +1942,25 @@ def convert_scan_to_mne_fif(
         try:
             raw = load_raw_eeg(file_path, preload=preload)
 
-            # Keep channels not in montage (type them as misc)
-            montage_chs = set(montage.ch_names)
-            unknown = [ch for ch in raw.ch_names if ch not in montage_chs]
-            if unknown:
-                raw.set_channel_types({ch: "misc" for ch in unknown})
+            if file_path.suffix.lower() == ".mat":
+                raw = _rebuild_fieldtrip_raw_with_clean_info(raw, montage)
+            else:
+                montage_chs = set(montage.ch_names)
+                unknown = [ch for ch in raw.ch_names if ch not in montage_chs]
+                if unknown:
+                    raw.set_channel_types({ch: "misc" for ch in unknown})
+                raw.set_montage(montage)
 
-            raw.set_montage(montage)
             raw.save(out_path.as_posix(), overwrite=overwrite, verbose=False)
+
+
+            # Keep channels not in montage (type them as misc)
+            #montage_chs = set(montage.ch_names)
+            #unknown = [ch for ch in raw.ch_names if ch not in montage_chs]
+            #if unknown:
+            #    raw.set_channel_types({ch: "misc" for ch in unknown})
+            #raw.set_montage(montage)
+            #raw.save(out_path.as_posix(), overwrite=overwrite, verbose=False)
 
         except Exception as e:
             failed.append((file_path.name, str(e)))
@@ -1873,7 +2120,7 @@ def convert_abcct_from_scan(
     # ------------------------------------------------------------------
     for row in tqdm(
         work.itertuples(), total=len(work),
-        desc="Converting ABC-CT → FIF (by label)", unit="file"
+        desc="Converting EEG.mat → FIF (by label)", unit="file"
     ):
         idx = row.Index
         mat_path = Path(row.filepath)
@@ -2001,260 +2248,6 @@ def convert_abcct_from_scan(
     return converted_df, uunmatched_df
 
 
-# Old version
-# def convert_abcct_from_scan(
-#     df: pd.DataFrame,
-#     out_dir: str | Path = "abcct_data_prepared",
-#     montage_name: str | None = None,
-#     overwrite: bool = False,
-#     n_blocks_to_keep: int = 3,
-#     require_n_blocks: bool = True,
-# ) -> None:
-#     """
-#     Convert ABC-CT *_r.mat resting EEG files (previously discovered via
-#     `scan_eeg_directory`) into MNE FIF format, organizing output by label.
-
-#     This function assumes that `df` already contains one row per MATLAB file,
-#     with at least the following columns:
-
-#         - 'filepath'   : full path to the *_r.mat file
-#         - 'subject_id' : subject identifier extracted from filename
-#         - 'label'      : label (e.g. ASD, TD, UNLABELED) [optional]
-
-#     Processing steps:
-#         1. Loads each .mat file using h5py (EEG_Resting + samplingRate).
-#         2. Selects resting segments (blocks) according to `n_blocks_to_keep` and
-#            `require_n_blocks`:
-#               - If require_n_blocks=True: skip files with < n_blocks_to_keep blocks.
-#               - If require_n_blocks=False: keep up to n_blocks_to_keep blocks.
-#         3. Converts each kept segment to an MNE Raw object.
-#         4. Concatenates segments, applies a standard montage.
-#         5. Saves one FIF per subject into label-based subfolders.
-
-#     Parameters
-#     ----------
-#     df : pd.DataFrame
-#         DataFrame produced by `scan_eeg_directory` with backend="h5"
-#         (or an equivalent subset). Must contain 'filepath' and 'subject_id',
-#         and ideally 'label'.
-
-#     out_dir : str or Path
-#         Root output directory. Subfolders will be created per label
-#         (e.g., ASD, TD, UNLABELED).
-
-#     montage_name : str, optional
-#         Name of an MNE standard montage (e.g. "GSN-HydroCel-128").
-#         Must be provided and valid.
-
-#     overwrite : bool
-#         Whether to overwrite existing FIF files if they already exist.
-
-#     n_blocks_to_keep : int
-#         Target number of resting segments (blocks) to retain from EEG_Resting.
-
-#         - If require_n_blocks=True, this is a minimum requirement: files with fewer
-#           than `n_blocks_to_keep` blocks are skipped.
-#         - If require_n_blocks=False, this is a maximum: files with fewer blocks are
-#           still processed using all available blocks.
-
-#     require_n_blocks : bool
-#         If True, enforce that each file must contain at least `n_blocks_to_keep`
-#         blocks; otherwise skip the file (and report it). If False, process files
-#         even when fewer than `n_blocks_to_keep` blocks exist.
-
-#     Returns
-#     -------
-#     None
-#         Writes FIF files to disk and prints a summary of edge cases.
-
-#     Notes
-#     -----
-#     Expected MATLAB structure:
-#         - Dataset : EEG_Resting   (segments × time × channels)
-#         - Dataset : samplingRate  (scalar or 1×1 matrix)
-
-#     This function does *not* do any folder scanning or metadata merging; that is
-#     handled upstream by `scan_eeg_directory`.
-#     """
-
-#     # ------------------------------------------------------------------
-#     # 0. Basic validation of df and required columns
-#     # ------------------------------------------------------------------
-#     required_cols = {"filepath", "subject_id"}
-#     missing_cols = required_cols - set(df.columns)
-#     if missing_cols:
-#         raise ValueError(
-#             f"[convert_abcct_from_scan] df is missing required columns: {sorted(missing_cols)}"
-#         )
-
-#     # 'label' is optional, but useful; if missing, we synthesize UNLABELED.
-#     if "label" not in df.columns:
-#         df = df.copy()
-#         df["label"] = "UNLABELED"
-
-#     # ------------------------------------------------------------------
-#     # 1. Prepare output directory and montage
-#     # ------------------------------------------------------------------
-#     out_dir_path = Path(out_dir).expanduser().resolve()
-#     out_dir_path.mkdir(parents=True, exist_ok=True)
-
-#     if montage_name is None:
-#         raise ValueError(
-#             "[convert_abcct_from_scan] You must provide montage_name "
-#             "(e.g., 'GSN-HydroCel-128')."
-#         )
-
-#     try:
-#         montage = mne.channels.make_standard_montage(montage_name)
-#     except Exception as exc:
-#         raise ValueError(
-#             f"[convert_abcct_from_scan] Invalid montage '{montage_name}'. "
-#             f"Check available standard montages in MNE."
-#         ) from exc
-
-#     # ------------------------------------------------------------------
-#     # 2. Track edge cases for reporting
-#     # ------------------------------------------------------------------
-#     failed: list[tuple[str, str]] = []
-#     insufficient_blocks: list[tuple[str, int]] = []  # (filename, n_found)
-#     missing_label_files: list[str] = []
-
-#     # ------------------------------------------------------------------
-#     # 3. Main conversion loop
-#     # ------------------------------------------------------------------
-#     for row in tqdm(df.itertuples(), total=len(df), desc="Converting ABC-CT (from scan)", unit="file"):
-#         mat_path = Path(row.filepath)
-#         subj_id = str(row.subject_id)
-
-#         # Handle label; default to UNLABELED if NaN or empty
-#         label = getattr(row, "label", "UNLABELED")
-#         if pd.isna(label) or str(label).strip() == "":
-#             label = "UNLABELED"
-#             missing_label_files.append(mat_path.name)
-
-#         label = str(label).strip()
-
-#         # Destination directory: one subfolder per label
-#         label_dir = out_dir_path / label
-#         label_dir.mkdir(parents=True, exist_ok=True)
-
-#         out_path = label_dir / f"{subj_id}_eeg.fif"
-
-#         # Skip if FIF already exists and we don't want to overwrite
-#         if out_path.exists() and not overwrite:
-#             continue
-
-#         try:
-#             # -----------------------------------------------------
-#             # 3a. Load MATLAB data with h5py
-#             # -----------------------------------------------------
-#             with h5py.File(mat_path, "r") as f:
-#                 X = f["EEG_Resting"][()]      # shape: (segments, time, channels)
-#                 sr = f["samplingRate"][()]    # scalar or 1×1
-
-#             # sampling rate: handle 1×1 MATLAB matrix vs scalar
-#             sfreq = float(sr[0, 0]) if getattr(sr, "shape", None) == (1, 1) else float(sr)
-
-#             if X.ndim != 3:
-#                 raise ValueError(f"Unexpected EEG_Resting ndim={X.ndim} for file {mat_path.name}")
-
-#             n_seg, n_times, n_ch = X.shape
-
-#             # -----------------------------------------------------
-#             # 3b. Decide whether to skip based on available blocks
-#             # -----------------------------------------------------
-#             if n_seg < int(n_blocks_to_keep):
-#                 insufficient_blocks.append((mat_path.name, n_seg))
-#                 if require_n_blocks:
-#                     # Strict mode: skip this file entirely.
-#                     continue
-
-#             # Determine how many blocks we will actually use:
-#             # - Strict mode: exactly n_blocks_to_keep (since n_seg >= n_blocks_to_keep)
-#             # - Lenient mode: up to n_blocks_to_keep
-#             n_keep = int(n_blocks_to_keep) if require_n_blocks else min(n_seg, int(n_blocks_to_keep))
-#             X = X[:n_keep]
-
-#             # -----------------------------------------------------
-#             # 3c. Build MNE Raw objects for each block
-#             # -----------------------------------------------------
-#             ch_names = [f"EEG{idx+1:03d}" for idx in range(n_ch)]
-#             info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
-
-#             raws: list[mne.io.BaseRaw] = []
-
-#             for i in range(n_keep):
-#                 seg = X[i]
-
-#                 # Ensure data has shape (n_channels, n_times)
-#                 if seg.shape == (n_ch, n_times):
-#                     data = seg
-#                 elif seg.shape == (n_times, n_ch):
-#                     data = seg.T
-#                 else:
-#                     # Try to infer the channel axis if shape is odd
-#                     if n_ch in seg.shape:
-#                         ch_axis = int(np.argmax([dim == n_ch for dim in seg.shape]))
-#                         data = np.moveaxis(seg, ch_axis, 0)
-#                     else:
-#                         raise ValueError(
-#                             f"Cannot infer channel axis for segment {i} in file {mat_path.name}"
-#                         )
-
-#                 raw_i = mne.io.RawArray(data, info.copy(), verbose=False)
-
-#                 # Annotate this segment as a single "rest block"
-#                 duration = data.shape[1] / sfreq
-#                 raw_i.set_annotations(
-#                     mne.Annotations(
-#                         onset=[0.0],
-#                         duration=[duration],
-#                         description=[f"rest_block_{i+1}"],
-#                     )
-#                 )
-#                 raws.append(raw_i)
-
-#             # -----------------------------------------------------
-#             # 3d. Concatenate all blocks and finalize channels/montage
-#             # -----------------------------------------------------
-#             raw = mne.concatenate_raws(raws, on_mismatch="ignore", verbose=False)
-
-#             # Optionally rename channels to a simpler scheme (E1, E2, ...)
-#             mapping = {f"EEG{idx+1:03d}": f"E{idx+1}" for idx in range(n_ch)}
-#             raw.rename_channels(mapping)
-
-#             # Apply montage
-#             raw.set_montage(montage)
-
-#             # -----------------------------------------------------
-#             # 3e. Save final FIF
-#             # -----------------------------------------------------
-#             raw.save(out_path.as_posix(), overwrite=overwrite, verbose=False)
-
-#         except Exception as e:
-#             failed.append((mat_path.name, f"{type(e).__name__}: {e}"))
-
-#     # ------------------------------------------------------------------
-#     # 4. Summary reporting
-#     # ------------------------------------------------------------------
-#     if failed:
-#         print("\n[convert_abcct_from_scan] Failed to process the following files:")
-#         for fname, err in failed:
-#             print(f" - {fname}: {err}")
-
-#     if insufficient_blocks:
-#         label = "Insufficient blocks (skipped)" if require_n_blocks else "Fewer blocks than requested (processed anyway)"
-#         print(f"\n[convert_abcct_from_scan] {label}:")
-#         for fname, n_found in insufficient_blocks:
-#             print(f" - {fname}: found {n_found}, requested {n_blocks_to_keep}")
-
-#     if missing_label_files:
-#         print("\n[convert_abcct_from_scan] Files with missing label (treated as UNLABELED):")
-#         for fname in missing_label_files:
-#             print(f" - {fname}")
-
-
-
 
 
 
@@ -2323,6 +2316,7 @@ def build_label_epoch_arrays(
     data_root: str | Path,
     base_config: dict,
     skip_dirnames: list[str] = ["UNLABELED"],
+    final_epochs_key: str = "epochs_ransac",
 ) -> Tuple[Dict[str, List[np.ndarray]], List[Dict[str, str]], Dict[str, Any]]:
     """
     Discover EEG .fif files grouped by label, preprocess them, and build per-label subject arrays.
@@ -2443,7 +2437,7 @@ def build_label_epoch_arrays(
             try:
                 # Run the preprocessing pipeline
                 state = eeg_preprocess_pipeline(cfg)
-                epochs_final = state['epochs_ransac'].copy()
+                epochs_final = state[final_epochs_key].copy()
 
                 # Capture EEG info from the first valid file
                 if not eeg_info:

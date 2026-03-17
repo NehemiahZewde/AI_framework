@@ -4253,14 +4253,13 @@ def plot_patient_auprc_auroc(
     _plot_df(df_roc, "AUROC", ylim=auroc_ylim)
 
 
-
 def barplot_balanced_accuracy(
     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
     model_names: str | Sequence[str] | None = None,
     use_calibrated: bool = False,
     calibration_method: str | None = None,
     n_grid: int = 101,
-    mode: Literal["train_threshold", "test_threshold", "split_best"] = "train_threshold",
+    mode: Literal["train_threshold", "test_threshold", "split_best", "mean_train_threshold"] = "train_threshold",
     # ---- labels / aliasing ----
     method_alias: Mapping[str, str] | None = None,
     # ---- styling ----
@@ -4325,6 +4324,11 @@ def barplot_balanced_accuracy(
             Test  bar uses max_t BA_test(t)
         This is explicitly post hoc (a per-split upper bound), useful for visualization.
 
+    mode="mean_train_threshold":
+        For each fold, choose a threshold t* that maximizes BA on the TRAIN split for that fold.
+        Then compute the mean of these foldwise training-optimal thresholds for the model and
+        apply that single shared threshold to every fold's train and test split.
+
     Score sources
     -------------
     If use_calibrated=False:
@@ -4362,7 +4366,8 @@ def barplot_balanced_accuracy(
         Number of thresholds in the uniform grid over [0, 1].
 
     mode:
-        Threshold selection strategy ("train_threshold", "test_threshold", "split_best").
+        Threshold selection strategy ("train_threshold", "test_threshold", "split_best",
+        "mean_train_threshold").
 
     method_alias:
         Optional mapping from internal model keys to display labels on the x-axis.
@@ -4381,8 +4386,11 @@ def barplot_balanced_accuracy(
         expand to avoid clipping annotations.
 
     print_threshold_summary:
-        If True and mode is "train_threshold" or "test_threshold", print mean ± SD of selected
-        thresholds (t*) across folds for each model.
+        If True:
+          - for "train_threshold" / "test_threshold": print mean ± SD of selected thresholds
+            across folds for each model.
+          - for "mean_train_threshold": print the shared mean threshold for each model, along
+            with mean ± SD of the foldwise train-optimal thresholds used to create it.
 
     Returns
     -------
@@ -4394,8 +4402,10 @@ def barplot_balanced_accuracy(
     # -------------------------
     if use_calibrated and calibration_method is None:
         raise ValueError("calibration_method must be provided when use_calibrated=True.")
-    if mode not in {"train_threshold", "test_threshold", "split_best"}:
-        raise ValueError("mode must be 'train_threshold', 'test_threshold', or 'split_best'.")
+    if mode not in {"train_threshold", "test_threshold", "split_best", "mean_train_threshold"}:
+        raise ValueError(
+            "mode must be 'train_threshold', 'test_threshold', 'split_best', or 'mean_train_threshold'."
+        )
 
     if method_alias is None:
         method_alias = {}
@@ -4464,6 +4474,7 @@ def barplot_balanced_accuracy(
     train_vals_per_model: list[np.ndarray] = []
     test_vals_per_model: list[np.ndarray] = []
     tstars_per_model: list[np.ndarray] = []
+    shared_thresholds_per_model: list[float | None] = []
 
     for model in selected:
         folds = all_results[model]
@@ -4472,19 +4483,46 @@ def barplot_balanced_accuracy(
         test_ba: list[float] = []
         tstars: list[float] = []
 
+        usable_folds: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
         for r in folds:
             try:
                 y_tr, s_tr = _get_y_and_scores(r, "train")
                 y_te, s_te = _get_y_and_scores(r, "test")
             except KeyError:
                 continue
+            usable_folds.append((y_tr, s_tr, y_te, s_te))
 
-            if mode == "split_best":
+        if len(usable_folds) == 0:
+            raise ValueError(
+                f"No usable folds found for model '{model}'. "
+                "Check expected score keys for chosen calibration settings."
+            )
+
+        if mode == "split_best":
+            for y_tr, s_tr, y_te, s_te in usable_folds:
                 ba_tr, _ = _best_ba_and_t(y_tr, s_tr)
                 ba_te, _ = _best_ba_and_t(y_te, s_te)
                 train_ba.append(ba_tr)
                 test_ba.append(ba_te)
-            else:
+            shared_thresholds_per_model.append(None)
+
+        elif mode == "mean_train_threshold":
+            # First: collect best training thresholds across folds
+            for y_tr, s_tr, _, _ in usable_folds:
+                _, t_star = _best_ba_and_t(y_tr, s_tr)
+                tstars.append(t_star)
+
+            t_mean = float(np.mean(tstars))
+            shared_thresholds_per_model.append(t_mean)
+
+            # Then: apply same mean threshold to every train/test fold
+            for y_tr, s_tr, y_te, s_te in usable_folds:
+                train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_mean).astype(int)))
+                test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_mean).astype(int)))
+
+        else:
+            for y_tr, s_tr, y_te, s_te in usable_folds:
                 if mode == "train_threshold":
                     _, t_star = _best_ba_and_t(y_tr, s_tr)
                 else:  # test_threshold
@@ -4494,11 +4532,7 @@ def barplot_balanced_accuracy(
                 train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_star).astype(int)))
                 test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_star).astype(int)))
 
-        if len(train_ba) == 0:
-            raise ValueError(
-                f"No usable folds found for model '{model}'. "
-                "Check expected score keys for chosen calibration settings."
-            )
+            shared_thresholds_per_model.append(None)
 
         train_vals_per_model.append(np.array(train_ba, dtype=float))
         test_vals_per_model.append(np.array(test_ba, dtype=float))
@@ -4513,8 +4547,6 @@ def barplot_balanced_accuracy(
     # -------------------------
     # Plot
     # -------------------------
-
-
     x = np.arange(len(model_labels), dtype=float)
     width = float(bar_width)
 
@@ -4620,19 +4652,412 @@ def barplot_balanced_accuracy(
     fig.tight_layout()
     plt.show()
 
-
     # -------------------------
     # Optional: print threshold summary
     # -------------------------
-    if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
-        print("Per-model selected threshold summary (mean ± SD across folds):")
-        for label, tarr in zip(model_labels, tstars_per_model):
-            if tarr.size == 0:
-                print(f"  {label}: (no thresholds computed)")
-                continue
-            t_mean = float(np.mean(tarr))
-            t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
-            print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
+    if print_threshold_summary:
+        if mode in {"train_threshold", "test_threshold"}:
+            print("Per-model selected threshold summary (mean ± SD across folds):")
+            for label, tarr in zip(model_labels, tstars_per_model):
+                if tarr.size == 0:
+                    print(f"  {label}: (no thresholds computed)")
+                    continue
+                t_mean = float(np.mean(tarr))
+                t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+                print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
+
+        elif mode == "mean_train_threshold":
+            print("Per-model shared mean training-threshold summary:")
+            for label, tarr, t_shared in zip(model_labels, tstars_per_model, shared_thresholds_per_model):
+                if tarr.size == 0 or t_shared is None:
+                    print(f"  {label}: (no thresholds computed)")
+                    continue
+                t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+                print(
+                    f"  {label}: shared threshold = {t_shared:.3f} "
+                    f"(from foldwise best-train thresholds: {t_shared:.3f} ± {t_sd:.3f})"
+                )
+
+
+# def barplot_balanced_accuracy(
+#     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
+#     model_names: str | Sequence[str] | None = None,
+#     use_calibrated: bool = False,
+#     calibration_method: str | None = None,
+#     n_grid: int = 101,
+#     mode: Literal["train_threshold", "test_threshold", "split_best"] = "train_threshold",
+#     # ---- labels / aliasing ----
+#     method_alias: Mapping[str, str] | None = None,
+#     # ---- styling ----
+#     figsize: tuple[float, float] = (9.0, 5.0),
+#     font_size: float = 12.0,
+#     legend_loc: str = "best",
+#     x_tick_rotation: int = 0,
+#     split_palette: Mapping[str, str] | None = None,  # {"Train": "...", "Test": "..."}
+#     bar_width: float = 0.36,
+#     capsize: float = 5.0,
+#     # ---- baseline ----
+#     show_baseline: bool = True,
+#     baseline_value: float = 0.50,
+#     baseline_color: str = "#D5F713",
+#     baseline_lw: float = 1.5,
+#     baseline_ls: str = "--",
+#     # ---- annotation ----
+#     annotate_mean_sd: bool = True,
+#     annotate_decimals: int = 3,
+#     annotate_font_size: float | None = None,
+#     annotate_offset: float = 0.015,
+#     # ---- y limits ----
+#     ylim: tuple[float, float] | None = None,
+#     # ---- console threshold summary ----
+#     print_threshold_summary: bool = True,
+# ) -> None:
+#     """
+#     Plot balanced accuracy across outer folds as a grouped bar chart (Train vs Test) for one or
+#     more models, summarizing performance as mean ± SD across folds.
+
+#     This function is intended to work with your nested-CV `all_results` structure where each
+#     model maps to a list of per-(trial, outer_fold) dictionaries containing y labels and score
+#     vectors (and optionally calibrated scores).
+
+#     What is computed
+#     ----------------
+#     For each model and each fold dictionary `r`:
+#       1) Retrieve (y_train, score_train) and (y_test, score_test) from `r`.
+#       2) Convert scores to hard predictions using thresholds on a fixed grid in [0, 1].
+#       3) Compute balanced accuracy:
+#             BA = (TPR + TNR) / 2
+#          where TPR is sensitivity and TNR is specificity.
+#       4) Aggregate fold-level balanced accuracy values across folds and display:
+#             mean ± SD
+
+#     Threshold selection modes
+#     -------------------------
+#     mode="train_threshold":
+#         For each fold, choose a threshold t* that maximizes BA on the TRAIN split for that fold,
+#         then evaluate BA on both train and test using that same t*.
+#         This is the recommended “train-chosen threshold” summary.
+
+#     mode="test_threshold":
+#         For each fold, choose a threshold t* that maximizes BA on the TEST split for that fold,
+#         then evaluate BA on both train and test using that same t*.
+#         This is optimistic (uses test labels to pick thresholds) and is best used for diagnostic
+#         or “ceiling” comparisons.
+
+#     mode="split_best":
+#         For each fold, choose thresholds independently for train and test:
+#             Train bar uses max_t BA_train(t)
+#             Test  bar uses max_t BA_test(t)
+#         This is explicitly post hoc (a per-split upper bound), useful for visualization.
+
+#     Score sources
+#     -------------
+#     If use_calibrated=False:
+#         Train: r["y_train"], r["y_train_scores"]
+#         Test : r["y_test"],  r["y_test_scores"]
+
+#     If use_calibrated=True:
+#         `calibration_method` is required and scores are taken from:
+#         Train: r[f"cv_calib_train_predictions_{calibration_method}"], with y_train
+#         Test : r[f"calib_test_predictions_{calibration_method}"],     with y_test
+
+#     Plot contents
+#     -------------
+#     - Two bars per model: Train and Test.
+#     - Error bars show ±1 SD across folds.
+#     - Optional horizontal baseline line (default: 0.50) for reference.
+#     - Optional annotation above each bar showing "mean ± SD".
+
+#     Parameters
+#     ----------
+#     all_results:
+#         Nested-CV results keyed by model name; each value is a list of fold dicts.
+
+#     model_names:
+#         Model(s) to plot:
+#           - None: plot all models in `all_results`
+#           - str: plot one model
+#           - sequence[str]: plot multiple models
+
+#     use_calibrated / calibration_method:
+#         If use_calibrated=True, calibration_method must be provided (e.g., "beta") and the
+#         calibrated prediction keys must exist in the fold dicts.
+
+#     n_grid:
+#         Number of thresholds in the uniform grid over [0, 1].
+
+#     mode:
+#         Threshold selection strategy ("train_threshold", "test_threshold", "split_best").
+
+#     method_alias:
+#         Optional mapping from internal model keys to display labels on the x-axis.
+
+#     split_palette:
+#         Optional colors for bars, e.g. {"Train": "#138CFD", "Test": "#000000"}.
+
+#     show_baseline / baseline_value / baseline_color / baseline_lw / baseline_ls:
+#         Control the horizontal baseline reference line.
+
+#     annotate_mean_sd / annotate_decimals / annotate_font_size / annotate_offset:
+#         Controls for the "mean ± SD" text annotations.
+
+#     ylim:
+#         Optional y-axis limits (ymin, ymax). If None, limits are chosen automatically and may
+#         expand to avoid clipping annotations.
+
+#     print_threshold_summary:
+#         If True and mode is "train_threshold" or "test_threshold", print mean ± SD of selected
+#         thresholds (t*) across folds for each model.
+
+#     Returns
+#     -------
+#     None
+#         Displays a matplotlib figure.
+#     """
+#     # -------------------------
+#     # Defaults / validation
+#     # -------------------------
+#     if use_calibrated and calibration_method is None:
+#         raise ValueError("calibration_method must be provided when use_calibrated=True.")
+#     if mode not in {"train_threshold", "test_threshold", "split_best"}:
+#         raise ValueError("mode must be 'train_threshold', 'test_threshold', or 'split_best'.")
+
+#     if method_alias is None:
+#         method_alias = {}
+#     if split_palette is None:
+#         split_palette = {"Train": "darkblue", "Test": "darkred"}
+#     if "Train" not in split_palette or "Test" not in split_palette:
+#         raise ValueError("split_palette must contain keys 'Train' and 'Test'.")
+
+#     # -------------------------
+#     # Choose models
+#     # -------------------------
+#     if model_names is None:
+#         selected = list(all_results.keys())
+#     elif isinstance(model_names, str):
+#         selected = [model_names]
+#     else:
+#         selected = list(model_names)
+
+#     missing = [m for m in selected if m not in all_results]
+#     if missing:
+#         raise KeyError(
+#             f"Model(s) not found in all_results: {missing}. Available: {list(all_results.keys())}"
+#         )
+
+#     # display labels + uniqueness check
+#     model_labels = [method_alias.get(m, m) for m in selected]
+#     if len(set(model_labels)) != len(model_labels):
+#         # find duplicates
+#         seen = set()
+#         dupes = sorted({x for x in model_labels if (x in seen) or seen.add(x) is None and False})  # type: ignore
+#         # the trick above is messy; just do a clean count:
+#         dupes = sorted({x for x in model_labels if model_labels.count(x) > 1})
+#         raise ValueError(
+#             f"method_alias causes duplicate model labels: {dupes}. Make aliases unique."
+#         )
+
+#     grid = np.linspace(0.0, 1.0, int(n_grid))
+
+#     # -------------------------
+#     # Helpers
+#     # -------------------------
+#     def _get_y_and_scores(r: Mapping[str, Any], split: Literal["train", "test"]) -> tuple[np.ndarray, np.ndarray]:
+#         if not use_calibrated:
+#             y_key = "y_train" if split == "train" else "y_test"
+#             s_key = "y_train_scores" if split == "train" else "y_test_scores"
+#         else:
+#             y_key = "y_train" if split == "train" else "y_test"
+#             s_key = (
+#                 f"cv_calib_train_predictions_{calibration_method}"
+#                 if split == "train"
+#                 else f"calib_test_predictions_{calibration_method}"
+#             )
+
+#         if y_key not in r or s_key not in r:
+#             raise KeyError(f"Missing keys '{y_key}'/'{s_key}' in fold record.")
+#         return np.asarray(r[y_key]), np.asarray(r[s_key])
+
+#     def _best_ba_and_t(y: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+#         ba = np.array([balanced_accuracy_score(y, (s >= t).astype(int)) for t in grid], dtype=float)
+#         j = int(np.argmax(ba))
+#         return float(ba[j]), float(grid[j])
+
+#     # -------------------------
+#     # Compute per-fold BA for each model
+#     # -------------------------
+#     train_vals_per_model: list[np.ndarray] = []
+#     test_vals_per_model: list[np.ndarray] = []
+#     tstars_per_model: list[np.ndarray] = []
+
+#     for model in selected:
+#         folds = all_results[model]
+
+#         train_ba: list[float] = []
+#         test_ba: list[float] = []
+#         tstars: list[float] = []
+
+#         for r in folds:
+#             try:
+#                 y_tr, s_tr = _get_y_and_scores(r, "train")
+#                 y_te, s_te = _get_y_and_scores(r, "test")
+#             except KeyError:
+#                 continue
+
+#             if mode == "split_best":
+#                 ba_tr, _ = _best_ba_and_t(y_tr, s_tr)
+#                 ba_te, _ = _best_ba_and_t(y_te, s_te)
+#                 train_ba.append(ba_tr)
+#                 test_ba.append(ba_te)
+#             else:
+#                 if mode == "train_threshold":
+#                     _, t_star = _best_ba_and_t(y_tr, s_tr)
+#                 else:  # test_threshold
+#                     _, t_star = _best_ba_and_t(y_te, s_te)
+
+#                 tstars.append(t_star)
+#                 train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_star).astype(int)))
+#                 test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_star).astype(int)))
+
+#         if len(train_ba) == 0:
+#             raise ValueError(
+#                 f"No usable folds found for model '{model}'. "
+#                 "Check expected score keys for chosen calibration settings."
+#             )
+
+#         train_vals_per_model.append(np.array(train_ba, dtype=float))
+#         test_vals_per_model.append(np.array(test_ba, dtype=float))
+#         tstars_per_model.append(np.array(tstars, dtype=float))
+
+#     # summarize mean/sd
+#     train_means = np.array([v.mean() for v in train_vals_per_model], dtype=float)
+#     test_means = np.array([v.mean() for v in test_vals_per_model], dtype=float)
+#     train_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in train_vals_per_model], dtype=float)
+#     test_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in test_vals_per_model], dtype=float)
+
+#     # -------------------------
+#     # Plot
+#     # -------------------------
+
+
+#     x = np.arange(len(model_labels), dtype=float)
+#     width = float(bar_width)
+
+#     fig, ax = plt.subplots(figsize=figsize)
+
+#     bars_train = ax.bar(
+#         x - width / 2,
+#         train_means,
+#         width,
+#         yerr=train_sds,
+#         capsize=capsize,
+#         color=split_palette["Train"],
+#         label="Train",
+#     )
+#     bars_test = ax.bar(
+#         x + width / 2,
+#         test_means,
+#         width,
+#         yerr=test_sds,
+#         capsize=capsize,
+#         color=split_palette["Test"],
+#         label="Test",
+#     )
+
+#     baseline_handle = None
+#     if show_baseline:
+#         baseline_handle = ax.axhline(
+#             float(baseline_value),
+#             linestyle=baseline_ls,
+#             linewidth=baseline_lw,
+#             color=baseline_color,
+#             label=f"Baseline = {baseline_value:.2f}",
+#         )
+
+#     # ---- labels / title (Option A title) ----
+#     ax.set_title(
+#         "Balanced accuracy across folds",
+#         fontsize=font_size + 1,
+#         fontweight="bold",
+#     )
+#     ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
+#     ax.set_ylabel("Balanced accuracy", fontsize=font_size, fontweight="bold")
+
+#     ax.set_xticks(x)
+#     ax.set_xticklabels(model_labels, fontsize=font_size, fontweight="bold", rotation=x_tick_rotation)
+#     ax.tick_params(axis="y", labelsize=font_size)
+#     for lab in ax.get_yticklabels():
+#         lab.set_fontweight("bold")
+
+#     # ---- annotations (bold) ----
+#     if annotate_mean_sd:
+#         ann_fs = annotate_font_size if annotate_font_size is not None else max(8.0, float(font_size) - 3.0)
+#         offset = float(annotate_offset)
+
+#         def _annotate(bars, means, sds):
+#             for bar, mean, sd in zip(bars, means, sds):
+#                 x0 = bar.get_x() + bar.get_width() / 2.0
+#                 y0 = float(mean) + float(sd) + offset
+#                 ax.text(
+#                     x0,
+#                     y0,
+#                     f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+#                     ha="center",
+#                     va="bottom",
+#                     fontsize=ann_fs,
+#                     fontweight="bold",
+#                 )
+
+#         _annotate(bars_train, train_means, train_sds)
+#         _annotate(bars_test, test_means, test_sds)
+
+#     # ---- y-lims (same as before) ----
+#     if ylim is not None:
+#         ax.set_ylim(*ylim)
+#     else:
+#         top = max(
+#             float(np.max(train_means + train_sds)),
+#             float(np.max(test_means + test_sds)),
+#             float(baseline_value) if show_baseline else 0.0,
+#         )
+#         pad = 0.08 if annotate_mean_sd else 0.05
+#         ax.set_ylim(0.0, min(1.10, top + pad))
+
+#     # ---- legend order: Train, Test, Baseline ----
+#     handles, labels = ax.get_legend_handles_labels()
+
+#     handle_map = {lab: h for h, lab in zip(handles, labels)}
+#     ordered_labels = ["Train", "Test"]
+#     if show_baseline:
+#         ordered_labels.append(f"Baseline = {baseline_value:.2f}")
+
+#     ordered_handles = [handle_map[lbl] for lbl in ordered_labels if lbl in handle_map]
+
+#     leg = ax.legend(
+#         ordered_handles,
+#         ordered_labels,
+#         loc=legend_loc,
+#         frameon=True,
+#         prop={"size": font_size, "weight": "bold"},
+#         title="",
+#     )
+
+#     fig.tight_layout()
+#     plt.show()
+
+
+#     # -------------------------
+#     # Optional: print threshold summary
+#     # -------------------------
+#     if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
+#         print("Per-model selected threshold summary (mean ± SD across folds):")
+#         for label, tarr in zip(model_labels, tstars_per_model):
+#             if tarr.size == 0:
+#                 print(f"  {label}: (no thresholds computed)")
+#                 continue
+#             t_mean = float(np.mean(tarr))
+#             t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+#             print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
 
 
 

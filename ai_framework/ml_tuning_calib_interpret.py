@@ -3163,49 +3163,89 @@ def plot_brier_logloss(
 
         if ylim is not None:
             ax.set_ylim(*ylim)
-            
+
         # -------------------------
         # Annotate mean ± SD above each bar
         # -------------------------
         if annotate_mean_sd:
+            # compute mean/sd per (model, split)
             summary = (
                 df.groupby(["model", "split"])["score"]
-                  .agg(mean="mean", sd="std")
+                  .agg(mean="mean", sd=lambda x: np.std(x, ddof=1))
                   .reset_index()
             )
             summary["sd"] = summary["sd"].fillna(0.0)
 
-            summary["model"] = pd.Categorical(summary["model"], categories=model_labels, ordered=True)
-            summary["split"] = pd.Categorical(summary["split"], categories=["Train", "Test"], ordered=True)
-            summary = summary.sort_values(["model", "split"]).reset_index(drop=True)
-
-            bars = list(ax.patches)
-            if len(bars) != len(summary):
-                n = min(len(bars), len(summary))
-                bars = bars[:n]
-                summary = summary.iloc[:n].reset_index(drop=True)
+            # map (model, split) -> (mean, sd)
+            stats = {
+                (r["model"], r["split"]): (float(r["mean"]), float(r["sd"]))
+                for _, r in summary.iterrows()
+            }
 
             ann_fs = annotate_font_size if annotate_font_size is not None else max(8, float(font_size) - 3)
             offset = float(annotate_offset)
 
-            for bar, (_, r) in zip(bars, summary.iterrows()):
-                mean = float(r["mean"])
-                sd = float(r["sd"])
-                x = bar.get_x() + bar.get_width() / 2.0
-                y = mean + sd + offset
-                ax.text(
-                    x,
-                    y,
-                    f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=ann_fs,
-                    fontweight="bold",
-                )
+            # IMPORTANT: because hue_order=["Train","Test"], containers[0]=Train bars, containers[1]=Test bars
+            for split, container in zip(["Train", "Test"], ax.containers[:2]):
+                for model_label, bar in zip(model_labels, container):
+                    mean, sd = stats[(model_label, split)]
+                    x = bar.get_x() + bar.get_width() / 2.0
+                    y = mean + sd + offset
+                    ax.text(
+                        x, y,
+                        f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+                        ha="center", va="bottom",
+                        fontsize=ann_fs, fontweight="bold",
+                    )
 
-            # keep labels from clipping
-            top = float((summary["mean"] + summary["sd"]).max() + offset + 0.05)
-            #ax.set_ylim(0.0, max(ax.get_ylim()[1], top))
+            # keep labels from clipping (only expand if user didn't force ylim)
+            top = max(m + s for (m, s) in stats.values()) + offset + 0.05
+            if ylim is None:
+                y0, y1 = ax.get_ylim()
+                ax.set_ylim(y0, max(y1, top))
+
+        # # -------------------------
+        # # Annotate mean ± SD above each bar
+        # # -------------------------
+        # if annotate_mean_sd:
+        #     summary = (
+        #         df.groupby(["model", "split"])["score"]
+        #           .agg(mean="mean", sd="std")
+        #           .reset_index()
+        #     )
+        #     summary["sd"] = summary["sd"].fillna(0.0)
+
+        #     summary["model"] = pd.Categorical(summary["model"], categories=model_labels, ordered=True)
+        #     summary["split"] = pd.Categorical(summary["split"], categories=["Train", "Test"], ordered=True)
+        #     summary = summary.sort_values(["model", "split"]).reset_index(drop=True)
+
+        #     bars = list(ax.patches)
+        #     if len(bars) != len(summary):
+        #         n = min(len(bars), len(summary))
+        #         bars = bars[:n]
+        #         summary = summary.iloc[:n].reset_index(drop=True)
+
+        #     ann_fs = annotate_font_size if annotate_font_size is not None else max(8, float(font_size) - 3)
+        #     offset = float(annotate_offset)
+
+        #     for bar, (_, r) in zip(bars, summary.iterrows()):
+        #         mean = float(r["mean"])
+        #         sd = float(r["sd"])
+        #         x = bar.get_x() + bar.get_width() / 2.0
+        #         y = mean + sd + offset
+        #         ax.text(
+        #             x,
+        #             y,
+        #             f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+        #             ha="center",
+        #             va="bottom",
+        #             fontsize=ann_fs,
+        #             fontweight="bold",
+        #         )
+
+        #     # keep labels from clipping
+        #     top = float((summary["mean"] + summary["sd"]).max() + offset + 0.05)
+        #     #ax.set_ylim(0.0, max(ax.get_ylim()[1], top))
 
             if ylim is None:
                 y0, y1 = ax.get_ylim()
@@ -3857,13 +3897,14 @@ def plot_patient_auprc_auroc(
 
 
 
+
 def barplot_balanced_accuracy(
     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
     model_names: str | Sequence[str] | None = None,
     use_calibrated: bool = False,
     calibration_method: str | None = None,
     n_grid: int = 101,
-    mode: Literal["train_threshold", "test_threshold", "split_best"] = "train_threshold",
+    mode: Literal["train_threshold", "test_threshold", "split_best", "mean_train_threshold"] = "train_threshold",
     # ---- labels / aliasing ----
     method_alias: Mapping[str, str] | None = None,
     # ---- styling ----
@@ -3928,6 +3969,11 @@ def barplot_balanced_accuracy(
             Test  bar uses max_t BA_test(t)
         This is explicitly post hoc (a per-split upper bound), useful for visualization.
 
+    mode="mean_train_threshold":
+        For each fold, choose a threshold t* that maximizes BA on the TRAIN split for that fold.
+        Then compute the mean of these foldwise training-optimal thresholds for the model and
+        apply that single shared threshold to every fold's train and test split.
+
     Score sources
     -------------
     If use_calibrated=False:
@@ -3965,7 +4011,8 @@ def barplot_balanced_accuracy(
         Number of thresholds in the uniform grid over [0, 1].
 
     mode:
-        Threshold selection strategy ("train_threshold", "test_threshold", "split_best").
+        Threshold selection strategy ("train_threshold", "test_threshold", "split_best",
+        "mean_train_threshold").
 
     method_alias:
         Optional mapping from internal model keys to display labels on the x-axis.
@@ -3984,8 +4031,11 @@ def barplot_balanced_accuracy(
         expand to avoid clipping annotations.
 
     print_threshold_summary:
-        If True and mode is "train_threshold" or "test_threshold", print mean ± SD of selected
-        thresholds (t*) across folds for each model.
+        If True:
+          - for "train_threshold" / "test_threshold": print mean ± SD of selected thresholds
+            across folds for each model.
+          - for "mean_train_threshold": print the shared mean threshold for each model, along
+            with mean ± SD of the foldwise train-optimal thresholds used to create it.
 
     Returns
     -------
@@ -3997,8 +4047,10 @@ def barplot_balanced_accuracy(
     # -------------------------
     if use_calibrated and calibration_method is None:
         raise ValueError("calibration_method must be provided when use_calibrated=True.")
-    if mode not in {"train_threshold", "test_threshold", "split_best"}:
-        raise ValueError("mode must be 'train_threshold', 'test_threshold', or 'split_best'.")
+    if mode not in {"train_threshold", "test_threshold", "split_best", "mean_train_threshold"}:
+        raise ValueError(
+            "mode must be 'train_threshold', 'test_threshold', 'split_best', or 'mean_train_threshold'."
+        )
 
     if method_alias is None:
         method_alias = {}
@@ -4067,6 +4119,7 @@ def barplot_balanced_accuracy(
     train_vals_per_model: list[np.ndarray] = []
     test_vals_per_model: list[np.ndarray] = []
     tstars_per_model: list[np.ndarray] = []
+    shared_thresholds_per_model: list[float | None] = []
 
     for model in selected:
         folds = all_results[model]
@@ -4075,19 +4128,46 @@ def barplot_balanced_accuracy(
         test_ba: list[float] = []
         tstars: list[float] = []
 
+        usable_folds: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
         for r in folds:
             try:
                 y_tr, s_tr = _get_y_and_scores(r, "train")
                 y_te, s_te = _get_y_and_scores(r, "test")
             except KeyError:
                 continue
+            usable_folds.append((y_tr, s_tr, y_te, s_te))
 
-            if mode == "split_best":
+        if len(usable_folds) == 0:
+            raise ValueError(
+                f"No usable folds found for model '{model}'. "
+                "Check expected score keys for chosen calibration settings."
+            )
+
+        if mode == "split_best":
+            for y_tr, s_tr, y_te, s_te in usable_folds:
                 ba_tr, _ = _best_ba_and_t(y_tr, s_tr)
                 ba_te, _ = _best_ba_and_t(y_te, s_te)
                 train_ba.append(ba_tr)
                 test_ba.append(ba_te)
-            else:
+            shared_thresholds_per_model.append(None)
+
+        elif mode == "mean_train_threshold":
+            # First: collect best training thresholds across folds
+            for y_tr, s_tr, _, _ in usable_folds:
+                _, t_star = _best_ba_and_t(y_tr, s_tr)
+                tstars.append(t_star)
+
+            t_mean = float(np.mean(tstars))
+            shared_thresholds_per_model.append(t_mean)
+
+            # Then: apply same mean threshold to every train/test fold
+            for y_tr, s_tr, y_te, s_te in usable_folds:
+                train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_mean).astype(int)))
+                test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_mean).astype(int)))
+
+        else:
+            for y_tr, s_tr, y_te, s_te in usable_folds:
                 if mode == "train_threshold":
                     _, t_star = _best_ba_and_t(y_tr, s_tr)
                 else:  # test_threshold
@@ -4097,11 +4177,7 @@ def barplot_balanced_accuracy(
                 train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_star).astype(int)))
                 test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_star).astype(int)))
 
-        if len(train_ba) == 0:
-            raise ValueError(
-                f"No usable folds found for model '{model}'. "
-                "Check expected score keys for chosen calibration settings."
-            )
+            shared_thresholds_per_model.append(None)
 
         train_vals_per_model.append(np.array(train_ba, dtype=float))
         test_vals_per_model.append(np.array(test_ba, dtype=float))
@@ -4116,8 +4192,6 @@ def barplot_balanced_accuracy(
     # -------------------------
     # Plot
     # -------------------------
-
-
     x = np.arange(len(model_labels), dtype=float)
     width = float(bar_width)
 
@@ -4223,19 +4297,411 @@ def barplot_balanced_accuracy(
     fig.tight_layout()
     plt.show()
 
-
     # -------------------------
     # Optional: print threshold summary
     # -------------------------
-    if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
-        print("Per-model selected threshold summary (mean ± SD across folds):")
-        for label, tarr in zip(model_labels, tstars_per_model):
-            if tarr.size == 0:
-                print(f"  {label}: (no thresholds computed)")
-                continue
-            t_mean = float(np.mean(tarr))
-            t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
-            print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
+    if print_threshold_summary:
+        if mode in {"train_threshold", "test_threshold"}:
+            print("Per-model selected threshold summary (mean ± SD across folds):")
+            for label, tarr in zip(model_labels, tstars_per_model):
+                if tarr.size == 0:
+                    print(f"  {label}: (no thresholds computed)")
+                    continue
+                t_mean = float(np.mean(tarr))
+                t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+                print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
+
+        elif mode == "mean_train_threshold":
+            print("Per-model shared mean training-threshold summary:")
+            for label, tarr, t_shared in zip(model_labels, tstars_per_model, shared_thresholds_per_model):
+                if tarr.size == 0 or t_shared is None:
+                    print(f"  {label}: (no thresholds computed)")
+                    continue
+                t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+                print(
+                    f"  {label}: shared threshold = {t_shared:.3f} "
+                    f"(from foldwise best-train thresholds: {t_shared:.3f} ± {t_sd:.3f})"
+                )
+
+# def barplot_balanced_accuracy(
+#     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
+#     model_names: str | Sequence[str] | None = None,
+#     use_calibrated: bool = False,
+#     calibration_method: str | None = None,
+#     n_grid: int = 101,
+#     mode: Literal["train_threshold", "test_threshold", "split_best"] = "train_threshold",
+#     # ---- labels / aliasing ----
+#     method_alias: Mapping[str, str] | None = None,
+#     # ---- styling ----
+#     figsize: tuple[float, float] = (9.0, 5.0),
+#     font_size: float = 12.0,
+#     legend_loc: str = "best",
+#     x_tick_rotation: int = 0,
+#     split_palette: Mapping[str, str] | None = None,  # {"Train": "...", "Test": "..."}
+#     bar_width: float = 0.36,
+#     capsize: float = 5.0,
+#     # ---- baseline ----
+#     show_baseline: bool = True,
+#     baseline_value: float = 0.50,
+#     baseline_color: str = "#D5F713",
+#     baseline_lw: float = 1.5,
+#     baseline_ls: str = "--",
+#     # ---- annotation ----
+#     annotate_mean_sd: bool = True,
+#     annotate_decimals: int = 3,
+#     annotate_font_size: float | None = None,
+#     annotate_offset: float = 0.015,
+#     # ---- y limits ----
+#     ylim: tuple[float, float] | None = None,
+#     # ---- console threshold summary ----
+#     print_threshold_summary: bool = True,
+# ) -> None:
+#     """
+#     Plot balanced accuracy across outer folds as a grouped bar chart (Train vs Test) for one or
+#     more models, summarizing performance as mean ± SD across folds.
+
+#     This function is intended to work with your nested-CV `all_results` structure where each
+#     model maps to a list of per-(trial, outer_fold) dictionaries containing y labels and score
+#     vectors (and optionally calibrated scores).
+
+#     What is computed
+#     ----------------
+#     For each model and each fold dictionary `r`:
+#       1) Retrieve (y_train, score_train) and (y_test, score_test) from `r`.
+#       2) Convert scores to hard predictions using thresholds on a fixed grid in [0, 1].
+#       3) Compute balanced accuracy:
+#             BA = (TPR + TNR) / 2
+#          where TPR is sensitivity and TNR is specificity.
+#       4) Aggregate fold-level balanced accuracy values across folds and display:
+#             mean ± SD
+
+#     Threshold selection modes
+#     -------------------------
+#     mode="train_threshold":
+#         For each fold, choose a threshold t* that maximizes BA on the TRAIN split for that fold,
+#         then evaluate BA on both train and test using that same t*.
+#         This is the recommended “train-chosen threshold” summary.
+
+#     mode="test_threshold":
+#         For each fold, choose a threshold t* that maximizes BA on the TEST split for that fold,
+#         then evaluate BA on both train and test using that same t*.
+#         This is optimistic (uses test labels to pick thresholds) and is best used for diagnostic
+#         or “ceiling” comparisons.
+
+#     mode="split_best":
+#         For each fold, choose thresholds independently for train and test:
+#             Train bar uses max_t BA_train(t)
+#             Test  bar uses max_t BA_test(t)
+#         This is explicitly post hoc (a per-split upper bound), useful for visualization.
+
+#     Score sources
+#     -------------
+#     If use_calibrated=False:
+#         Train: r["y_train"], r["y_train_scores"]
+#         Test : r["y_test"],  r["y_test_scores"]
+
+#     If use_calibrated=True:
+#         `calibration_method` is required and scores are taken from:
+#         Train: r[f"cv_calib_train_predictions_{calibration_method}"], with y_train
+#         Test : r[f"calib_test_predictions_{calibration_method}"],     with y_test
+
+#     Plot contents
+#     -------------
+#     - Two bars per model: Train and Test.
+#     - Error bars show ±1 SD across folds.
+#     - Optional horizontal baseline line (default: 0.50) for reference.
+#     - Optional annotation above each bar showing "mean ± SD".
+
+#     Parameters
+#     ----------
+#     all_results:
+#         Nested-CV results keyed by model name; each value is a list of fold dicts.
+
+#     model_names:
+#         Model(s) to plot:
+#           - None: plot all models in `all_results`
+#           - str: plot one model
+#           - sequence[str]: plot multiple models
+
+#     use_calibrated / calibration_method:
+#         If use_calibrated=True, calibration_method must be provided (e.g., "beta") and the
+#         calibrated prediction keys must exist in the fold dicts.
+
+#     n_grid:
+#         Number of thresholds in the uniform grid over [0, 1].
+
+#     mode:
+#         Threshold selection strategy ("train_threshold", "test_threshold", "split_best").
+
+#     method_alias:
+#         Optional mapping from internal model keys to display labels on the x-axis.
+
+#     split_palette:
+#         Optional colors for bars, e.g. {"Train": "#138CFD", "Test": "#000000"}.
+
+#     show_baseline / baseline_value / baseline_color / baseline_lw / baseline_ls:
+#         Control the horizontal baseline reference line.
+
+#     annotate_mean_sd / annotate_decimals / annotate_font_size / annotate_offset:
+#         Controls for the "mean ± SD" text annotations.
+
+#     ylim:
+#         Optional y-axis limits (ymin, ymax). If None, limits are chosen automatically and may
+#         expand to avoid clipping annotations.
+
+#     print_threshold_summary:
+#         If True and mode is "train_threshold" or "test_threshold", print mean ± SD of selected
+#         thresholds (t*) across folds for each model.
+
+#     Returns
+#     -------
+#     None
+#         Displays a matplotlib figure.
+#     """
+#     # -------------------------
+#     # Defaults / validation
+#     # -------------------------
+#     if use_calibrated and calibration_method is None:
+#         raise ValueError("calibration_method must be provided when use_calibrated=True.")
+#     if mode not in {"train_threshold", "test_threshold", "split_best"}:
+#         raise ValueError("mode must be 'train_threshold', 'test_threshold', or 'split_best'.")
+
+#     if method_alias is None:
+#         method_alias = {}
+#     if split_palette is None:
+#         split_palette = {"Train": "darkblue", "Test": "darkred"}
+#     if "Train" not in split_palette or "Test" not in split_palette:
+#         raise ValueError("split_palette must contain keys 'Train' and 'Test'.")
+
+#     # -------------------------
+#     # Choose models
+#     # -------------------------
+#     if model_names is None:
+#         selected = list(all_results.keys())
+#     elif isinstance(model_names, str):
+#         selected = [model_names]
+#     else:
+#         selected = list(model_names)
+
+#     missing = [m for m in selected if m not in all_results]
+#     if missing:
+#         raise KeyError(
+#             f"Model(s) not found in all_results: {missing}. Available: {list(all_results.keys())}"
+#         )
+
+#     # display labels + uniqueness check
+#     model_labels = [method_alias.get(m, m) for m in selected]
+#     if len(set(model_labels)) != len(model_labels):
+#         # find duplicates
+#         seen = set()
+#         dupes = sorted({x for x in model_labels if (x in seen) or seen.add(x) is None and False})  # type: ignore
+#         # the trick above is messy; just do a clean count:
+#         dupes = sorted({x for x in model_labels if model_labels.count(x) > 1})
+#         raise ValueError(
+#             f"method_alias causes duplicate model labels: {dupes}. Make aliases unique."
+#         )
+
+#     grid = np.linspace(0.0, 1.0, int(n_grid))
+
+#     # -------------------------
+#     # Helpers
+#     # -------------------------
+#     def _get_y_and_scores(r: Mapping[str, Any], split: Literal["train", "test"]) -> tuple[np.ndarray, np.ndarray]:
+#         if not use_calibrated:
+#             y_key = "y_train" if split == "train" else "y_test"
+#             s_key = "y_train_scores" if split == "train" else "y_test_scores"
+#         else:
+#             y_key = "y_train" if split == "train" else "y_test"
+#             s_key = (
+#                 f"cv_calib_train_predictions_{calibration_method}"
+#                 if split == "train"
+#                 else f"calib_test_predictions_{calibration_method}"
+#             )
+
+#         if y_key not in r or s_key not in r:
+#             raise KeyError(f"Missing keys '{y_key}'/'{s_key}' in fold record.")
+#         return np.asarray(r[y_key]), np.asarray(r[s_key])
+
+#     def _best_ba_and_t(y: np.ndarray, s: np.ndarray) -> tuple[float, float]:
+#         ba = np.array([balanced_accuracy_score(y, (s >= t).astype(int)) for t in grid], dtype=float)
+#         j = int(np.argmax(ba))
+#         return float(ba[j]), float(grid[j])
+
+#     # -------------------------
+#     # Compute per-fold BA for each model
+#     # -------------------------
+#     train_vals_per_model: list[np.ndarray] = []
+#     test_vals_per_model: list[np.ndarray] = []
+#     tstars_per_model: list[np.ndarray] = []
+
+#     for model in selected:
+#         folds = all_results[model]
+
+#         train_ba: list[float] = []
+#         test_ba: list[float] = []
+#         tstars: list[float] = []
+
+#         for r in folds:
+#             try:
+#                 y_tr, s_tr = _get_y_and_scores(r, "train")
+#                 y_te, s_te = _get_y_and_scores(r, "test")
+#             except KeyError:
+#                 continue
+
+#             if mode == "split_best":
+#                 ba_tr, _ = _best_ba_and_t(y_tr, s_tr)
+#                 ba_te, _ = _best_ba_and_t(y_te, s_te)
+#                 train_ba.append(ba_tr)
+#                 test_ba.append(ba_te)
+#             else:
+#                 if mode == "train_threshold":
+#                     _, t_star = _best_ba_and_t(y_tr, s_tr)
+#                 else:  # test_threshold
+#                     _, t_star = _best_ba_and_t(y_te, s_te)
+
+#                 tstars.append(t_star)
+#                 train_ba.append(balanced_accuracy_score(y_tr, (s_tr >= t_star).astype(int)))
+#                 test_ba.append(balanced_accuracy_score(y_te, (s_te >= t_star).astype(int)))
+
+#         if len(train_ba) == 0:
+#             raise ValueError(
+#                 f"No usable folds found for model '{model}'. "
+#                 "Check expected score keys for chosen calibration settings."
+#             )
+
+#         train_vals_per_model.append(np.array(train_ba, dtype=float))
+#         test_vals_per_model.append(np.array(test_ba, dtype=float))
+#         tstars_per_model.append(np.array(tstars, dtype=float))
+
+#     # summarize mean/sd
+#     train_means = np.array([v.mean() for v in train_vals_per_model], dtype=float)
+#     test_means = np.array([v.mean() for v in test_vals_per_model], dtype=float)
+#     train_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in train_vals_per_model], dtype=float)
+#     test_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in test_vals_per_model], dtype=float)
+
+#     # -------------------------
+#     # Plot
+#     # -------------------------
+
+
+#     x = np.arange(len(model_labels), dtype=float)
+#     width = float(bar_width)
+
+#     fig, ax = plt.subplots(figsize=figsize)
+
+#     bars_train = ax.bar(
+#         x - width / 2,
+#         train_means,
+#         width,
+#         yerr=train_sds,
+#         capsize=capsize,
+#         color=split_palette["Train"],
+#         label="Train",
+#     )
+#     bars_test = ax.bar(
+#         x + width / 2,
+#         test_means,
+#         width,
+#         yerr=test_sds,
+#         capsize=capsize,
+#         color=split_palette["Test"],
+#         label="Test",
+#     )
+
+#     baseline_handle = None
+#     if show_baseline:
+#         baseline_handle = ax.axhline(
+#             float(baseline_value),
+#             linestyle=baseline_ls,
+#             linewidth=baseline_lw,
+#             color=baseline_color,
+#             label=f"Baseline = {baseline_value:.2f}",
+#         )
+
+#     # ---- labels / title (Option A title) ----
+#     ax.set_title(
+#         "Balanced accuracy across folds",
+#         fontsize=font_size + 1,
+#         fontweight="bold",
+#     )
+#     ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
+#     ax.set_ylabel("Balanced accuracy", fontsize=font_size, fontweight="bold")
+
+#     ax.set_xticks(x)
+#     ax.set_xticklabels(model_labels, fontsize=font_size, fontweight="bold", rotation=x_tick_rotation)
+#     ax.tick_params(axis="y", labelsize=font_size)
+#     for lab in ax.get_yticklabels():
+#         lab.set_fontweight("bold")
+
+#     # ---- annotations (bold) ----
+#     if annotate_mean_sd:
+#         ann_fs = annotate_font_size if annotate_font_size is not None else max(8.0, float(font_size) - 3.0)
+#         offset = float(annotate_offset)
+
+#         def _annotate(bars, means, sds):
+#             for bar, mean, sd in zip(bars, means, sds):
+#                 x0 = bar.get_x() + bar.get_width() / 2.0
+#                 y0 = float(mean) + float(sd) + offset
+#                 ax.text(
+#                     x0,
+#                     y0,
+#                     f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
+#                     ha="center",
+#                     va="bottom",
+#                     fontsize=ann_fs,
+#                     fontweight="bold",
+#                 )
+
+#         _annotate(bars_train, train_means, train_sds)
+#         _annotate(bars_test, test_means, test_sds)
+
+#     # ---- y-lims (same as before) ----
+#     if ylim is not None:
+#         ax.set_ylim(*ylim)
+#     else:
+#         top = max(
+#             float(np.max(train_means + train_sds)),
+#             float(np.max(test_means + test_sds)),
+#             float(baseline_value) if show_baseline else 0.0,
+#         )
+#         pad = 0.08 if annotate_mean_sd else 0.05
+#         ax.set_ylim(0.0, min(1.10, top + pad))
+
+#     # ---- legend order: Train, Test, Baseline ----
+#     handles, labels = ax.get_legend_handles_labels()
+
+#     handle_map = {lab: h for h, lab in zip(handles, labels)}
+#     ordered_labels = ["Train", "Test"]
+#     if show_baseline:
+#         ordered_labels.append(f"Baseline = {baseline_value:.2f}")
+
+#     ordered_handles = [handle_map[lbl] for lbl in ordered_labels if lbl in handle_map]
+
+#     leg = ax.legend(
+#         ordered_handles,
+#         ordered_labels,
+#         loc=legend_loc,
+#         frameon=True,
+#         prop={"size": font_size, "weight": "bold"},
+#         title="",
+#     )
+
+#     fig.tight_layout()
+#     plt.show()
+
+
+#     # -------------------------
+#     # Optional: print threshold summary
+#     # -------------------------
+#     if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
+#         print("Per-model selected threshold summary (mean ± SD across folds):")
+#         for label, tarr in zip(model_labels, tstars_per_model):
+#             if tarr.size == 0:
+#                 print(f"  {label}: (no thresholds computed)")
+#                 continue
+#             t_mean = float(np.mean(tarr))
+#             t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
+#             print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
 
 
 
@@ -4256,59 +4722,55 @@ def calibrate_nested_cv_results(
     model_selection: str = "StratifiedKFold",
     n_splits: int = 5,
     calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
+    train_probs_source: str = "oof",  # NEW: "oof" (cross-validated) or "refit" (final_model train scores)
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Calibrate nested-CV models (per outer fold) using out-of-fold (OOF) probabilities
-    computed on the OUTER-TRAIN split, while respecting per-model feature selection.
+    Calibrate nested-CV models (per outer fold) while respecting per-model feature selection.
 
-    Why this function exists
-    ------------------------
-    After nested CV, each fold dict in `all_results[model_name]` contains:
-      - a tuned + fitted estimator under "final_model"
-      - "outer_train_idx" and "outer_test_idx" (row indices into the dataset level used)
-      - uncalibrated test probabilities under "y_test_scores"
+    Key idea
+    --------
+    This function calibrates probabilities AFTER nested CV has already produced:
+      - r["final_model"] (the tuned estimator / template)
+      - r["outer_train_idx"], r["outer_test_idx"]
+      - r["y_test_scores"]  (uncalibrated test probabilities from the nested-CV refit)
+      - often r["y_train_scores"] (uncalibrated train probabilities from the same refit)
 
-    To calibrate probabilities, we need *training* probabilities that are:
-      - out-of-fold (OOF) on the outer-train set (to avoid fitting calibrators on in-fold predictions)
-      - produced by a model that sees the exact same feature space that the final model expects
+    The main choice is HOW to obtain the *train* probabilities used to fit the calibrator:
 
-    With your new setup, each model can use its own feature subset (via config). Therefore
-    we must:
-      1) start from the *superset* X in the bundle (defined by x_key)
-      2) slice columns ONCE per model (using prepare_training_bundle and config)
-      3) slice rows per fold using outer_train_idx / outer_test_idx
+    1) train_probs_source="oof" (default)
+       - Use cross_val_predict on the OUTER-TRAIN set to create out-of-fold (OOF) probabilities.
+       - Pros: avoids fitting calibrator on in-sample probabilities.
+       - Cons: these OOF probabilities are produced by CV-trained models (trained on less data),
+               while r["y_test_scores"] are produced by a refit model trained on ALL outer-train.
+               This train/test "score distribution mismatch" can sometimes lead to odd-looking
+               train vs test comparisons (e.g., calibrated test AUC > calibrated train AUC).
 
-    Behavior / outputs
-    ------------------
-    For every (model_name, fold_dict) in all_results:
-      - Stores OOF uncalibrated train probabilities:
-            r["cv_uncalib_train_predictions"]  -> shape (n_train,)
+    2) train_probs_source="refit"
+       - Use r["y_train_scores"] as the train probabilities (from the same refit model that
+         produced r["y_test_scores"]).
+       - Pros: train/test probabilities come from the same training regime (refit-on-all-outer-train),
+               so comparisons are more apples-to-apples.
+       - Cons: calibrator is fit on in-sample scores (can be optimistic).
 
-      - For each calibration method requested, fits a calibrator on the OOF train probs and y_train,
-        then produces calibrated train + test probabilities:
+    Output structure compatibility
+    ------------------------------
+    Downstream code expects keys like:
+      - r["cv_uncalib_train_predictions"]
+      - r["cv_calib_train_predictions_platt"]
+      - r["cv_calib_train_predictions_beta"]
+      - r["calib_test_predictions_platt"]
+      - r["calib_test_predictions_beta"]
 
-        If "platt":
-            r["calibration_method_platt"] = "platt"
-            r["calibrator_platt"] = fitted LogisticRegression
-            r["cv_calib_train_predictions_platt"] -> calibrated OOF train probs
-            r["calib_test_predictions_platt"] -> calibrated outer-test probs
-
-        If "beta":
-            r["calibration_method_beta"] = "beta"
-            r["calibrator_beta"] = fitted BetaCalibration
-            r["cv_calib_train_predictions_beta"] -> calibrated OOF train probs
-            r["calib_test_predictions_beta"] -> calibrated outer-test probs
+    We KEEP these keys regardless of train_probs_source to avoid breaking downstream steps.
+    Note: when train_probs_source="refit", the "cv_*" prefix is a historical name/misnomer,
+    but is preserved for compatibility.
 
     Notes
     -----
-    - This function does NOT refit the model on the full outer-train split. It only uses
-      cross_val_predict(clone(final_model)) to generate OOF train probabilities, and then
-      fits calibrators on those probabilities.
-    - Test calibration is applied to r["y_test_scores"] (already produced by the fitted final_model
-      during nested CV), so we do not need X_test to calibrate.
     - If model_selection == "StratifiedGroupKFold", you must pass groups_key so groups can be
       reconstructed on the outer-train rows for cross_val_predict.
     """
+
     # ------------------------------------------------------------------
     # 0) Handle calibration method selection + validation
     # ------------------------------------------------------------------
@@ -4318,16 +4780,19 @@ def calibrate_nested_cv_results(
     if len(calibration_methods) == 0:
         raise ValueError("calibration_methods must contain at least one method.")
 
-    # normalize user input
     calibration_methods = [m.lower() for m in calibration_methods]
 
-    # validate supported methods
     supported = {"platt", "beta"}
     unknown = set(calibration_methods) - supported
     if unknown:
         raise ValueError(
             f"Unsupported calibration methods: {unknown}. Supported methods: {supported}."
         )
+
+    # Validate train_probs_source
+    train_probs_source = str(train_probs_source).lower()
+    if train_probs_source not in {"oof", "refit"}:
+        raise ValueError("train_probs_source must be one of {'oof', 'refit'}.")
 
     # ------------------------------------------------------------------
     # 1) Pull the correct dataset level from the bundle (superset X/y)
@@ -4337,9 +4802,6 @@ def calibrate_nested_cv_results(
     if y_key not in bundle:
         raise KeyError(f"bundle missing y_key='{y_key}'")
 
-    # IMPORTANT:
-    # - X_full is the *superset* feature matrix at the dataset level specified by x_key
-    # - feature_names_full must correspond to the columns of X_full
     X_full = np.asarray(bundle[x_key])
     y = np.asarray(bundle[y_key])
 
@@ -4352,8 +4814,7 @@ def calibrate_nested_cv_results(
             f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
         )
 
-    # Choose which feature-names key to use.
-    # If you have separate names for aggregated features, prefer those.
+    # Choose feature-names key
     feature_names_key = "feature_names"
     if str(x_key).startswith("combined_"):
         if "combined_feature_names" in bundle:
@@ -4371,7 +4832,7 @@ def calibrate_nested_cv_results(
             f"bundle[{feature_names_key}] has {len(feature_names_full)} names."
         )
 
-    # Optional group labels at the same dataset level (needed only for StratifiedGroupKFold)
+    # Optional group labels (needed only for StratifiedGroupKFold)
     groups_all: Optional[np.ndarray] = None
     if groups_key is not None:
         if groups_key not in bundle:
@@ -4388,19 +4849,16 @@ def calibrate_nested_cv_results(
     # 2) Loop over models; for each model slice X_full -> X_model ONCE
     # ------------------------------------------------------------------
     for model_name, folds in all_results.items():
-        # Ensure this model exists in config
         if model_name not in cfg["models"]:
             raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
 
         m_cfg = cfg["models"][model_name]
 
-        # Per-model feature selection knobs (same as training):
-        #   - either a list of feature names OR an integer n_features (prefix mode)
+        # Per-model feature selection knobs
         keep_features_cfg = m_cfg.get("feature_names", None)  # list[str] | None
         n_features_cfg = m_cfg.get("n_features", None)        # int | None
 
-        # If your nested CV stored the exact feature names used, prefer those.
-        # This protects you if config changes later.
+        # Prefer feature list stored in results if present
         keep_features_from_results: Optional[List[str]] = None
         if len(folds) > 0 and "feature_names" in folds[0]:
             keep_features_from_results = list(folds[0]["feature_names"])
@@ -4412,16 +4870,15 @@ def calibrate_nested_cv_results(
             keep_features = keep_features_cfg
             n_features_model = n_features_cfg
 
-        # Do not allow both selection methods at once (ambiguous)
         if keep_features is not None and n_features_model is not None:
             raise ValueError(
                 f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
             )
 
-        # Build the "view bundle" expected by prepare_training_bundle
+        # Build view bundle for slicing
         view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
 
-        # Slice columns ONCE per model to match the model's trained feature space
+        # Slice columns ONCE per model
         if keep_features is not None or n_features_model is not None:
             mb = prepare_training_bundle(
                 view_bundle,
@@ -4432,79 +4889,95 @@ def calibrate_nested_cv_results(
                 copy_bundle=True,
             )
         else:
-            mb = view_bundle  # no slicing requested
+            mb = view_bundle
 
-        X_model = np.asarray(mb["X_raw"])                 # shape: (n_samples, D_model)
-        feature_names_model = list(mb["feature_names"])   # length: D_model
+        X_model = np.asarray(mb["X_raw"])
+        feature_names_model = list(mb["feature_names"])
 
         # ------------------------------------------------------------------
-        # 3) Loop over outer folds for this model and perform calibration
+        # 3) Loop over outer folds and perform calibration
         # ------------------------------------------------------------------
         for r in folds:
             outer_train_idx = r["outer_train_idx"]
             outer_test_idx = r["outer_test_idx"]
 
-            # Outer-train subset (rows only; columns already model-specific)
-            X_train = X_model[outer_train_idx]   # shape: (n_train, D_model)
-            y_train = y[outer_train_idx]         # shape: (n_train,)
+            # Outer-train labels (used to fit calibrator)
+            y_train = y[outer_train_idx]
 
-            # NOTE:
-            # We don't need X_test to apply calibration, because we calibrate the
-            # already-stored uncalibrated test probabilities in r["y_test_scores"].
-            # X_test = X_model[outer_test_idx]
-            # y_test = y[outer_test_idx]
-
-            # Groups only matter if using StratifiedGroupKFold
+            # Groups only needed if using StratifiedGroupKFold AND train_probs_source="oof"
             groups_train = None
-            if (groups_all is not None) and (model_selection == "StratifiedGroupKFold"):
+            if (
+                train_probs_source == "oof"
+                and (groups_all is not None)
+                and (model_selection == "StratifiedGroupKFold")
+            ):
                 groups_train = groups_all[outer_train_idx]
 
-            # Clone the final tuned estimator (unfitted) to generate OOF train probs
-            final_model = r["final_model"]
-            clf = clone(final_model)
+            # --------------------------------------------------------------
+            # 3a) Obtain uncalibrated TRAIN probabilities (two supported modes)
+            # --------------------------------------------------------------
+            if train_probs_source == "refit":
+                # Use refit-model probabilities that should already be stored by your nested CV step.
+                if "y_train_scores" not in r:
+                    raise KeyError(
+                        f"{model_name}: fold is missing 'y_train_scores' needed for train_probs_source='refit'."
+                    )
+                cv_uncalib_train_predictions = np.asarray(r["y_train_scores"], dtype=float)
 
-            # Build a "regular CV" splitter (not nested) just to produce OOF predictions
-            _, inner_cv = make_outer_inner_cv(
-                model_selection=model_selection,
-                n_outer_splits=n_splits,   # arbitrary but valid
-                n_inner_splits=n_splits,   # K folds for OOF prediction
-                outer_trial_idx=r["trial"],  # seed for reproducibility
-            )
+            else:
+                # train_probs_source == "oof"
+                # Compute OOF probabilities on the outer-train split.
+                X_train = X_model[outer_train_idx]
 
-            # cross_val_predict supports passing groups via keyword
-            cv_kwargs = {}
-            if groups_train is not None:
-                cv_kwargs["groups"] = groups_train
+                # Clone the tuned estimator (unfitted) to generate OOF train probs
+                clf = clone(r["final_model"])
 
-            # OOF predicted probabilities for the positive class on outer-train
-            cv_probs_train = cross_val_predict(
-                clf,
-                X_train,
-                y_train,
-                cv=inner_cv,
-                method="predict_proba",
-                **cv_kwargs,
-            )
-            cv_uncalib_train_predictions = cv_probs_train[:, 1]
+                # CV splitter used ONLY for generating OOF predictions
+                _, inner_cv = make_outer_inner_cv(
+                    model_selection=model_selection,
+                    n_outer_splits=n_splits,   # arbitrary but valid
+                    n_inner_splits=n_splits,   # K folds for OOF prediction
+                    outer_trial_idx=r["trial"],  # seed for reproducibility
+                )
+
+                cv_kwargs = {}
+                if groups_train is not None:
+                    cv_kwargs["groups"] = groups_train
+
+                cv_probs_train = cross_val_predict(
+                    clf,
+                    X_train,
+                    y_train,
+                    cv=inner_cv,
+                    method="predict_proba",
+                    **cv_kwargs,
+                )
+                cv_uncalib_train_predictions = cv_probs_train[:, 1].astype(float)
+
+            # Store under the SAME key expected downstream
             r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
 
-            # Uncalibrated outer-test probabilities from nested CV training step
-            testset_preds_uncalib = r["y_test_scores"]
+            # --------------------------------------------------------------
+            # 3b) Obtain uncalibrated TEST probabilities
+            # --------------------------------------------------------------
+            # We keep using the test probabilities produced during nested CV training.
+            # This is the same behavior as your original function.
+            if "y_test_scores" not in r:
+                raise KeyError(f"{model_name}: fold is missing 'y_test_scores' needed for test calibration.")
+            testset_preds_uncalib = np.asarray(r["y_test_scores"], dtype=float)
 
-            # Store some traceability metadata
+            # Store metadata / traceability
             r["calib_x_key"] = x_key
             r["calib_y_key"] = y_key
             r["calib_feature_names_key"] = feature_names_key
             r["calib_feature_names"] = feature_names_model
+            r["train_probs_source"] = train_probs_source  # helpful downstream for debugging
 
             # --------------------------------------------------------------
-            # 4) Fit calibrators on (OOF train probs, y_train) and apply
+            # 4) Fit calibrators on (train probs, y_train) and apply to train+test
             # --------------------------------------------------------------
             if "platt" in calibration_methods:
-                # Platt scaling: logistic regression on the 1D score
-                calibrator_platt = LogisticRegression(
-                    C=np.inf, solver="lbfgs", max_iter=200000
-                )
+                calibrator_platt = LogisticRegression(C=np.inf, solver="lbfgs", max_iter=200000)
                 calibrator_platt.fit(
                     cv_uncalib_train_predictions.reshape(-1, 1),
                     y_train,
@@ -4513,18 +4986,17 @@ def calibrate_nested_cv_results(
                 r["calibration_method_platt"] = "platt"
                 r["calibrator_platt"] = calibrator_platt
 
-                # Calibrated OOF train probabilities
+                # Calibrated TRAIN probabilities (same key as before)
                 r["cv_calib_train_predictions_platt"] = calibrator_platt.predict_proba(
                     cv_uncalib_train_predictions.reshape(-1, 1)
                 )[:, 1]
 
-                # Calibrated outer-test probabilities (apply to uncalibrated test scores)
+                # Calibrated TEST probabilities (same key as before)
                 r["calib_test_predictions_platt"] = calibrator_platt.predict_proba(
                     testset_preds_uncalib.reshape(-1, 1)
                 )[:, 1]
 
             if "beta" in calibration_methods:
-                # Beta calibration on the 1D score
                 calibrator_beta = BetaCalibration(parameters="abm")
                 calibrator_beta.fit(
                     cv_uncalib_train_predictions,
@@ -4534,9 +5006,12 @@ def calibrate_nested_cv_results(
                 r["calibration_method_beta"] = "beta"
                 r["calibrator_beta"] = calibrator_beta
 
+                # Calibrated TRAIN probabilities (same key as before)
                 r["cv_calib_train_predictions_beta"] = calibrator_beta.predict(
                     cv_uncalib_train_predictions
                 )
+
+                # Calibrated TEST probabilities (same key as before)
                 r["calib_test_predictions_beta"] = calibrator_beta.predict(
                     testset_preds_uncalib
                 )
@@ -4544,89 +5019,239 @@ def calibrate_nested_cv_results(
     return all_results
 
 
+
 # def calibrate_nested_cv_results(
 #     all_results: Dict[str, List[Dict[str, Any]]],
-#     X: np.ndarray,
-#     y: np.ndarray,
+#     bundle: Mapping[str, Any],
+#     cfg: Mapping[str, Any],
+#     *,
+#     x_key: str = "combined_X_raw",
+#     y_key: str = "combined_y",
+#     groups_key: Optional[str] = None,
 #     model_selection: str = "StratifiedKFold",
 #     n_splits: int = 5,
-#     groups: Optional[np.ndarray] = None,
 #     calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
 # ) -> Dict[str, List[Dict[str, Any]]]:
 #     """
-#     For each (model, trial, outer_fold) entry in all_results, reconstruct the
-#     outer-train split and compute out-of-fold predicted probabilities via
-#     regular cross-validation (no nesting), then calibrate them using one or
-#     more calibration methods.
+#     Calibrate nested-CV models (per outer fold) using out-of-fold (OOF) probabilities
+#     computed on the OUTER-TRAIN split, while respecting per-model feature selection.
 
-#     Always stores uncalibrated OOF train probabilities as:
+#     Why this function exists
+#     ------------------------
+#     After nested CV, each fold dict in `all_results[model_name]` contains:
+#       - a tuned + fitted estimator under "final_model"
+#       - "outer_train_idx" and "outer_test_idx" (row indices into the dataset level used)
+#       - uncalibrated test probabilities under "y_test_scores"
 
-#         - "cv_uncalib_train_predictions": np.ndarray of shape (n_train,)
+#     To calibrate probabilities, we need *training* probabilities that are:
+#       - out-of-fold (OOF) on the outer-train set (to avoid fitting calibrators on in-fold predictions)
+#       - produced by a model that sees the exact same feature space that the final model expects
 
-#     For each method in calibration_methods, performs calibration and stores:
+#     With your new setup, each model can use its own feature subset (via config). Therefore
+#     we must:
+#       1) start from the *superset* X in the bundle (defined by x_key)
+#       2) slice columns ONCE per model (using prepare_training_bundle and config)
+#       3) slice rows per fold using outer_train_idx / outer_test_idx
 
-#       If "platt" in calibration_methods:
-#         - "calibration_method_platt"               : str, "platt"
-#         - "calibrator_platt"                       : fitted LogisticRegression
-#         - "cv_calib_train_predictions_platt"       : calibrated probs (train, OOF)
-#         - "calib_test_predictions_platt"           : calibrated probs (test)
+#     Behavior / outputs
+#     ------------------
+#     For every (model_name, fold_dict) in all_results:
+#       - Stores OOF uncalibrated train probabilities:
+#             r["cv_uncalib_train_predictions"]  -> shape (n_train,)
 
-#       If "beta" in calibration_methods:
-#         - "calibration_method_beta"                : str, "beta"
-#         - "calibrator_beta"                        : fitted BetaCalibration
-#         - "cv_calib_train_predictions_beta"        : calibrated probs (train, OOF)
-#         - "calib_test_predictions_beta"            : calibrated probs (test)
+#       - For each calibration method requested, fits a calibrator on the OOF train probs and y_train,
+#         then produces calibrated train + test probabilities:
+
+#         If "platt":
+#             r["calibration_method_platt"] = "platt"
+#             r["calibrator_platt"] = fitted LogisticRegression
+#             r["cv_calib_train_predictions_platt"] -> calibrated OOF train probs
+#             r["calib_test_predictions_platt"] -> calibrated outer-test probs
+
+#         If "beta":
+#             r["calibration_method_beta"] = "beta"
+#             r["calibrator_beta"] = fitted BetaCalibration
+#             r["cv_calib_train_predictions_beta"] -> calibrated OOF train probs
+#             r["calib_test_predictions_beta"] -> calibrated outer-test probs
+
+#     Notes
+#     -----
+#     - This function does NOT refit the model on the full outer-train split. It only uses
+#       cross_val_predict(clone(final_model)) to generate OOF train probabilities, and then
+#       fits calibrators on those probabilities.
+#     - Test calibration is applied to r["y_test_scores"] (already produced by the fitted final_model
+#       during nested CV), so we do not need X_test to calibrate.
+#     - If model_selection == "StratifiedGroupKFold", you must pass groups_key so groups can be
+#       reconstructed on the outer-train rows for cross_val_predict.
 #     """
-#     # Default: only Platt scaling if user doesn’t specify
+#     # ------------------------------------------------------------------
+#     # 0) Handle calibration method selection + validation
+#     # ------------------------------------------------------------------
 #     if calibration_methods is None:
-#         calibration_methods = ["platt"]
+#         calibration_methods = ["platt"]  # default behavior
 
 #     if len(calibration_methods) == 0:
 #         raise ValueError("calibration_methods must contain at least one method.")
 
-#     # Normalize and validate supported methods
+#     # normalize user input
 #     calibration_methods = [m.lower() for m in calibration_methods]
+
+#     # validate supported methods
 #     supported = {"platt", "beta"}
 #     unknown = set(calibration_methods) - supported
 #     if unknown:
 #         raise ValueError(
-#             f"Unsupported calibration methods: {unknown}. "
-#             f"Supported methods: {supported}."
+#             f"Unsupported calibration methods: {unknown}. Supported methods: {supported}."
 #         )
 
+#     # ------------------------------------------------------------------
+#     # 1) Pull the correct dataset level from the bundle (superset X/y)
+#     # ------------------------------------------------------------------
+#     if x_key not in bundle:
+#         raise KeyError(f"bundle missing x_key='{x_key}'")
+#     if y_key not in bundle:
+#         raise KeyError(f"bundle missing y_key='{y_key}'")
+
+#     # IMPORTANT:
+#     # - X_full is the *superset* feature matrix at the dataset level specified by x_key
+#     # - feature_names_full must correspond to the columns of X_full
+#     X_full = np.asarray(bundle[x_key])
+#     y = np.asarray(bundle[y_key])
+
+#     if X_full.ndim != 2:
+#         raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
+#     if y.ndim != 1:
+#         raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
+#     if X_full.shape[0] != len(y):
+#         raise ValueError(
+#             f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
+#         )
+
+#     # Choose which feature-names key to use.
+#     # If you have separate names for aggregated features, prefer those.
+#     feature_names_key = "feature_names"
+#     if str(x_key).startswith("combined_"):
+#         if "combined_feature_names" in bundle:
+#             feature_names_key = "combined_feature_names"
+
+#     if feature_names_key not in bundle:
+#         raise KeyError(
+#             f"bundle missing '{feature_names_key}'. Needed to map names->columns for feature slicing."
+#         )
+
+#     feature_names_full = list(bundle[feature_names_key])
+#     if X_full.shape[1] != len(feature_names_full):
+#         raise ValueError(
+#             f"Mismatch: bundle[{x_key}] has {X_full.shape[1]} cols but "
+#             f"bundle[{feature_names_key}] has {len(feature_names_full)} names."
+#         )
+
+#     # Optional group labels at the same dataset level (needed only for StratifiedGroupKFold)
+#     groups_all: Optional[np.ndarray] = None
+#     if groups_key is not None:
+#         if groups_key not in bundle:
+#             raise KeyError(f"bundle missing groups_key='{groups_key}'")
+#         groups_all = np.asarray(bundle[groups_key])
+#         if groups_all.ndim != 1:
+#             raise ValueError(f"bundle[{groups_key}] must be 1D, got shape {groups_all.shape}")
+#         if len(groups_all) != len(y):
+#             raise ValueError(
+#                 f"groups/y mismatch for key {groups_key}: len(groups)={len(groups_all)} vs len(y)={len(y)}"
+#             )
+
+#     # ------------------------------------------------------------------
+#     # 2) Loop over models; for each model slice X_full -> X_model ONCE
+#     # ------------------------------------------------------------------
 #     for model_name, folds in all_results.items():
+#         # Ensure this model exists in config
+#         if model_name not in cfg["models"]:
+#             raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+
+#         m_cfg = cfg["models"][model_name]
+
+#         # Per-model feature selection knobs (same as training):
+#         #   - either a list of feature names OR an integer n_features (prefix mode)
+#         keep_features_cfg = m_cfg.get("feature_names", None)  # list[str] | None
+#         n_features_cfg = m_cfg.get("n_features", None)        # int | None
+
+#         # If your nested CV stored the exact feature names used, prefer those.
+#         # This protects you if config changes later.
+#         keep_features_from_results: Optional[List[str]] = None
+#         if len(folds) > 0 and "feature_names" in folds[0]:
+#             keep_features_from_results = list(folds[0]["feature_names"])
+
+#         if keep_features_from_results is not None:
+#             keep_features = keep_features_from_results
+#             n_features_model = None
+#         else:
+#             keep_features = keep_features_cfg
+#             n_features_model = n_features_cfg
+
+#         # Do not allow both selection methods at once (ambiguous)
+#         if keep_features is not None and n_features_model is not None:
+#             raise ValueError(
+#                 f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
+#             )
+
+#         # Build the "view bundle" expected by prepare_training_bundle
+#         view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
+
+#         # Slice columns ONCE per model to match the model's trained feature space
+#         if keep_features is not None or n_features_model is not None:
+#             mb = prepare_training_bundle(
+#                 view_bundle,
+#                 n_features=n_features_model,
+#                 keep_features=keep_features,
+#                 strict=m_cfg.get("feature_strict", True),
+#                 dedupe=True,
+#                 copy_bundle=True,
+#             )
+#         else:
+#             mb = view_bundle  # no slicing requested
+
+#         X_model = np.asarray(mb["X_raw"])                 # shape: (n_samples, D_model)
+#         feature_names_model = list(mb["feature_names"])   # length: D_model
+
+#         # ------------------------------------------------------------------
+#         # 3) Loop over outer folds for this model and perform calibration
+#         # ------------------------------------------------------------------
 #         for r in folds:
 #             outer_train_idx = r["outer_train_idx"]
 #             outer_test_idx = r["outer_test_idx"]
 
-#             # Rebuild train/test subset for this outer fold
-#             X_train = X[outer_train_idx]
-#             y_train = y[outer_train_idx]
+#             # Outer-train subset (rows only; columns already model-specific)
+#             X_train = X_model[outer_train_idx]   # shape: (n_train, D_model)
+#             y_train = y[outer_train_idx]         # shape: (n_train,)
 
-#             X_test = X[outer_test_idx]      # not used now, but handy if needed later
-#             y_test = y[outer_test_idx]      # same as above
+#             # NOTE:
+#             # We don't need X_test to apply calibration, because we calibrate the
+#             # already-stored uncalibrated test probabilities in r["y_test_scores"].
+#             # X_test = X_model[outer_test_idx]
+#             # y_test = y[outer_test_idx]
 
+#             # Groups only matter if using StratifiedGroupKFold
 #             groups_train = None
-#             if (groups is not None) and (model_selection == "StratifiedGroupKFold"):
-#                 groups_train = groups[outer_train_idx]
+#             if (groups_all is not None) and (model_selection == "StratifiedGroupKFold"):
+#                 groups_train = groups_all[outer_train_idx]
 
-#             # Unfitted clone of the tuned final model
+#             # Clone the final tuned estimator (unfitted) to generate OOF train probs
 #             final_model = r["final_model"]
 #             clf = clone(final_model)
 
-#             # Build a regular CV splitter (no nested CV here)
+#             # Build a "regular CV" splitter (not nested) just to produce OOF predictions
 #             _, inner_cv = make_outer_inner_cv(
 #                 model_selection=model_selection,
 #                 n_outer_splits=n_splits,   # arbitrary but valid
-#                 n_inner_splits=n_splits,   # this is our K for regular CV
+#                 n_inner_splits=n_splits,   # K folds for OOF prediction
 #                 outer_trial_idx=r["trial"],  # seed for reproducibility
 #             )
 
-#             # cross_val_predict with or without groups
+#             # cross_val_predict supports passing groups via keyword
 #             cv_kwargs = {}
 #             if groups_train is not None:
 #                 cv_kwargs["groups"] = groups_train
 
+#             # OOF predicted probabilities for the positive class on outer-train
 #             cv_probs_train = cross_val_predict(
 #                 clf,
 #                 X_train,
@@ -4635,60 +5260,61 @@ def calibrate_nested_cv_results(
 #                 method="predict_proba",
 #                 **cv_kwargs,
 #             )
-
-#             # Positive-class OOF probabilities on outer-train (UNCALIBRATED)
 #             cv_uncalib_train_predictions = cv_probs_train[:, 1]
 #             r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
 
-#             # Uncalibrated test scores already stored from nested CV
+#             # Uncalibrated outer-test probabilities from nested CV training step
 #             testset_preds_uncalib = r["y_test_scores"]
 
+#             # Store some traceability metadata
+#             r["calib_x_key"] = x_key
+#             r["calib_y_key"] = y_key
+#             r["calib_feature_names_key"] = feature_names_key
+#             r["calib_feature_names"] = feature_names_model
+
 #             # --------------------------------------------------------------
-#             # Apply each requested calibration method
+#             # 4) Fit calibrators on (OOF train probs, y_train) and apply
 #             # --------------------------------------------------------------
 #             if "platt" in calibration_methods:
-#                 calibrator_platt = LogisticRegression(C=np.inf,solver="lbfgs", max_iter=200000)
+#                 # Platt scaling: logistic regression on the 1D score
+#                 calibrator_platt = LogisticRegression(
+#                     C=np.inf, solver="lbfgs", max_iter=200000
+#                 )
 #                 calibrator_platt.fit(
 #                     cv_uncalib_train_predictions.reshape(-1, 1),
 #                     y_train,
 #                 )
 
-#                 cv_calib_train_predictions_platt = calibrator_platt.predict_proba(
+#                 r["calibration_method_platt"] = "platt"
+#                 r["calibrator_platt"] = calibrator_platt
+
+#                 # Calibrated OOF train probabilities
+#                 r["cv_calib_train_predictions_platt"] = calibrator_platt.predict_proba(
 #                     cv_uncalib_train_predictions.reshape(-1, 1)
 #                 )[:, 1]
 
-#                 calib_test_predictions_platt = calibrator_platt.predict_proba(
+#                 # Calibrated outer-test probabilities (apply to uncalibrated test scores)
+#                 r["calib_test_predictions_platt"] = calibrator_platt.predict_proba(
 #                     testset_preds_uncalib.reshape(-1, 1)
 #                 )[:, 1]
 
-#                 r["calibration_method_platt"] = "platt"
-#                 r["calibrator_platt"] = calibrator_platt
-#                 r["cv_calib_train_predictions_platt"] = (
-#                     cv_calib_train_predictions_platt
-#                 )
-#                 r["calib_test_predictions_platt"] = calib_test_predictions_platt
-
 #             if "beta" in calibration_methods:
-#                 calibrator_beta = BetaCalibration(parameters='abm')
+#                 # Beta calibration on the 1D score
+#                 calibrator_beta = BetaCalibration(parameters="abm")
 #                 calibrator_beta.fit(
 #                     cv_uncalib_train_predictions,
 #                     y_train,
 #                 )
 
-#                 cv_calib_train_predictions_beta = calibrator_beta.predict(
-#                     cv_uncalib_train_predictions
-#                 )
-
-#                 calib_test_predictions_beta = calibrator_beta.predict(
-#                     testset_preds_uncalib
-#                 )
-
 #                 r["calibration_method_beta"] = "beta"
 #                 r["calibrator_beta"] = calibrator_beta
-#                 r["cv_calib_train_predictions_beta"] = (
-#                     cv_calib_train_predictions_beta
+
+#                 r["cv_calib_train_predictions_beta"] = calibrator_beta.predict(
+#                     cv_uncalib_train_predictions
 #                 )
-#                 r["calib_test_predictions_beta"] = calib_test_predictions_beta
+#                 r["calib_test_predictions_beta"] = calibrator_beta.predict(
+#                     testset_preds_uncalib
+#                 )
 
 #     return all_results
 
