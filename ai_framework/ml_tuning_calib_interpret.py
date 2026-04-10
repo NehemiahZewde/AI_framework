@@ -464,6 +464,321 @@ def fit_and_evaluate_final_model(
 # ---------------------------------------------------------------------
 def run_nested_cv_for_model(
     model_name: str,
+    model_data: Dict[str, Any],
+    y: np.ndarray,
+    cfg: Dict[str, Any],
+    *,
+    groups: Optional[np.ndarray] = None,
+    model_selection: str = "StratifiedKFold",
+) -> List[Dict[str, Any]]:
+    """
+    Run nested cross-validation with Optuna hyperparameter tuning for ONE model,
+    using model-specific feature-selection output from `balanced_permutation_rank_select_pipeline(...)`.
+
+    This function expects:
+      - `model_data["X"]`: model-specific feature matrix
+      - `model_data["feature_names_selected"]`: names of columns in `model_data["X"]`
+      - shared `y` passed separately
+      - optional shared `groups` passed separately
+
+    Manual per-model feature subsetting is still supported via config, using exactly
+    one of:
+      - cfg["models"][model_name]["feature_names"]   : Optional[List[str]]
+          Select these exact feature names from `model_data["feature_names_selected"]`,
+          preserving the exact order given in config.
+      - cfg["models"][model_name]["feature_indices"] : Optional[List[int]]
+          Select these exact column positions from `model_data["X"]`, preserving the
+          exact order given in config.
+      - cfg["models"][model_name]["n_features"]      : Optional[int]
+          Select the first K columns from the current model-specific feature space.
+
+    Only ONE of feature_names, feature_indices, or n_features may be set.
+    If all are None, all features in model_data are used.
+
+    Parameters
+    ----------
+    model_name:
+        Key into cfg["models"].
+
+    model_data:
+        Per-model output block from feature-selection pipeline, expected to contain:
+          - "X": np.ndarray of shape (n_samples, n_features_model)
+          - "feature_names_selected": List[str] of length n_features_model
+          - optional "selected_feature_indices": np.ndarray of original dataset indices
+
+    y:
+        Shared target vector aligned row-wise with model_data["X"].
+
+    cfg:
+        Global configuration dict with:
+          - cfg["cv"]: {"num_trials","n_outer_splits","n_inner_splits"}
+          - cfg["optuna"]: {"n_inner_trials","direction", optional "n_jobs"}
+          - cfg["models"][model_name]:
+              - "params": callable(trial)->dict
+              - optional "feature_names": List[str] | None
+              - optional "feature_indices": List[int] | None
+              - optional "n_features": int | None
+              - optional "feature_strict": bool
+              - optional "max_print_features": int
+
+    groups:
+        Optional group ids array aligned with y/X rows (for group-aware CV).
+
+    model_selection:
+        "StratifiedKFold" or "StratifiedGroupKFold".
+
+    Returns
+    -------
+    results:
+        List of dicts, one per outer fold, including:
+          - model_name, trial, outer_fold
+          - feature_names_used, feature_indices_local_used, feature_indices_original_used
+          - inner_train_scores/test_scores + mean/std
+          - outer_train_metrics, outer_test_metrics
+          - best_params, final_model
+          - indices + labels + score vectors
+    """
+    # --------------------------------------------------------------
+    # 1. Read model config
+    # --------------------------------------------------------------
+    m_cfg = cfg["models"][model_name]
+
+    keep_features = m_cfg.get("feature_names", None)      # exact names, preserve requested order
+    keep_indices = m_cfg.get("feature_indices", None)     # exact indices, preserve requested order
+    n_features = m_cfg.get("n_features", None)            # first K columns only
+    strict = bool(m_cfg.get("feature_strict", True))
+
+    specified = sum(x is not None for x in [keep_features, keep_indices, n_features])
+    if specified > 1:
+        raise ValueError(
+            f"{model_name}: set only one of 'feature_names', 'feature_indices', or 'n_features' (or none)."
+        )
+
+    # --------------------------------------------------------------
+    # 2. Pull model-specific X + feature names from model_data
+    # --------------------------------------------------------------
+    if "X" not in model_data:
+        raise KeyError("model_data must contain 'X'.")
+    if "feature_names_selected" not in model_data:
+        raise KeyError("model_data must contain 'feature_names_selected'.")
+
+    X_full = np.asarray(model_data["X"])
+    y = np.asarray(y)
+    feature_names_full = list(model_data["feature_names_selected"])
+
+    original_feature_indices_full = None
+    if "selected_feature_indices" in model_data and model_data["selected_feature_indices"] is not None:
+        original_feature_indices_full = np.asarray(model_data["selected_feature_indices"])
+
+    # --------------------------------------------------------------
+    # 3. Input validation
+    # --------------------------------------------------------------
+    if X_full.ndim != 2:
+        raise ValueError(f"model_data['X'] must be 2D, got shape {X_full.shape}")
+    if y.ndim != 1:
+        raise ValueError(f"y must be 1D, got shape {y.shape}")
+    if X_full.shape[0] != len(y):
+        raise ValueError(
+            f"X/y mismatch: X rows={X_full.shape[0]} vs len(y)={len(y)}"
+        )
+    if X_full.shape[1] != len(feature_names_full):
+        raise ValueError(
+            f"Mismatch: X has {X_full.shape[1]} columns but feature_names_selected "
+            f"has {len(feature_names_full)} entries."
+        )
+
+    if len(set(feature_names_full)) != len(feature_names_full):
+        raise ValueError("model_data['feature_names_selected'] must contain unique names.")
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.ndim != 1:
+            raise ValueError(f"groups must be 1D, got shape {groups.shape}")
+        if len(groups) != len(y):
+            raise ValueError(
+                f"groups/y mismatch: len(groups)={len(groups)} vs len(y)={len(y)}"
+            )
+    # --------------------------------------------------------------
+    # 4. Apply optional manual feature subsetting
+    # --------------------------------------------------------------
+    keep_features = m_cfg.get("feature_names", None)
+
+    if keep_features is None:
+        X = X_full
+        selected_feature_names = list(feature_names_full)
+        selected_feature_indices_local = np.arange(len(feature_names_full), dtype=int)
+    else:
+        name_to_idx = {name: i for i, name in enumerate(feature_names_full)}
+        selected_feature_indices_local = np.array(
+            [name_to_idx[name] for name in keep_features],
+            dtype=int,
+        )
+        X = X_full[:, selected_feature_indices_local]
+        selected_feature_names = list(keep_features)
+
+    selected_feature_indices_original = np.asarray(
+        model_data["selected_feature_indices"]
+    )[selected_feature_indices_local]
+
+    
+    # --------------------------------------------------------------
+    # 5. Debug prints
+    # --------------------------------------------------------------
+    print(f"[{model_name}] X shape after slicing: {X.shape} (features={len(selected_feature_names)})")
+
+    max_show = int(m_cfg.get("max_print_features", 30))
+    print(f"[{model_name}] feature_names ({len(selected_feature_names)}):")
+    for f in selected_feature_names[:max_show]:
+        print(f"  - {f}")
+    if len(selected_feature_names) > max_show:
+        print(f"  ... (+{len(selected_feature_names) - max_show} more)")
+
+    if selected_feature_indices_original is not None:
+        print(f"[{model_name}] original feature indices used: {selected_feature_indices_original.tolist()}")
+
+    # --------------------------------------------------------------
+    # 6. Validate CV mode
+    # --------------------------------------------------------------
+    if model_selection == "StratifiedGroupKFold" and groups is None:
+        raise ValueError(
+            "model_selection='StratifiedGroupKFold' but groups is None. "
+            "Provide groups or use 'StratifiedKFold'."
+        )
+
+    # --------------------------------------------------------------
+    # 7. Read CV / Optuna config
+    # --------------------------------------------------------------
+    cv_cfg = cfg["cv"]
+    opt_cfg = cfg["optuna"]
+
+    NUM_TRIALS = cv_cfg["num_trials"]
+    n_outer_splits = cv_cfg["n_outer_splits"]
+    n_inner_splits = cv_cfg["n_inner_splits"]
+
+    N_INNER_OPTUNA_TRIALS = opt_cfg["n_inner_trials"]
+    OPTUNA_N_JOBS = opt_cfg.get("n_jobs", 1)
+
+    results: List[Dict[str, Any]] = []
+    cv_tracker = 0
+    total_outer_folds = NUM_TRIALS * n_outer_splits
+
+    # --------------------------------------------------------------
+    # 8. Outer loop: repeated outer cross-validation
+    # --------------------------------------------------------------
+    for trial_idx in range(NUM_TRIALS):
+        outer_cv, inner_cv = make_outer_inner_cv(
+            model_selection=model_selection,
+            n_outer_splits=n_outer_splits,
+            n_inner_splits=n_inner_splits,
+            outer_trial_idx=trial_idx,
+        )
+
+        print("=" * 200)
+        print(f"\n=== Model: {model_name} | Trial {trial_idx + 1}/{NUM_TRIALS} ===")
+        print("=" * 200)
+        outer_fold_idx = 0
+
+        if groups is not None:
+            outer_splits = outer_cv.split(X, y, groups)
+        else:
+            outer_splits = outer_cv.split(X, y)
+
+        # ----------------------------------------------------------
+        # Loop over outer folds for this trial
+        # ----------------------------------------------------------
+        for outer_train_idx, outer_test_idx in outer_splits:
+            cv_tracker += 1
+            outer_fold_idx += 1
+            print(
+                f"Outer fold {cv_tracker}/{total_outer_folds} "
+                f"(trial {trial_idx}, fold {outer_fold_idx})"
+            )
+
+            X_train, X_test = X[outer_train_idx], X[outer_test_idx]
+            y_train, y_test = y[outer_train_idx], y[outer_test_idx]
+            groups_train = groups[outer_train_idx] if groups is not None else None
+
+            # ------------------------------------------------------
+            # Inner CV + Optuna hyperparameter tuning
+            # ------------------------------------------------------
+            study = optuna.create_study(direction=opt_cfg["direction"])
+            study.optimize(
+                lambda tr: objective_with_args(
+                    tr,
+                    model_name,
+                    X_train,
+                    y_train,
+                    inner_cv,
+                    cfg,
+                    groups_train=groups_train,
+                ),
+                n_trials=N_INNER_OPTUNA_TRIALS,
+                show_progress_bar=True,
+                n_jobs=OPTUNA_N_JOBS,
+            )
+
+            best_trial = study.best_trial
+
+            # ------------------------------------------------------
+            # Fit final model on the full outer-train set
+            # ------------------------------------------------------
+            final_model, outer_train_metrics, outer_test_metrics, y_train_scores, y_test_scores = (
+                fit_and_evaluate_final_model(
+                    model_name=model_name,
+                    best_params=best_trial.params,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_test=X_test,
+                    y_test=y_test,
+                    cfg=cfg,
+                )
+            )
+
+            # ------------------------------------------------------
+            # Collect all information for this outer fold
+            # ------------------------------------------------------
+            results.append(
+                {
+                    "model_name": model_name,
+                    "trial": trial_idx,
+                    "outer_fold": outer_fold_idx,
+
+                    "feature_names_used": list(selected_feature_names),
+                    "feature_indices_local_used": selected_feature_indices_local.copy(),
+                    "feature_indices_original_used": (
+                        None if selected_feature_indices_original is None
+                        else selected_feature_indices_original.copy()
+                    ),
+                    "n_features_used": int(len(selected_feature_names)),
+
+                    "inner_train_scores": best_trial.user_attrs["inner_train_scores"],
+                    "inner_test_scores": best_trial.user_attrs["inner_test_scores"],
+                    "inner_train_mean": float(best_trial.user_attrs["inner_train_scores"].mean()),
+                    "inner_train_std": float(best_trial.user_attrs["inner_train_scores"].std()),
+                    "inner_test_mean": float(best_trial.user_attrs["inner_test_scores"].mean()),
+                    "inner_test_std": float(best_trial.user_attrs["inner_test_scores"].std()),
+
+                    "outer_train_metrics": outer_train_metrics,
+                    "outer_test_metrics": outer_test_metrics,
+                    "best_params": best_trial.params,
+                    "n_train": len(y_train),
+                    "n_test": len(y_test),
+                    "final_model": final_model,
+
+                    "outer_train_idx": outer_train_idx,
+                    "outer_test_idx": outer_test_idx,
+                    "y_train": y_train,
+                    "y_test": y_test,
+                    "y_train_scores": y_train_scores,
+                    "y_test_scores": y_test_scores,
+                }
+            )
+
+    return results
+
+
+def run_nested_cv_for_model_v1(
+    model_name: str,
     bundle: Dict[str, Any],
     cfg: Dict[str, Any],
     *,
@@ -815,223 +1130,6 @@ def run_nested_cv_for_model(
 
     return results
 
-
-
-# def run_nested_cv_for_model(
-#     model_name: str,
-#     X: np.ndarray,
-#     y: np.ndarray,
-#     cfg: Dict[str, Any],
-#     groups: Optional[np.ndarray] = None,
-#     model_selection: str = "StratifiedKFold",
-# ) -> List[Dict[str, Any]]:
-#     """
-#     Run nested cross-validation with Optuna hyperparameter tuning
-#     for a single model specified by `model_name`.
-
-#     The procedure is:
-
-#       * Outer loop:
-#           - Repeated `NUM_TRIALS` times.
-#           - Each repetition uses a CV splitter (StratifiedKFold or
-#             StratifiedGroupKFold, depending on `model_selection`) with
-#             `n_outer_splits` folds.
-#           - Each outer fold defines an outer train/test split.
-
-#       * Inner loop:
-#           - On each outer train split (X_train, y_train), run an Optuna
-#             study using `objective_with_args` and an inner CV with
-#             `n_inner_splits` folds.
-#           - The study searches over hyperparameters defined in the config
-#             and selects the best trial based on mean inner test score.
-
-#       * Final model per outer fold:
-#           - Rebuild model using the best trial's hyperparameters via
-#             `fit_and_evaluate_final_model`.
-#           - Fit on the outer train split and evaluate on train and test.
-#           - Store inner and outer metrics, best parameters, and indices.
-
-#     Parameters
-#     ----------
-#     model_name : str
-#         Name of the model to run nested CV for. Must be a key in
-#         cfg["models"], e.g. "logistic_regression" or "random_forest".
-#     X : np.ndarray
-#         Full feature matrix, shape (n_samples, n_features).
-#     y : np.ndarray
-#         Full label vector, shape (n_samples,).
-#     cfg : dict
-#         Global configuration dictionary. Must contain:
-#         - cfg["cv"] with keys: "num_trials", "n_outer_splits", "n_inner_splits"
-#         - cfg["optuna"] with keys: "n_inner_trials", "direction"
-#         - cfg["models"][model_name]["params"]: callable(trial) -> dict
-#     groups : np.ndarray or None, default=None
-#         Group labels for the samples, shape (n_samples,). Required if
-#         `model_selection == "StratifiedGroupKFold"`, and ignored when
-#         using plain "StratifiedKFold".
-#     model_selection : str, default="StratifiedKFold"
-#         CV strategy to use for both outer and inner loops. Supported:
-#         - "StratifiedKFold"       (no grouping)
-#         - "StratifiedGroupKFold"  (group-aware splitting)
-
-#     Returns
-#     -------
-#     results : list of dict
-#         One dictionary per outer fold, containing:
-#         - "model_name": str
-#         - "trial": int (outer repetition index)
-#         - "outer_fold": int (fold index within the outer trial)
-#         - "inner_train_scores": np.ndarray (per-fold inner train scores)
-#         - "inner_test_scores": np.ndarray (per-fold inner test scores)
-#         - "inner_train_mean": float
-#         - "inner_train_std": float
-#         - "inner_test_mean": float
-#         - "inner_test_std": float
-#         - "outer_train_metrics": dict of metrics on X_train
-#         - "outer_test_metrics": dict of metrics on X_test
-#         - "best_params": dict of best hyperparameters (Optuna)
-#         - "n_train": int, size of outer train set
-#         - "n_test": int, size of outer test set
-#         - "final_model": fitted model object
-#         - "outer_train_idx": np.ndarray of indices used for train
-#         - "outer_test_idx": np.ndarray of indices used for test
-#         - "y_train": np.ndarray of labels for train
-#         - "y_test": np.ndarray of labels for test
-#         - "y_train_scores": np.ndarray of scores on train
-#         - "y_test_scores": np.ndarray of scores on test
-#     """
-#     cv_cfg = cfg["cv"]
-#     opt_cfg = cfg["optuna"]
-
-
-#     NUM_TRIALS = cv_cfg["num_trials"]
-#     n_outer_splits = cv_cfg["n_outer_splits"]
-#     n_inner_splits = cv_cfg["n_inner_splits"]
-#     N_INNER_OPTUNA_TRIALS = opt_cfg["n_inner_trials"]
-#     OPTUNA_N_JOBS = opt_cfg.get("n_jobs", 1)   # default to sequential if missing
-    
-#     # Enforce that groups are provided when using group-aware splitting
-#     if model_selection == "StratifiedGroupKFold" and groups is None:
-#         raise ValueError(
-#             "model_selection='StratifiedGroupKFold' but groups is None. "
-#             "Provide a groups array or use 'StratifiedKFold'."
-#         )
-
-#     results: List[Dict[str, Any]] = []
-#     cv_tracker = 0
-#     total_outer_folds = NUM_TRIALS * n_outer_splits
-
-#     # ------------------------------------------------------------------
-#     # Outer loop: repeated outer cross-validation
-#     # ------------------------------------------------------------------
-#     for trial_idx in range(NUM_TRIALS):
-#         # Build outer & inner CV based on the chosen strategy
-#         outer_cv, inner_cv = make_outer_inner_cv(
-#             model_selection=model_selection,
-#             n_outer_splits=n_outer_splits,
-#             n_inner_splits=n_inner_splits,
-#             outer_trial_idx=trial_idx,
-#         )
-
-#         print('='*200)
-#         print(f"\n=== Model: {model_name} | Trial {trial_idx + 1}/{NUM_TRIALS} ===")
-#         print('='*200)
-#         outer_fold_idx = 0
-
-#         # Select outer splits depending on whether we have groups or not
-#         if groups is not None:
-#             outer_splits = outer_cv.split(X, y, groups)
-#         else:
-#             outer_splits = outer_cv.split(X, y)
-
-#         # --------------------------------------------------------------
-#         # Loop over outer folds for this trial
-#         # --------------------------------------------------------------
-#         for outer_train_idx, outer_test_idx in outer_splits:
-#             cv_tracker += 1
-#             outer_fold_idx += 1
-#             print(
-#                 f"Outer fold {cv_tracker}/{total_outer_folds} "
-#                 f"(trial {trial_idx}, fold {outer_fold_idx})"
-#             )
-
-#             # Outer train/test split
-#             X_train, X_test = X[outer_train_idx], X[outer_test_idx]
-#             y_train, y_test = y[outer_train_idx], y[outer_test_idx]
-#             groups_train = groups[outer_train_idx] if groups is not None else None
-
-#             # ----------------------------------------------------------
-#             # Inner CV + Optuna hyperparameter tuning on (X_train, y_train)
-#             # ----------------------------------------------------------
-#             study = optuna.create_study(direction=opt_cfg["direction"])
-#             study.optimize(
-#                 lambda tr: objective_with_args(
-#                     tr,
-#                     model_name,
-#                     X_train,
-#                     y_train,
-#                     inner_cv,
-#                     cfg,
-#                     groups_train=groups_train,
-#                 ),
-#                 n_trials=N_INNER_OPTUNA_TRIALS,
-#                 show_progress_bar=True,
-#                 n_jobs=OPTUNA_N_JOBS,
-#             )
-
-#             best_trial = study.best_trial
-
-#             # ----------------------------------------------------------
-#             # Fit final model on the full outer-train set using best params
-#             # ----------------------------------------------------------
-#             final_model,outer_train_metrics,outer_test_metrics, y_train_scores, y_test_scores,= fit_and_evaluate_final_model(model_name=model_name, 
-#                                                                                                                              best_params=best_trial.params, X_train=X_train,
-#                                                                                                                              y_train=y_train, X_test=X_test, y_test=y_test, cfg=cfg, )
-
-#             # ----------------------------------------------------------
-#             # Collect all information for this outer fold
-#             # ----------------------------------------------------------
-#             results.append(
-#                 {
-#                     "model_name": model_name,
-#                     "trial": trial_idx,
-#                     "outer_fold": outer_fold_idx,
-
-#                     # inner CV stats (directly from best_trial)
-#                     "inner_train_scores": best_trial.user_attrs["inner_train_scores"],
-#                     "inner_test_scores": best_trial.user_attrs["inner_test_scores"],
-#                     "inner_train_mean": float(
-#                         best_trial.user_attrs["inner_train_scores"].mean()
-#                     ),
-#                     "inner_train_std": float(
-#                         best_trial.user_attrs["inner_train_scores"].std()
-#                     ),
-#                     "inner_test_mean": float(
-#                         best_trial.user_attrs["inner_test_scores"].mean()
-#                     ),
-#                     "inner_test_std": float(
-#                         best_trial.user_attrs["inner_test_scores"].std()
-#                     ),
-
-#                     # outer performance
-#                     "outer_train_metrics": outer_train_metrics,
-#                     "outer_test_metrics": outer_test_metrics,
-#                     "best_params": best_trial.params,
-#                     "n_train": len(y_train),
-#                     "n_test": len(y_test),
-#                     "final_model": final_model,
-
-#                     # bookkeeping of indices and raw labels/scores
-#                     "outer_train_idx": outer_train_idx,
-#                     "outer_test_idx": outer_test_idx,
-#                     "y_train": y_train,
-#                     "y_test": y_test,
-#                     "y_train_scores": y_train_scores,
-#                     "y_test_scores": y_test_scores,
-#                 }
-#             )
-
-#     return results
 
 
 def summarize_cv_split_sizes(
@@ -4713,6 +4811,284 @@ def barplot_balanced_accuracy(
 # --------------------------------------------------------------
 def calibrate_nested_cv_results(
     all_results: Dict[str, List[Dict[str, Any]]],
+    final_features: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    *,
+    groups: Optional[np.ndarray] = None,
+    model_selection: str = "StratifiedKFold",
+    n_splits: int = 5,
+    calibration_methods: Optional[List[str]] = None,
+    train_probs_source: str = "oof",
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Calibrate nested-CV models (per outer fold) using the new feature-selection output
+    structure from `balanced_permutation_rank_select_pipeline(...)`.
+
+    Expected inputs
+    ---------------
+    final_features:
+        {
+            "final_by_model": {
+                model_name: {
+                    "X": np.ndarray,
+                    "feature_names_selected": List[str],
+                    "selected_feature_indices": np.ndarray,   # original dataset indices
+                    ...
+                },
+                ...
+            },
+            "y": np.ndarray,
+        }
+
+    Manual feature subsetting
+    -------------------------
+    If cfg["models"][model_name]["feature_names"] is provided, those names are matched
+    against final_features["final_by_model"][model_name]["feature_names_selected"], and
+    X is subset in the EXACT requested order.
+
+    Notes
+    -----
+    - This mutates `all_results` in place and also returns it.
+    - If train_probs_source="oof", OOF train probabilities are generated from the
+      outer-train split using cross_val_predict.
+    - If train_probs_source="refit", the function uses r["y_train_scores"] already
+      stored by nested CV.
+    """
+
+    # ------------------------------------------------------------------
+    # 0) Validate calibration methods
+    # ------------------------------------------------------------------
+    if calibration_methods is None:
+        calibration_methods = ["platt"]
+
+    if len(calibration_methods) == 0:
+        raise ValueError("calibration_methods must contain at least one method.")
+
+    calibration_methods = [m.lower() for m in calibration_methods]
+
+    supported = {"platt", "beta"}
+    unknown = set(calibration_methods) - supported
+    if unknown:
+        raise ValueError(
+            f"Unsupported calibration methods: {unknown}. Supported methods: {supported}."
+        )
+
+    train_probs_source = str(train_probs_source).lower()
+    if train_probs_source not in {"oof", "refit"}:
+        raise ValueError("train_probs_source must be one of {'oof', 'refit'}.")
+
+    # ------------------------------------------------------------------
+    # 1) Validate final_features structure
+    # ------------------------------------------------------------------
+    if "final_by_model" not in final_features:
+        raise KeyError("final_features must contain 'final_by_model'.")
+    if "y" not in final_features:
+        raise KeyError("final_features must contain 'y'.")
+
+    y = np.asarray(final_features["y"])
+    if y.ndim != 1:
+        raise ValueError(f"final_features['y'] must be 1D, got shape {y.shape}")
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.ndim != 1:
+            raise ValueError(f"groups must be 1D, got shape {groups.shape}")
+        if len(groups) != len(y):
+            raise ValueError(
+                f"groups/y mismatch: len(groups)={len(groups)} vs len(y)={len(y)}"
+            )
+
+    # ------------------------------------------------------------------
+    # 2) Loop over models
+    # ------------------------------------------------------------------
+    for model_name, folds in all_results.items():
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+
+        if model_name not in final_features["final_by_model"]:
+            raise KeyError(
+                f"Model '{model_name}' not found in final_features['final_by_model']."
+            )
+
+        m_cfg = cfg["models"][model_name]
+        model_block = final_features["final_by_model"][model_name]
+
+        if "X" not in model_block:
+            raise KeyError(f"final_features['final_by_model']['{model_name}'] missing 'X'.")
+        if "feature_names_selected" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'feature_names_selected'."
+            )
+        if "selected_feature_indices" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'selected_feature_indices'."
+            )
+
+        X_full = np.asarray(model_block["X"])
+        feature_names_full = list(model_block["feature_names_selected"])
+        selected_feature_indices_full = np.asarray(model_block["selected_feature_indices"])
+
+        if X_full.ndim != 2:
+            raise ValueError(
+                f"final_features['final_by_model']['{model_name}']['X'] must be 2D, "
+                f"got shape {X_full.shape}"
+            )
+        if X_full.shape[0] != len(y):
+            raise ValueError(
+                f"{model_name}: X/y mismatch: X rows={X_full.shape[0]} vs len(y)={len(y)}"
+            )
+        if X_full.shape[1] != len(feature_names_full):
+            raise ValueError(
+                f"{model_name}: X has {X_full.shape[1]} columns but "
+                f"feature_names_selected has {len(feature_names_full)} names."
+            )
+        if len(selected_feature_indices_full) != X_full.shape[1]:
+            raise ValueError(
+                f"{model_name}: selected_feature_indices has length "
+                f"{len(selected_feature_indices_full)} but X has {X_full.shape[1]} columns."
+            )
+
+        # --------------------------------------------------------------
+        # 3) Optional manual feature subsetting by feature_names
+        # --------------------------------------------------------------
+        keep_features = m_cfg.get("feature_names", None)
+
+        if keep_features is None:
+            X_model = X_full
+            feature_names_model = list(feature_names_full)
+            selected_feature_indices_local = np.arange(len(feature_names_full), dtype=int)
+        else:
+            name_to_idx = {name: i for i, name in enumerate(feature_names_full)}
+            selected_feature_indices_local = np.array(
+                [name_to_idx[name] for name in keep_features],
+                dtype=int,
+            )
+            X_model = X_full[:, selected_feature_indices_local]
+            feature_names_model = list(keep_features)
+
+        selected_feature_indices_original = selected_feature_indices_full[
+            selected_feature_indices_local
+        ]
+
+        # --------------------------------------------------------------
+        # 4) Loop over outer folds and calibrate
+        # --------------------------------------------------------------
+        for r in folds:
+            outer_train_idx = r["outer_train_idx"]
+            outer_test_idx = r["outer_test_idx"]
+
+            y_train = y[outer_train_idx]
+
+            groups_train = None
+            if (
+                train_probs_source == "oof"
+                and groups is not None
+                and model_selection == "StratifiedGroupKFold"
+            ):
+                groups_train = groups[outer_train_idx]
+
+            # ----------------------------------------------------------
+            # 4a) Get uncalibrated TRAIN probabilities
+            # ----------------------------------------------------------
+            if train_probs_source == "refit":
+                if "y_train_scores" not in r:
+                    raise KeyError(
+                        f"{model_name}: fold is missing 'y_train_scores' needed for "
+                        f"train_probs_source='refit'."
+                    )
+                cv_uncalib_train_predictions = np.asarray(r["y_train_scores"], dtype=float)
+
+            else:
+                X_train = X_model[outer_train_idx]
+
+                clf = clone(r["final_model"])
+
+                _, inner_cv = make_outer_inner_cv(
+                    model_selection=model_selection,
+                    n_outer_splits=n_splits,
+                    n_inner_splits=n_splits,
+                    outer_trial_idx=r["trial"],
+                )
+
+                cv_kwargs = {}
+                if groups_train is not None:
+                    cv_kwargs["groups"] = groups_train
+
+                cv_probs_train = cross_val_predict(
+                    clf,
+                    X_train,
+                    y_train,
+                    cv=inner_cv,
+                    method="predict_proba",
+                    **cv_kwargs,
+                )
+                cv_uncalib_train_predictions = cv_probs_train[:, 1].astype(float)
+
+            r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
+
+            # ----------------------------------------------------------
+            # 4b) Get uncalibrated TEST probabilities
+            # ----------------------------------------------------------
+            if "y_test_scores" not in r:
+                raise KeyError(
+                    f"{model_name}: fold is missing 'y_test_scores' needed for test calibration."
+                )
+            testset_preds_uncalib = np.asarray(r["y_test_scores"], dtype=float)
+
+            # Metadata / traceability
+            r["calib_feature_names"] = feature_names_model
+            r["calib_feature_indices_local"] = selected_feature_indices_local.copy()
+            r["calib_feature_indices_original"] = selected_feature_indices_original.copy()
+            r["train_probs_source"] = train_probs_source
+
+            # ----------------------------------------------------------
+            # 5) Fit calibrators and apply to train + test
+            # ----------------------------------------------------------
+            if "platt" in calibration_methods:
+                calibrator_platt = LogisticRegression(
+                    C=np.inf,
+                    solver="lbfgs",
+                    max_iter=200000,
+                )
+                calibrator_platt.fit(
+                    cv_uncalib_train_predictions.reshape(-1, 1),
+                    y_train,
+                )
+
+                r["calibration_method_platt"] = "platt"
+                r["calibrator_platt"] = calibrator_platt
+
+                r["cv_calib_train_predictions_platt"] = calibrator_platt.predict_proba(
+                    cv_uncalib_train_predictions.reshape(-1, 1)
+                )[:, 1]
+
+                r["calib_test_predictions_platt"] = calibrator_platt.predict_proba(
+                    testset_preds_uncalib.reshape(-1, 1)
+                )[:, 1]
+
+            if "beta" in calibration_methods:
+                calibrator_beta = BetaCalibration(parameters="abm")
+                calibrator_beta.fit(
+                    cv_uncalib_train_predictions,
+                    y_train,
+                )
+
+                r["calibration_method_beta"] = "beta"
+                r["calibrator_beta"] = calibrator_beta
+
+                r["cv_calib_train_predictions_beta"] = calibrator_beta.predict(
+                    cv_uncalib_train_predictions
+                )
+
+                r["calib_test_predictions_beta"] = calibrator_beta.predict(
+                    testset_preds_uncalib
+                )
+
+    return all_results
+
+
+def calibrate_nested_cv_results_v1(
+    all_results: Dict[str, List[Dict[str, Any]]],
     bundle: Mapping[str, Any],
     cfg: Mapping[str, Any],
     *,
@@ -5020,303 +5396,6 @@ def calibrate_nested_cv_results(
 
 
 
-# def calibrate_nested_cv_results(
-#     all_results: Dict[str, List[Dict[str, Any]]],
-#     bundle: Mapping[str, Any],
-#     cfg: Mapping[str, Any],
-#     *,
-#     x_key: str = "combined_X_raw",
-#     y_key: str = "combined_y",
-#     groups_key: Optional[str] = None,
-#     model_selection: str = "StratifiedKFold",
-#     n_splits: int = 5,
-#     calibration_methods: Optional[List[str]] = None,  # e.g. ["platt", "beta"]
-# ) -> Dict[str, List[Dict[str, Any]]]:
-#     """
-#     Calibrate nested-CV models (per outer fold) using out-of-fold (OOF) probabilities
-#     computed on the OUTER-TRAIN split, while respecting per-model feature selection.
-
-#     Why this function exists
-#     ------------------------
-#     After nested CV, each fold dict in `all_results[model_name]` contains:
-#       - a tuned + fitted estimator under "final_model"
-#       - "outer_train_idx" and "outer_test_idx" (row indices into the dataset level used)
-#       - uncalibrated test probabilities under "y_test_scores"
-
-#     To calibrate probabilities, we need *training* probabilities that are:
-#       - out-of-fold (OOF) on the outer-train set (to avoid fitting calibrators on in-fold predictions)
-#       - produced by a model that sees the exact same feature space that the final model expects
-
-#     With your new setup, each model can use its own feature subset (via config). Therefore
-#     we must:
-#       1) start from the *superset* X in the bundle (defined by x_key)
-#       2) slice columns ONCE per model (using prepare_training_bundle and config)
-#       3) slice rows per fold using outer_train_idx / outer_test_idx
-
-#     Behavior / outputs
-#     ------------------
-#     For every (model_name, fold_dict) in all_results:
-#       - Stores OOF uncalibrated train probabilities:
-#             r["cv_uncalib_train_predictions"]  -> shape (n_train,)
-
-#       - For each calibration method requested, fits a calibrator on the OOF train probs and y_train,
-#         then produces calibrated train + test probabilities:
-
-#         If "platt":
-#             r["calibration_method_platt"] = "platt"
-#             r["calibrator_platt"] = fitted LogisticRegression
-#             r["cv_calib_train_predictions_platt"] -> calibrated OOF train probs
-#             r["calib_test_predictions_platt"] -> calibrated outer-test probs
-
-#         If "beta":
-#             r["calibration_method_beta"] = "beta"
-#             r["calibrator_beta"] = fitted BetaCalibration
-#             r["cv_calib_train_predictions_beta"] -> calibrated OOF train probs
-#             r["calib_test_predictions_beta"] -> calibrated outer-test probs
-
-#     Notes
-#     -----
-#     - This function does NOT refit the model on the full outer-train split. It only uses
-#       cross_val_predict(clone(final_model)) to generate OOF train probabilities, and then
-#       fits calibrators on those probabilities.
-#     - Test calibration is applied to r["y_test_scores"] (already produced by the fitted final_model
-#       during nested CV), so we do not need X_test to calibrate.
-#     - If model_selection == "StratifiedGroupKFold", you must pass groups_key so groups can be
-#       reconstructed on the outer-train rows for cross_val_predict.
-#     """
-#     # ------------------------------------------------------------------
-#     # 0) Handle calibration method selection + validation
-#     # ------------------------------------------------------------------
-#     if calibration_methods is None:
-#         calibration_methods = ["platt"]  # default behavior
-
-#     if len(calibration_methods) == 0:
-#         raise ValueError("calibration_methods must contain at least one method.")
-
-#     # normalize user input
-#     calibration_methods = [m.lower() for m in calibration_methods]
-
-#     # validate supported methods
-#     supported = {"platt", "beta"}
-#     unknown = set(calibration_methods) - supported
-#     if unknown:
-#         raise ValueError(
-#             f"Unsupported calibration methods: {unknown}. Supported methods: {supported}."
-#         )
-
-#     # ------------------------------------------------------------------
-#     # 1) Pull the correct dataset level from the bundle (superset X/y)
-#     # ------------------------------------------------------------------
-#     if x_key not in bundle:
-#         raise KeyError(f"bundle missing x_key='{x_key}'")
-#     if y_key not in bundle:
-#         raise KeyError(f"bundle missing y_key='{y_key}'")
-
-#     # IMPORTANT:
-#     # - X_full is the *superset* feature matrix at the dataset level specified by x_key
-#     # - feature_names_full must correspond to the columns of X_full
-#     X_full = np.asarray(bundle[x_key])
-#     y = np.asarray(bundle[y_key])
-
-#     if X_full.ndim != 2:
-#         raise ValueError(f"bundle[{x_key}] must be 2D, got shape {X_full.shape}")
-#     if y.ndim != 1:
-#         raise ValueError(f"bundle[{y_key}] must be 1D, got shape {y.shape}")
-#     if X_full.shape[0] != len(y):
-#         raise ValueError(
-#             f"X/y mismatch for keys ({x_key}, {y_key}): X rows={X_full.shape[0]} vs len(y)={len(y)}"
-#         )
-
-#     # Choose which feature-names key to use.
-#     # If you have separate names for aggregated features, prefer those.
-#     feature_names_key = "feature_names"
-#     if str(x_key).startswith("combined_"):
-#         if "combined_feature_names" in bundle:
-#             feature_names_key = "combined_feature_names"
-
-#     if feature_names_key not in bundle:
-#         raise KeyError(
-#             f"bundle missing '{feature_names_key}'. Needed to map names->columns for feature slicing."
-#         )
-
-#     feature_names_full = list(bundle[feature_names_key])
-#     if X_full.shape[1] != len(feature_names_full):
-#         raise ValueError(
-#             f"Mismatch: bundle[{x_key}] has {X_full.shape[1]} cols but "
-#             f"bundle[{feature_names_key}] has {len(feature_names_full)} names."
-#         )
-
-#     # Optional group labels at the same dataset level (needed only for StratifiedGroupKFold)
-#     groups_all: Optional[np.ndarray] = None
-#     if groups_key is not None:
-#         if groups_key not in bundle:
-#             raise KeyError(f"bundle missing groups_key='{groups_key}'")
-#         groups_all = np.asarray(bundle[groups_key])
-#         if groups_all.ndim != 1:
-#             raise ValueError(f"bundle[{groups_key}] must be 1D, got shape {groups_all.shape}")
-#         if len(groups_all) != len(y):
-#             raise ValueError(
-#                 f"groups/y mismatch for key {groups_key}: len(groups)={len(groups_all)} vs len(y)={len(y)}"
-#             )
-
-#     # ------------------------------------------------------------------
-#     # 2) Loop over models; for each model slice X_full -> X_model ONCE
-#     # ------------------------------------------------------------------
-#     for model_name, folds in all_results.items():
-#         # Ensure this model exists in config
-#         if model_name not in cfg["models"]:
-#             raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
-
-#         m_cfg = cfg["models"][model_name]
-
-#         # Per-model feature selection knobs (same as training):
-#         #   - either a list of feature names OR an integer n_features (prefix mode)
-#         keep_features_cfg = m_cfg.get("feature_names", None)  # list[str] | None
-#         n_features_cfg = m_cfg.get("n_features", None)        # int | None
-
-#         # If your nested CV stored the exact feature names used, prefer those.
-#         # This protects you if config changes later.
-#         keep_features_from_results: Optional[List[str]] = None
-#         if len(folds) > 0 and "feature_names" in folds[0]:
-#             keep_features_from_results = list(folds[0]["feature_names"])
-
-#         if keep_features_from_results is not None:
-#             keep_features = keep_features_from_results
-#             n_features_model = None
-#         else:
-#             keep_features = keep_features_cfg
-#             n_features_model = n_features_cfg
-
-#         # Do not allow both selection methods at once (ambiguous)
-#         if keep_features is not None and n_features_model is not None:
-#             raise ValueError(
-#                 f"{model_name}: set only one of 'feature_names' or 'n_features' (or neither)."
-#             )
-
-#         # Build the "view bundle" expected by prepare_training_bundle
-#         view_bundle = {"X_raw": X_full, "feature_names": feature_names_full}
-
-#         # Slice columns ONCE per model to match the model's trained feature space
-#         if keep_features is not None or n_features_model is not None:
-#             mb = prepare_training_bundle(
-#                 view_bundle,
-#                 n_features=n_features_model,
-#                 keep_features=keep_features,
-#                 strict=m_cfg.get("feature_strict", True),
-#                 dedupe=True,
-#                 copy_bundle=True,
-#             )
-#         else:
-#             mb = view_bundle  # no slicing requested
-
-#         X_model = np.asarray(mb["X_raw"])                 # shape: (n_samples, D_model)
-#         feature_names_model = list(mb["feature_names"])   # length: D_model
-
-#         # ------------------------------------------------------------------
-#         # 3) Loop over outer folds for this model and perform calibration
-#         # ------------------------------------------------------------------
-#         for r in folds:
-#             outer_train_idx = r["outer_train_idx"]
-#             outer_test_idx = r["outer_test_idx"]
-
-#             # Outer-train subset (rows only; columns already model-specific)
-#             X_train = X_model[outer_train_idx]   # shape: (n_train, D_model)
-#             y_train = y[outer_train_idx]         # shape: (n_train,)
-
-#             # NOTE:
-#             # We don't need X_test to apply calibration, because we calibrate the
-#             # already-stored uncalibrated test probabilities in r["y_test_scores"].
-#             # X_test = X_model[outer_test_idx]
-#             # y_test = y[outer_test_idx]
-
-#             # Groups only matter if using StratifiedGroupKFold
-#             groups_train = None
-#             if (groups_all is not None) and (model_selection == "StratifiedGroupKFold"):
-#                 groups_train = groups_all[outer_train_idx]
-
-#             # Clone the final tuned estimator (unfitted) to generate OOF train probs
-#             final_model = r["final_model"]
-#             clf = clone(final_model)
-
-#             # Build a "regular CV" splitter (not nested) just to produce OOF predictions
-#             _, inner_cv = make_outer_inner_cv(
-#                 model_selection=model_selection,
-#                 n_outer_splits=n_splits,   # arbitrary but valid
-#                 n_inner_splits=n_splits,   # K folds for OOF prediction
-#                 outer_trial_idx=r["trial"],  # seed for reproducibility
-#             )
-
-#             # cross_val_predict supports passing groups via keyword
-#             cv_kwargs = {}
-#             if groups_train is not None:
-#                 cv_kwargs["groups"] = groups_train
-
-#             # OOF predicted probabilities for the positive class on outer-train
-#             cv_probs_train = cross_val_predict(
-#                 clf,
-#                 X_train,
-#                 y_train,
-#                 cv=inner_cv,
-#                 method="predict_proba",
-#                 **cv_kwargs,
-#             )
-#             cv_uncalib_train_predictions = cv_probs_train[:, 1]
-#             r["cv_uncalib_train_predictions"] = cv_uncalib_train_predictions
-
-#             # Uncalibrated outer-test probabilities from nested CV training step
-#             testset_preds_uncalib = r["y_test_scores"]
-
-#             # Store some traceability metadata
-#             r["calib_x_key"] = x_key
-#             r["calib_y_key"] = y_key
-#             r["calib_feature_names_key"] = feature_names_key
-#             r["calib_feature_names"] = feature_names_model
-
-#             # --------------------------------------------------------------
-#             # 4) Fit calibrators on (OOF train probs, y_train) and apply
-#             # --------------------------------------------------------------
-#             if "platt" in calibration_methods:
-#                 # Platt scaling: logistic regression on the 1D score
-#                 calibrator_platt = LogisticRegression(
-#                     C=np.inf, solver="lbfgs", max_iter=200000
-#                 )
-#                 calibrator_platt.fit(
-#                     cv_uncalib_train_predictions.reshape(-1, 1),
-#                     y_train,
-#                 )
-
-#                 r["calibration_method_platt"] = "platt"
-#                 r["calibrator_platt"] = calibrator_platt
-
-#                 # Calibrated OOF train probabilities
-#                 r["cv_calib_train_predictions_platt"] = calibrator_platt.predict_proba(
-#                     cv_uncalib_train_predictions.reshape(-1, 1)
-#                 )[:, 1]
-
-#                 # Calibrated outer-test probabilities (apply to uncalibrated test scores)
-#                 r["calib_test_predictions_platt"] = calibrator_platt.predict_proba(
-#                     testset_preds_uncalib.reshape(-1, 1)
-#                 )[:, 1]
-
-#             if "beta" in calibration_methods:
-#                 # Beta calibration on the 1D score
-#                 calibrator_beta = BetaCalibration(parameters="abm")
-#                 calibrator_beta.fit(
-#                     cv_uncalib_train_predictions,
-#                     y_train,
-#                 )
-
-#                 r["calibration_method_beta"] = "beta"
-#                 r["calibrator_beta"] = calibrator_beta
-
-#                 r["cv_calib_train_predictions_beta"] = calibrator_beta.predict(
-#                     cv_uncalib_train_predictions
-#                 )
-#                 r["calib_test_predictions_beta"] = calibrator_beta.predict(
-#                     testset_preds_uncalib
-#                 )
-
-#     return all_results
 
 
 # Get slope and intercept of calibration
@@ -7146,8 +7225,199 @@ def combine_permutation_importances_nested_cv(
     return combined_importances_by_model
 
 
-
 def run_permutation_importance_pipeline(
+    all_results: Dict[str, List[Dict[str, Any]]],
+    final_features: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    *,
+    scoring: str,
+    n_repeats: int = 10,
+    random_state: int = 42,
+    n_jobs: int = -1,
+) -> Tuple[
+    Dict[str, List[Dict[str, Any]]],
+    Dict[str, np.ndarray],
+    Dict[str, List[str]],
+]:
+    """
+    Run permutation feature-importance for nested-CV results using the new
+    feature-selection output structure.
+
+    Parameters
+    ----------
+    all_results:
+        Nested-CV results dict structured as:
+            {model_name: [fold_dict_0, fold_dict_1, ...]}
+        Each fold dict must include at minimum:
+            - "final_model"
+            - "outer_test_idx"
+
+    final_features:
+        Output from balanced_permutation_rank_select_pipeline(...), expected to contain:
+            {
+                "final_by_model": {
+                    model_name: {
+                        "X": np.ndarray,
+                        "feature_names_selected": list[str],
+                        "selected_feature_indices": np.ndarray,
+                        ...
+                    },
+                    ...
+                },
+                "y": np.ndarray,
+            }
+
+    cfg:
+        Configuration dictionary containing cfg["models"][model_name].
+        Supported per-model feature-selection key:
+            - "feature_names": Optional[list[str]]
+        If provided, these names are matched against the model-specific
+        feature_names_selected list, preserving the exact requested order.
+
+    scoring:
+        Scoring metric passed to sklearn permutation_importance.
+
+    n_repeats:
+        Number of shuffles per feature per fold.
+
+    random_state:
+        Random seed for reproducibility.
+
+    n_jobs:
+        Parallel jobs for permutation_importance.
+
+    Returns
+    -------
+    all_results:
+        Same dict as input, mutated in-place with fold-level permutation outputs.
+
+    combined_importances:
+        Dict mapping model_name -> combined permutation importance array.
+
+    model_feature_names:
+        Dict mapping model_name -> list[str] of feature names actually used.
+    """
+    if "final_by_model" not in final_features:
+        raise KeyError("final_features must contain 'final_by_model'.")
+    if "y" not in final_features:
+        raise KeyError("final_features must contain 'y'.")
+
+    y = np.asarray(final_features["y"])
+    if y.ndim != 1:
+        raise ValueError(f"final_features['y'] must be 1D, got shape {y.shape}")
+
+    model_feature_names: Dict[str, List[str]] = {}
+
+    steps = tqdm(total=2, desc="Permutation importance pipeline", unit="step")
+
+    # --------------------------------------------------------------
+    # Step 1: compute permutation importance per model
+    # --------------------------------------------------------------
+    steps.set_description("Permutation importance: compute per model")
+
+    for model_name in list(all_results.keys()):
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+        if model_name not in final_features["final_by_model"]:
+            raise KeyError(
+                f"Model '{model_name}' not found in final_features['final_by_model']."
+            )
+
+        m_cfg = cfg["models"][model_name]
+        model_block = final_features["final_by_model"][model_name]
+
+        if "X" not in model_block:
+            raise KeyError(f"final_features['final_by_model']['{model_name}'] missing 'X'.")
+        if "feature_names_selected" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'feature_names_selected'."
+            )
+        if "selected_feature_indices" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'selected_feature_indices'."
+            )
+
+        X_full = np.asarray(model_block["X"])
+        feature_names_full = list(model_block["feature_names_selected"])
+        selected_feature_indices_full = np.asarray(model_block["selected_feature_indices"])
+
+        if X_full.ndim != 2:
+            raise ValueError(
+                f"{model_name}: model-specific X must be 2D, got shape {X_full.shape}"
+            )
+        if X_full.shape[0] != len(y):
+            raise ValueError(
+                f"{model_name}: X/y mismatch: X rows={X_full.shape[0]} vs len(y)={len(y)}"
+            )
+        if X_full.shape[1] != len(feature_names_full):
+            raise ValueError(
+                f"{model_name}: X has {X_full.shape[1]} columns but "
+                f"feature_names_selected has {len(feature_names_full)} names."
+            )
+        if len(selected_feature_indices_full) != X_full.shape[1]:
+            raise ValueError(
+                f"{model_name}: selected_feature_indices has length "
+                f"{len(selected_feature_indices_full)} but X has {X_full.shape[1]} columns."
+            )
+
+        # Simple manual feature subsetting by name, preserving requested order
+        keep_features = m_cfg.get("feature_names", None)
+
+        if keep_features is None:
+            X_model = X_full
+            feature_names_model = list(feature_names_full)
+            selected_feature_indices_local = np.arange(len(feature_names_full), dtype=int)
+        else:
+            name_to_idx = {name: i for i, name in enumerate(feature_names_full)}
+            selected_feature_indices_local = np.array(
+                [name_to_idx[name] for name in keep_features],
+                dtype=int,
+            )
+            X_model = X_full[:, selected_feature_indices_local]
+            feature_names_model = list(keep_features)
+
+        selected_feature_indices_original = selected_feature_indices_full[
+            selected_feature_indices_local
+        ]
+
+        model_feature_names[model_name] = feature_names_model
+
+        # Stash metadata in each fold result for traceability
+        for r in all_results[model_name]:
+            r["pi_feature_names"] = feature_names_model
+            r["pi_feature_indices_local"] = selected_feature_indices_local.copy()
+            r["pi_feature_indices_original"] = selected_feature_indices_original.copy()
+
+        sub_results = {model_name: all_results[model_name]}
+        sub_results = compute_permutation_importance_nested_cv(
+            all_results=sub_results,
+            X=X_model,
+            y=y,
+            scoring=scoring,
+            n_repeats=n_repeats,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            show_progress=True,
+        )
+
+        all_results[model_name] = sub_results[model_name]
+
+    steps.update(1)
+
+    # --------------------------------------------------------------
+    # Step 2: combine across folds
+    # --------------------------------------------------------------
+    steps.set_description("Permutation importance: combine folds")
+    combined_importances = combine_permutation_importances_nested_cv(all_results)
+    steps.update(1)
+    steps.close()
+
+    return all_results, combined_importances, model_feature_names
+
+
+
+
+def run_permutation_importance_pipeline_v1(
     all_results: Dict[str, List[Dict[str, Any]]],
     bundle: Mapping[str, Any],
     cfg: Mapping[str, Any],
@@ -7342,6 +7612,8 @@ def run_permutation_importance_pipeline(
     steps.close()
 
     return all_results, combined_importances, model_feature_names
+
+
 
 
 def plot_permutation_importances_barplot(
@@ -8523,6 +8795,197 @@ def add_grid_value_raw_to_pdp_agg(
 
 def run_pdp_pipeline(
     all_results: Dict[str, List[Dict[str, Any]]],
+    final_features: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    *,
+    data_source: str = "test",
+    grid_resolution: int = 100,
+    percentiles: Tuple[float, float] = (0.0, 1.0),
+    centered: bool = False,
+    n_points: int = 20,
+    discrete_threshold: int = 10,
+    scaler_bundle: Optional[Mapping[str, Any]] = None,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, pd.DataFrame], Dict[str, List[str]]]:
+    """
+    Run PDP workflow using final_features output instead of bundle.
+
+    final_features is expected to contain:
+        {
+            "final_by_model": {
+                model_name: {
+                    "X": np.ndarray,
+                    "feature_names_selected": list[str],
+                    "selected_feature_indices": np.ndarray,
+                    ...
+                },
+                ...
+            },
+            "y": np.ndarray,
+        }
+
+    If cfg["models"][model_name]["feature_names"] is provided, those names are
+    matched against the model-specific feature_names_selected list and X is subset
+    in the exact requested order.
+    """
+
+    if "final_by_model" not in final_features:
+        raise KeyError("final_features must contain 'final_by_model'.")
+    if "y" not in final_features:
+        raise KeyError("final_features must contain 'y'.")
+
+    y = np.asarray(final_features["y"])
+    if y.ndim != 1:
+        raise ValueError(f"final_features['y'] must be 1D, got shape {y.shape}")
+
+    model_feature_names: Dict[str, List[str]] = {}
+
+    n_steps = 4 if scaler_bundle is not None else 3
+    steps = tqdm(total=n_steps, desc="PDP pipeline", unit="step")
+
+    # --------------------------------------------------------------
+    # Step 1: compute PDP per model
+    # --------------------------------------------------------------
+    steps.set_description("PDP pipeline: compute PDP per model")
+
+    for model_name in list(all_results.keys()):
+        if model_name not in cfg["models"]:
+            raise KeyError(f"Model '{model_name}' not found in cfg['models'].")
+        if model_name not in final_features["final_by_model"]:
+            raise KeyError(
+                f"Model '{model_name}' not found in final_features['final_by_model']."
+            )
+
+        m_cfg = cfg["models"][model_name]
+        model_block = final_features["final_by_model"][model_name]
+
+        if "X" not in model_block:
+            raise KeyError(f"final_features['final_by_model']['{model_name}'] missing 'X'.")
+        if "feature_names_selected" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'feature_names_selected'."
+            )
+        if "selected_feature_indices" not in model_block:
+            raise KeyError(
+                f"final_features['final_by_model']['{model_name}'] missing 'selected_feature_indices'."
+            )
+
+        X_full = np.asarray(model_block["X"])
+        feature_names_full = list(model_block["feature_names_selected"])
+        selected_feature_indices_full = np.asarray(model_block["selected_feature_indices"])
+
+        if X_full.ndim != 2:
+            raise ValueError(
+                f"{model_name}: model-specific X must be 2D, got shape {X_full.shape}"
+            )
+        if X_full.shape[0] != len(y):
+            raise ValueError(
+                f"{model_name}: X/y mismatch: X rows={X_full.shape[0]} vs len(y)={len(y)}"
+            )
+        if X_full.shape[1] != len(feature_names_full):
+            raise ValueError(
+                f"{model_name}: X has {X_full.shape[1]} columns but "
+                f"feature_names_selected has {len(feature_names_full)} names."
+            )
+        if len(selected_feature_indices_full) != X_full.shape[1]:
+            raise ValueError(
+                f"{model_name}: selected_feature_indices has length "
+                f"{len(selected_feature_indices_full)} but X has {X_full.shape[1]} columns."
+            )
+
+        keep_features = m_cfg.get("feature_names", None)
+
+        if keep_features is None:
+            X_model = X_full
+            fnames_model = list(feature_names_full)
+            selected_feature_indices_local = np.arange(len(feature_names_full), dtype=int)
+        else:
+            name_to_idx = {name: i for i, name in enumerate(feature_names_full)}
+            selected_feature_indices_local = np.array(
+                [name_to_idx[name] for name in keep_features],
+                dtype=int,
+            )
+            X_model = X_full[:, selected_feature_indices_local]
+            fnames_model = list(keep_features)
+
+        selected_feature_indices_original = selected_feature_indices_full[
+            selected_feature_indices_local
+        ]
+
+        model_feature_names[model_name] = fnames_model
+
+        for r in all_results[model_name]:
+            r["pdp_feature_names"] = fnames_model
+            r["pdp_feature_indices_local"] = selected_feature_indices_local.copy()
+            r["pdp_feature_indices_original"] = selected_feature_indices_original.copy()
+
+        sub_results = {model_name: all_results[model_name]}
+        sub_results = compute_pdp_nested_cv(
+            all_results=sub_results,
+            X=X_model,
+            y=y,
+            grid_resolution=grid_resolution,
+            percentiles=percentiles,
+            data_source=data_source,
+            centered=centered,
+        )
+        all_results[model_name] = sub_results[model_name]
+
+    steps.update(1)
+
+    # --------------------------------------------------------------
+    # Step 2: aggregate folds per model
+    # --------------------------------------------------------------
+    steps.set_description("PDP pipeline: aggregate folds")
+    agg_source = data_source if data_source in ("train", "test") else "test"
+
+    pdp_agg: Dict[str, pd.DataFrame] = {}
+    for model_name in list(all_results.keys()):
+        sub_results = {model_name: all_results[model_name]}
+        sub_agg = aggregate_pdp_nested_cv(
+            all_results=sub_results,
+            source=agg_source,
+            feature_names=model_feature_names[model_name],
+        )
+        pdp_agg.update(sub_agg)
+
+    steps.update(1)
+
+    # --------------------------------------------------------------
+    # Step 3: mean/std curves across folds
+    # --------------------------------------------------------------
+    steps.set_description("PDP pipeline: mean/std curves")
+    pdp_agg = add_interpolated_mean_pdp_to_agg(
+        pdp_agg=pdp_agg,
+        n_points=n_points,
+        discrete_threshold=discrete_threshold,
+    )
+    steps.update(1)
+
+    # --------------------------------------------------------------
+    # Step 4: add raw grid values (optional)
+    # --------------------------------------------------------------
+    if scaler_bundle is not None:
+        steps.set_description("PDP pipeline: add raw grid values")
+
+        for model_name in list(all_results.keys()):
+            keys = [model_name, f"{model_name}_mean_pdp"]
+            sub_pdp_agg = {k: pdp_agg[k] for k in keys if k in pdp_agg}
+
+            sub_pdp_agg = add_grid_value_raw_to_pdp_agg(
+                pdp_agg=sub_pdp_agg,
+                scaler_bundle=scaler_bundle,
+            )
+
+            for k, v in sub_pdp_agg.items():
+                pdp_agg[k] = v
+
+        steps.update(1)
+
+    steps.close()
+    return all_results, pdp_agg, model_feature_names
+
+def run_pdp_pipeline_v1(
+    all_results: Dict[str, List[Dict[str, Any]]],
     bundle: Mapping[str, Any],
     cfg: Mapping[str, Any],
     *,
@@ -9037,325 +9500,6 @@ def plot_all_mean_pdp_with_std(
 
             plt.tight_layout()
             plt.show()
-
-
-# def run_pdp_pipeline(
-#     all_results: Dict[str, List[Dict[str, Any]]],
-#     X: np.ndarray,
-#     y: np.ndarray,
-#     feature_names: Optional[Sequence[str]] = None,
-#     *,
-#     data_source: str = "test",
-#     grid_resolution: int = 100,
-#     percentiles: Tuple[float, float] = (0.0, 1.0),
-#     centered: bool = False,
-#     n_points: int = 20,
-#     discrete_threshold: int = 10,
-#     scaler_bundle: Optional[Dict[str, Any]] = None,
-# ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, pd.DataFrame]]:
-#     """
-#     Run the full PDP workflow as a single pipeline with progress reporting.
-
-#     This pipeline wraps up to four steps into one call:
-
-#       (1) compute_pdp_nested_cv:
-#           Computes per-fold partial dependence (PDP) curves for each model and
-#           stores the results back into `all_results` under keys like:
-#             - "pdp_grid_values_test" / "pdp_average_values_test"
-#             - "pdp_grid_values_train" / "pdp_average_values_train"
-#           Note: PDP arrays are NaN-padded per feature so that low-cardinality
-#           features (e.g., binary) can have fewer grid points without breaking
-#           array stacking.
-
-#       (2) aggregate_pdp_nested_cv:
-#           Converts the per-fold (padded) PDP arrays into a single long-format
-#           DataFrame per model, skipping any NaN-padded entries.
-
-#       (3) add_interpolated_mean_pdp_to_agg:
-#           For each model and each feature, creates a canonical x-grid and
-#           interpolates each fold's PDP curve onto it, then computes mean/std
-#           across folds, storing results as:
-#             pdp_agg[f"{model_name}_mean_pdp"].
-
-#       (4) add_grid_value_raw_to_pdp_agg (optional):
-#           If `scaler_bundle` is provided, converts standardized/scaled PDP
-#           x-values (grid_value) back into raw feature units and appends a
-#           `grid_value_raw` column to each DataFrame in `pdp_agg`.
-
-#     A top-level tqdm progress bar is shown to indicate which pipeline stage
-#     is running.
-
-#     Parameters
-#     ----------
-#     all_results:
-#         Nested-CV results dict with structure:
-#           {model_name: [fold_dict_0, fold_dict_1, ...]}
-#         Each fold dict must include:
-#           - "final_model": fitted estimator for that fold
-#           - "outer_train_idx": indices into X for outer-train split
-#           - "outer_test_idx": indices into X for outer-test split
-#         This object is mutated in-place by step (1) to store PDP arrays.
-
-#     X:
-#         Full feature matrix used for the nested CV, shape (n_samples, n_features).
-#         PDP computations slice this matrix using outer_train_idx / outer_test_idx.
-
-#     y:
-#         Label vector, shape (n_samples,). Included for API symmetry with other
-#         code paths; not used directly for PDP computations.
-
-#     feature_names:
-#         Optional list/sequence of feature names (length must equal n_features).
-#         If provided, aggregations include a "feature_name" column.
-
-#     data_source:
-#         Which outer split to compute PDPs on in step (1):
-#           - "train": compute PDP on outer-train split only
-#           - "test":  compute PDP on outer-test split only
-#           - "both":  compute PDP on both outer-train and outer-test splits
-#         Note: step (2) aggregates a single source at a time; if you pass "both",
-#         this pipeline will aggregate "test" by default unless you extend it.
-
-#     grid_resolution:
-#         Requested number of grid points for continuous features in
-#         `PartialDependenceDisplay.from_estimator`. Low-cardinality features may
-#         produce fewer grid points (handled via NaN padding).
-
-#     percentiles:
-#         Percentile range used by scikit-learn to define PDP grid boundaries
-#         (e.g., (0.05, 0.95) trims extremes). Use (0.0, 1.0) to include full range.
-
-#     centered:
-#         Passed to `PartialDependenceDisplay.from_estimator`. If True, centers
-#         the PDP curves.
-
-#     n_points:
-#         Number of points used for the canonical grid when a feature is treated
-#         as continuous in step (3). Larger values produce smoother mean curves.
-
-#     discrete_threshold:
-#         If a feature has <= this many unique x-values across folds, treat it
-#         as discrete in step (3) and use the observed unique values as the
-#         canonical grid (instead of creating a dense linspace).
-
-#     scaler_bundle:
-#         Optional object (as returned by your `load_all_results`) containing the
-#         scaler needed to invert standardized/scaled feature values.
-#         If provided, step (4) runs and adds `grid_value_raw` to each DataFrame
-#         in `pdp_agg`. If None, step (4) is skipped.
-
-#     Returns
-#     -------
-#     all_results:
-#         Same nested-CV results dict as input, mutated in-place with PDP arrays
-#         added per fold.
-
-#     pdp_agg:
-#         Dict mapping:
-#           - pdp_agg[model_name] = long-format PDP points across folds
-#           - pdp_agg[f"{model_name}_mean_pdp"] = mean/std PDP curves per feature
-#         If scaler_bundle is provided, each DataFrame also includes:
-#           - grid_value_raw (inverse-transformed grid values)
-
-#     Notes
-#     -----
-#     - Recommended pattern: load scaler_bundle outside this pipeline (I/O),
-#       then pass the in-memory object into `run_pdp_pipeline`.
-#     """
-
-#     # Decide how many pipeline stages we will run (3 base + optional raw-grid stage).
-#     n_steps = 4 if scaler_bundle is not None else 3
-
-#     # Create a progress bar for the pipeline stages.
-#     steps = tqdm(total=n_steps, desc="PDP pipeline", unit="step")
-
-#     # ---- Step 1: compute per-fold PDP arrays and store them in all_results ----
-#     steps.set_description("PDP pipeline: compute PDP per fold")
-#     all_results = compute_pdp_nested_cv(
-#         all_results=all_results,
-#         X=X,
-#         y=y,
-#         grid_resolution=grid_resolution,
-#         percentiles=percentiles,
-#         data_source=data_source,
-#         centered=centered,
-#     )
-#     steps.update(1)
-
-#     # ---- Step 2: aggregate per-fold PDP arrays into long-format DataFrames ----
-#     steps.set_description("PDP pipeline: aggregate folds")
-#     agg_source = data_source if data_source in ("train", "test") else "test"
-#     pdp_agg = aggregate_pdp_nested_cv(
-#         all_results=all_results,
-#         source=agg_source,
-#         feature_names=feature_names,
-#     )
-#     steps.update(1)
-
-#     # ---- Step 3: compute mean/std PDP curves across folds per feature ----
-#     steps.set_description("PDP pipeline: mean/std curves")
-#     pdp_agg = add_interpolated_mean_pdp_to_agg(
-#         pdp_agg=pdp_agg,
-#         n_points=n_points,
-#         discrete_threshold=discrete_threshold,
-#     )
-#     steps.update(1)
-
-#     # ---- Step 4 (optional): add inverse-transformed raw grid values ----
-#     if scaler_bundle is not None:
-#         steps.set_description("PDP pipeline: add raw grid values")
-#         pdp_agg = add_grid_value_raw_to_pdp_agg(
-#             pdp_agg=pdp_agg,
-#             scaler_bundle=scaler_bundle,
-#         )
-#         steps.update(1)
-
-#     # Close the progress bar cleanly.
-#     steps.close()
-
-#     # Return both the enriched all_results and the aggregated DataFrames.
-#     return all_results, pdp_agg
-
-# def plot_all_mean_pdp_with_std(
-#     pdp_agg: Mapping[str, Any],
-#     model_name: str | Sequence[str] | None = None,  # None -> all models found in pdp_agg
-#     *,
-#     x_scale: Literal["scaled", "raw"] = "scaled",
-#     figsize: tuple[float, float] = (8, 4),
-#     font_size: int = 12,
-#     y_lim: Optional[tuple[float, float]] = None,
-#     line_color: str = "darkblue",
-#     fill_color: str = "blue",
-#     sns_style: str = "whitegrid",
-#     fill_alpha: float = 0.2,
-#     fill_edgecolor: Optional[str] = None,
-#     method_alias: Mapping[str, str] | None = None,  # NEW
-# ) -> None:
-#     """
-#     Plot mean PDP ± std for ALL features, for one or more models.
-
-#     (Same behavior as before; `method_alias` only affects the displayed model name in the title.)
-#     """
-
-#     if method_alias is None:
-#         method_alias = {}
-
-#     # -------------------------
-#     # Decide which models to plot
-#     # -------------------------
-#     suffix = "_mean_pdp"
-#     available_models = sorted(
-#         [k[: -len(suffix)] for k in pdp_agg.keys() if isinstance(k, str) and k.endswith(suffix)]
-#     )
-
-#     if model_name is None:
-#         selected_models = available_models
-#         if not selected_models:
-#             raise KeyError(
-#                 "No '*_mean_pdp' keys found in pdp_agg. "
-#                 "Make sure you called add_interpolated_mean_pdp_to_agg first."
-#             )
-#     elif isinstance(model_name, str):
-#         selected_models = [model_name]
-#     else:
-#         selected_models = list(model_name)
-
-#     # Validate requested models exist
-#     missing = [m for m in selected_models if f"{m}{suffix}" not in pdp_agg]
-#     if missing:
-#         raise KeyError(
-#             f"Model(s) not found in pdp_agg mean PDP keys: {missing}. "
-#             f"Available: {available_models}"
-#         )
-
-#     # Choose x column + xlabel based on requested x_scale
-#     if x_scale == "raw":
-#         x_col = "grid_value_raw"
-#         x_label = "Feature value (raw)"
-#     else:
-#         x_col = "grid_value"
-#         x_label = "Feature value (scaled)"
-
-#     sns.set(style=sns_style)
-
-#     # -------------------------
-#     # Plot: for each model, for each feature -> one figure
-#     # -------------------------
-#     for m in selected_models:
-#         mean_key = f"{m}{suffix}"
-#         df = pdp_agg[mean_key]
-
-#         if df is None or (hasattr(df, "empty") and df.empty):
-#             raise ValueError(f"No mean PDP data available for model '{m}' (key: '{mean_key}').")
-
-#         if not isinstance(df, pd.DataFrame):
-#             raise TypeError(f"pdp_agg['{mean_key}'] must be a pandas DataFrame; got {type(df)}")
-
-#         required_cols = {"feature_idx", "grid_value", "mean_pdp", "std_pdp"}
-#         missing_cols = required_cols - set(df.columns)
-#         if missing_cols:
-#             raise KeyError(
-#                 f"Missing required columns in pdp_agg['{mean_key}']: {sorted(missing_cols)}. "
-#                 f"Found columns: {list(df.columns)}"
-#             )
-
-#         if x_scale == "raw" and x_col not in df.columns:
-#             raise KeyError(
-#                 f"You requested x_scale='raw' but '{x_col}' is missing in pdp_agg['{mean_key}']. "
-#                 f"Run add_grid_value_raw_to_pdp_agg(...) on the mean-PDP tables first."
-#             )
-
-#         has_feature_name = "feature_name" in df.columns
-#         model_display = method_alias.get(m, m)
-
-#         for feature_id, df_feat in df.groupby("feature_idx"):
-#             df_feat = df_feat.sort_values(x_col)
-
-#             if has_feature_name:
-#                 feat_label = str(df_feat["feature_name"].iloc[0])
-#             else:
-#                 feat_label = f"feature_idx={feature_id}"
-
-#             plt.figure(figsize=figsize)
-
-#             ax = sns.lineplot(
-#                 data=df_feat,
-#                 x=x_col,
-#                 y="mean_pdp",
-#                 marker="o",
-#                 color=line_color,
-#             )
-
-#             x = df_feat[x_col].to_numpy()
-#             mean = df_feat["mean_pdp"].to_numpy()
-#             std = df_feat["std_pdp"].to_numpy()
-
-#             ax.fill_between(
-#                 x,
-#                 mean - std,
-#                 mean + std,
-#                 alpha=fill_alpha,
-#                 color=fill_color,
-#                 edgecolor=fill_edgecolor,
-#             )
-
-#             ax.set_xlabel(x_label, fontsize=font_size, fontweight="bold")
-#             ax.set_ylabel("Predicted probability", fontsize=font_size, fontweight="bold")
-#             ax.set_title(
-#                 f"Mean PDP ± std for {feat_label}\nModel: {model_display}",
-#                 fontsize=font_size + 2,
-#                 fontweight="bold",
-#             )
-
-#             if y_lim is not None:
-#                 ax.set_ylim(*y_lim)
-
-#             ax.tick_params(axis="both", labelsize=font_size)
-#             for label in ax.get_xticklabels() + ax.get_yticklabels():
-#                 label.set_fontweight("bold")
-
-#             plt.tight_layout()
-#             plt.show()
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------
