@@ -102,84 +102,84 @@ def sample_one_row_per_group(
     return X_sub, y_sub, groups_sub, chosen_indices
 
 
-from numpy.typing import NDArray
-Bundle = Dict[str, Any]
-def prepare_training_bundle(
-    bundle: Bundle,
-    n_features: Optional[int] = None,
-    keep_features: Optional[Sequence[str]] = None,
-    *,
-    strict: bool = True,
-    dedupe: bool = True,
-    copy_bundle: bool = True,
-) -> Bundle:
-    """
-    Return a training-ready bundle with flexible feature selection.
+# from numpy.typing import NDArray
+# Bundle = Dict[str, Any]
+# def prepare_training_bundle(
+#     bundle: Bundle,
+#     n_features: Optional[int] = None,
+#     keep_features: Optional[Sequence[str]] = None,
+#     *,
+#     strict: bool = True,
+#     dedupe: bool = True,
+#     copy_bundle: bool = True,
+# ) -> Bundle:
+#     """
+#     Return a training-ready bundle with flexible feature selection.
 
-    Selection precedence:
-      1) keep_features (exact names)
-      2) n_features (first k)
-      3) if both None -> return all features (no reduction)
+#     Selection precedence:
+#       1) keep_features (exact names)
+#       2) n_features (first k)
+#       3) if both None -> return all features (no reduction)
 
-    Args:
-      n_features: keep first n feature columns (prefix mode)
-      keep_features: keep these feature names (order preserved)
-      strict: if True, error on missing keep_features; else drop missing
-      dedupe: if True, de-duplicate keep_features while preserving order
-      copy_bundle: if True, return shallow copy; if False, may return original bundle when unchanged
-    """
-    if "X_raw" not in bundle or "feature_names" not in bundle:
-        raise KeyError("bundle must contain 'X_raw' and 'feature_names'")
+#     Args:
+#       n_features: keep first n feature columns (prefix mode)
+#       keep_features: keep these feature names (order preserved)
+#       strict: if True, error on missing keep_features; else drop missing
+#       dedupe: if True, de-duplicate keep_features while preserving order
+#       copy_bundle: if True, return shallow copy; if False, may return original bundle when unchanged
+#     """
+#     if "X_raw" not in bundle or "feature_names" not in bundle:
+#         raise KeyError("bundle must contain 'X_raw' and 'feature_names'")
 
-    X: NDArray[np.floating] = bundle["X_raw"]
-    feature_names: List[str] = list(bundle["feature_names"])
+#     X: NDArray[np.floating] = bundle["X_raw"]
+#     feature_names: List[str] = list(bundle["feature_names"])
 
-    if X.ndim != 2:
-        raise ValueError(f"X_raw must be 2D, got shape {X.shape}")
-    if X.shape[1] != len(feature_names):
-        raise ValueError(f"Mismatch: X has {X.shape[1]} cols but feature_names has {len(feature_names)}")
+#     if X.ndim != 2:
+#         raise ValueError(f"X_raw must be 2D, got shape {X.shape}")
+#     if X.shape[1] != len(feature_names):
+#         raise ValueError(f"Mismatch: X has {X.shape[1]} cols but feature_names has {len(feature_names)}")
 
-    # If nothing requested: return as-is (or shallow copy)
-    if keep_features is None and n_features is None:
-        return dict(bundle) if copy_bundle else bundle
+#     # If nothing requested: return as-is (or shallow copy)
+#     if keep_features is None and n_features is None:
+#         return dict(bundle) if copy_bundle else bundle
 
-    # Avoid ambiguous intent
-    if keep_features is not None and n_features is not None:
-        raise ValueError("Provide either keep_features OR n_features, not both.")
+#     # Avoid ambiguous intent
+#     if keep_features is not None and n_features is not None:
+#         raise ValueError("Provide either keep_features OR n_features, not both.")
 
-    out = dict(bundle)  # shallow copy
+#     out = dict(bundle)  # shallow copy
 
-    # ---- selection by names ----
-    if keep_features is not None:
-        if len(keep_features) == 0:
-            raise ValueError("keep_features must be non-empty")
+#     # ---- selection by names ----
+#     if keep_features is not None:
+#         if len(keep_features) == 0:
+#             raise ValueError("keep_features must be non-empty")
 
-        if dedupe:
-            seen = set()
-            keep_features = [n for n in keep_features if not (n in seen or seen.add(n))]
+#         if dedupe:
+#             seen = set()
+#             keep_features = [n for n in keep_features if not (n in seen or seen.add(n))]
 
-        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+#         name_to_idx = {n: i for i, n in enumerate(feature_names)}
 
-        missing = [n for n in keep_features if n not in name_to_idx]
-        if missing and strict:
-            raise KeyError(f"Requested features not found: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+#         missing = [n for n in keep_features if n not in name_to_idx]
+#         if missing and strict:
+#             raise KeyError(f"Requested features not found: {missing[:10]}{'...' if len(missing) > 10 else ''}")
 
-        idxs = [name_to_idx[n] for n in keep_features if n in name_to_idx]
-        if len(idxs) == 0:
-            raise ValueError("No features selected (all requested features missing).")
+#         idxs = [name_to_idx[n] for n in keep_features if n in name_to_idx]
+#         if len(idxs) == 0:
+#             raise ValueError("No features selected (all requested features missing).")
 
-        out["X_raw"] = X[:, idxs]
-        out["feature_names"] = [feature_names[i] for i in idxs]
-        return out
+#         out["X_raw"] = X[:, idxs]
+#         out["feature_names"] = [feature_names[i] for i in idxs]
+#         return out
 
-    # ---- selection by prefix (n_features) ----
-    if n_features < 0:
-        raise ValueError("n_features must be >= 0")
+#     # ---- selection by prefix (n_features) ----
+#     if n_features < 0:
+#         raise ValueError("n_features must be >= 0")
 
-    k = min(n_features, X.shape[1])
-    out["X_raw"] = X[:, :k]
-    out["feature_names"] = feature_names[:k]
-    return out
+#     k = min(n_features, X.shape[1])
+#     out["X_raw"] = X[:, :k]
+#     out["feature_names"] = feature_names[:k]
+#     return out
 
 
 # ============================================================
@@ -3081,3 +3081,441 @@ def make_synthetic_feature_selection_dataset(
 #     feature_names=collinear_pruned['feature_names'],
 #     cfg=RANK_SELECT_PIPELINE_CFG,
 # )
+
+
+
+
+
+
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
+from sklearn.model_selection._split import BaseCrossValidator  # for typing
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping
+
+
+from typing import Any, Dict, List, Optional, Sequence
+import numpy as np
+
+
+
+from typing import Any, Dict, List, Optional, Sequence
+import numpy as np
+
+
+# ---------------------------------------------------------------------
+# Nested cross-validation feature selection 
+# ---------------------------------------------------------------------
+def make_outer_inner_cv(
+    model_selection: str,
+    n_outer_splits: int,
+    n_inner_splits: int,
+    outer_trial_idx: int,
+) -> Tuple[BaseCrossValidator, BaseCrossValidator]:
+    """
+    Create outer and inner CV splitters based on a model_selection string.
+
+    Parameters
+    ----------
+    model_selection : str
+        Name of the CV strategy. Supported:
+        - "StratifiedKFold"
+        - "StratifiedGroupKFold"
+    n_outer_splits : int
+        Number of folds for the outer CV.
+    n_inner_splits : int
+        Number of folds for the inner CV (Optuna).
+    outer_trial_idx : int
+        Index of the outer trial (used for random_state).
+
+    Returns
+    -------
+    outer_cv : BaseCrossValidator
+    inner_cv : BaseCrossValidator
+    """
+    if model_selection == "StratifiedKFold":
+        cv_cls = StratifiedKFold
+    elif model_selection == "StratifiedGroupKFold":
+        cv_cls = StratifiedGroupKFold
+    else:
+        raise ValueError(
+            f"Unsupported model_selection='{model_selection}'. "
+            "Use 'StratifiedKFold' or 'StratifiedGroupKFold'."
+        )
+
+    outer_cv = cv_cls(
+        n_splits=n_outer_splits,
+        shuffle=True,
+        random_state=outer_trial_idx,
+    )
+
+    inner_cv = cv_cls(
+        n_splits=n_inner_splits,
+        shuffle=True,
+        random_state=outer_trial_idx,
+    )
+
+    return outer_cv, inner_cv
+
+
+def build_nested_cv_splits(
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: Dict[str, Any],
+    groups: Optional[np.ndarray] = None,
+    model_selection: str = "StratifiedKFold",
+) -> List[Dict[str, Any]]:
+    """
+    Build and return a reusable **nested cross-validation split plan**.
+
+    This function creates a deterministic “plan” of indices that defines:
+      - an **outer CV** split (train vs test), repeated `num_trials` times, and
+      - for each outer-train split, an **inner CV** split (train vs validation)
+        generated strictly within the outer-train portion.
+
+    The key idea is that the returned split plan can be reused across multiple
+    downstream steps (e.g., feature selection, ranking, VIF pruning, model training),
+    ensuring that every pipeline stage uses the exact same train/test partitions.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Full feature matrix of shape (n_samples, n_features). Used only to drive
+        the CV splitters (i.e., shapes); the returned indices always refer to rows
+        of this original X.
+    y : np.ndarray
+        Target vector of shape (n_samples,). Used for stratification (and for
+        group-aware stratification where supported).
+    cfg : Dict[str, Any]
+        Configuration dictionary containing CV settings under `cfg["cv"]`:
+          - "num_trials": int
+              Number of repeated outer-CV runs (each run uses a different random seed).
+          - "n_outer_splits": int
+              Number of folds in the outer CV.
+          - "n_inner_splits": int
+              Number of folds in the inner CV.
+    groups : Optional[np.ndarray], default=None
+        Optional group labels of shape (n_samples,). Required if
+        `model_selection="StratifiedGroupKFold"`. When provided, both outer and
+        inner splits are group-aware (no group leakage between train and test/val).
+    model_selection : str, default="StratifiedKFold"
+        Strategy name used to construct the outer and inner CV splitters via
+        `make_outer_inner_cv(...)`. Supported options:
+          - "StratifiedKFold"
+          - "StratifiedGroupKFold" (requires `groups`)
+
+    Returns
+    -------
+    split_plan : List[Dict[str, Any]]
+        A list of dictionaries, one per **outer fold** across all trials
+        (length = num_trials * n_outer_splits). Each dictionary contains:
+
+        Outer-fold metadata
+        - "trial": int
+            Outer repetition index (0-based).
+        - "outer_fold": int
+            Outer fold index within the trial (1-based in this implementation).
+        - "model_selection": str
+            CV strategy used.
+
+        Outer-fold indices (GLOBAL indices into X/y)
+        - "outer_train_idx": np.ndarray
+            1D integer array of row indices used for outer training.
+        - "outer_test_idx": np.ndarray
+            1D integer array of row indices used for outer testing.
+
+        Inner splits (GLOBAL indices, all subsets of outer_train_idx)
+        - "inner_splits": List[Dict[str, Any]]
+            List of length `n_inner_splits`. Each item contains:
+              - "inner_fold": int
+                  Inner fold index (1-based).
+              - "inner_train_idx": np.ndarray
+                  1D integer array of GLOBAL row indices for inner training.
+              - "inner_val_idx": np.ndarray
+                  1D integer array of GLOBAL row indices for inner validation.
+
+        Convenience label slices (aligned to the outer split)
+        - "y_outer_train": np.ndarray
+            y values for outer_train_idx (same order as outer_train_idx).
+        - "y_outer_test": np.ndarray
+            y values for outer_test_idx (same order as outer_test_idx).
+
+    Notes
+    -----
+    - Inner CV splits are generated **only** from the outer-train portion.
+      The outer-test data never influences inner splitting.
+    - The indices stored in the plan are **GLOBAL indices** into the original X/y.
+      This makes it easy to slice any derived matrices later (scaled X, pruned X, etc.)
+      as long as rows correspond to the original sample ordering.
+    - Group-aware behavior:
+        If `groups` is provided and `model_selection="StratifiedGroupKFold"`,
+        each group will appear in only one side of a split (no leakage).
+    - This function assumes you already have `make_outer_inner_cv(...)` implemented
+      and that it returns `(outer_cv, inner_cv)` objects exposing a scikit-learn-like
+      `.split(X, y[, groups])` generator.
+    """
+
+    cv_cfg = cfg["cv"]
+    NUM_TRIALS = cv_cfg["num_trials"]
+    n_outer_splits = cv_cfg["n_outer_splits"]
+    n_inner_splits = cv_cfg["n_inner_splits"]
+
+    if model_selection == "StratifiedGroupKFold" and groups is None:
+        raise ValueError(
+            "model_selection='StratifiedGroupKFold' but groups is None. "
+            "Provide a groups array or use 'StratifiedKFold'."
+        )
+
+    split_plan: List[Dict[str, Any]] = []
+    cv_tracker = 0
+    total_outer_folds = NUM_TRIALS * n_outer_splits
+
+    for trial_idx in range(NUM_TRIALS):
+        outer_cv, inner_cv = make_outer_inner_cv(
+            model_selection=model_selection,
+            n_outer_splits=n_outer_splits,
+            n_inner_splits=n_inner_splits,
+            outer_trial_idx=trial_idx,
+        )
+
+        # Outer splits (global indices)
+        if groups is not None:
+            outer_splits = outer_cv.split(X, y, groups)
+        else:
+            outer_splits = outer_cv.split(X, y)
+
+        outer_fold_idx = 0
+        for outer_train_idx, outer_test_idx in outer_splits:
+            cv_tracker += 1
+            outer_fold_idx += 1
+
+            print(
+                f"Outer fold {cv_tracker}/{total_outer_folds} "
+                f"(trial {trial_idx}, fold {outer_fold_idx})"
+            )
+
+            # Build inner splits on the OUTER-TRAIN subset
+            X_train = X[outer_train_idx]
+            y_train = y[outer_train_idx]
+            groups_train = groups[outer_train_idx] if groups is not None else None
+
+            if groups_train is not None:
+                inner_iter = inner_cv.split(X_train, y_train, groups_train)
+            else:
+                inner_iter = inner_cv.split(X_train, y_train)
+
+            inner_splits: List[Dict[str, Any]] = []
+            inner_fold_idx = 0
+
+            for inner_train_local, inner_val_local in inner_iter:
+                inner_fold_idx += 1
+
+                # Map local indices (into X_train) back to GLOBAL indices (into X)
+                inner_train_idx = outer_train_idx[inner_train_local]
+                inner_val_idx = outer_train_idx[inner_val_local]
+
+                inner_splits.append(
+                    {
+                        "inner_fold": inner_fold_idx,
+                        "inner_train_idx": inner_train_idx,
+                        "inner_val_idx": inner_val_idx,
+                    }
+                )
+
+            split_plan.append(
+                {
+                    "trial": trial_idx,
+                    "outer_fold": outer_fold_idx,
+                    "model_selection": model_selection,
+                    "outer_train_idx": outer_train_idx,
+                    "outer_test_idx": outer_test_idx,
+                    "inner_splits": inner_splits,
+                    "y_outer_train": y_train,
+                    "y_outer_test": y[outer_test_idx],
+                }
+            )
+
+    return split_plan
+
+
+
+
+
+
+
+
+
+def nested_cv_balanced_rank_select(
+    nested_splits: List[Dict[str, Any]],
+    X: np.ndarray,
+    y: np.ndarray,
+    feature_names: Sequence[str],
+    rank_select_cfg: Dict[str, Any],
+    groups: Optional[np.ndarray] = None,
+    rank_select_out_key: str = "rank_select_out",
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Attach balanced permutation rank-select outputs to each OUTER fold
+    in a nested CV split plan.
+
+    For each fold in `nested_splits`, this function:
+
+      1) slices the OUTER-TRAIN portion of X / y / groups
+      2) runs `balanced_permutation_rank_select_pipeline(...)` on that
+         outer-train subset only
+      3) stores the full pipeline output back into the fold dictionary
+
+    This function does NOT use the inner splits directly. The inner CV used by
+    the rank-select pipeline is controlled internally by `rank_select_cfg`
+    (for example via cfg["defaults"]["n_splits"]).
+
+    Parameters
+    ----------
+    nested_splits : List[Dict[str, Any]]
+        Nested CV split plan. Each fold dict must contain:
+        - "outer_train_idx"
+        and may contain:
+        - "trial"
+        - "outer_fold"
+
+    X : np.ndarray of shape (n_samples, n_features)
+        Full feature matrix. Each fold slices rows using outer_train_idx.
+
+    y : np.ndarray of shape (n_samples,)
+        Full target vector aligned row-wise with X.
+
+    feature_names : Sequence[str]
+        Feature names aligned to the columns of X.
+
+    rank_select_cfg : Dict[str, Any]
+        Configuration dictionary passed directly into
+        `balanced_permutation_rank_select_pipeline(...)`.
+
+    groups : Optional[np.ndarray] of shape (n_samples,), default=None
+        Optional group labels aligned row-wise with X. If provided, each fold
+        slices the outer-train rows and passes them into the rank-select pipeline.
+
+    rank_select_out_key : str, default="rank_select_out"
+        Key used to store the rank-select pipeline output inside each fold dict.
+
+    verbose : bool, default=True
+        If True, print per-fold progress messages.
+
+    Returns
+    -------
+    nested_splits : List[Dict[str, Any]]
+        The same list object, mutated in-place with rank-select outputs attached.
+
+    Stored Output
+    -------------
+    For each fold, this function stores:
+
+        fold[rank_select_out_key] = rank_select_out
+
+    where `rank_select_out` is the full output of
+    `balanced_permutation_rank_select_pipeline(...)`, typically including:
+    - "final_by_model"
+    - "y"
+
+    Notes
+    -----
+    - Feature selection is run using OUTER-TRAIN data only.
+    - This preserves nested-CV discipline: outer-test rows are not used during
+      feature selection for that fold.
+    - The function stores the full per-fold output so downstream steps can
+      inspect:
+        - selected feature names
+        - selected feature indices
+        - stage histories
+        - by-stage results
+        - outputs for multiple models
+    """
+    # -----------------------------
+    # 1) Basic validation
+    # -----------------------------
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D; got shape {X.shape}.")
+    if y.ndim != 1:
+        raise ValueError(f"y must be 1D; got shape {y.shape}.")
+    if X.shape[0] != y.shape[0]:
+        raise ValueError(
+            f"X and y must have the same number of rows; got {X.shape[0]} and {y.shape[0]}."
+        )
+
+    feature_names_list = list(feature_names)
+    if len(feature_names_list) != X.shape[1]:
+        raise ValueError(
+            f"feature_names length ({len(feature_names_list)}) must match "
+            f"X.shape[1] ({X.shape[1]})."
+        )
+
+    if groups is not None:
+        groups = np.asarray(groups)
+        if groups.ndim != 1:
+            raise ValueError(f"groups must be 1D; got shape {groups.shape}.")
+        if len(groups) != X.shape[0]:
+            raise ValueError(
+                f"groups length ({len(groups)}) must match X.shape[0] ({X.shape[0]})."
+            )
+
+    if not isinstance(rank_select_cfg, dict):
+        raise TypeError("rank_select_cfg must be a dictionary.")
+
+    if "defaults" not in rank_select_cfg:
+        raise KeyError("rank_select_cfg must contain a 'defaults' key.")
+    if "models" not in rank_select_cfg:
+        raise KeyError("rank_select_cfg must contain a 'models' key.")
+    if "stages" not in rank_select_cfg:
+        raise KeyError("rank_select_cfg must contain a 'stages' key.")
+
+    # -----------------------------
+    # 2) Per outer fold
+    # -----------------------------
+    for i, fold in enumerate(nested_splits):
+        if "outer_train_idx" not in fold:
+            raise KeyError(f"Fold {i} is missing required key 'outer_train_idx'.")
+
+        trial = fold.get("trial", None)
+        outer_fold = fold.get("outer_fold", None)
+
+        outer_train_idx = np.asarray(fold["outer_train_idx"], dtype=int)
+
+        X_train = X[outer_train_idx]
+        y_train = y[outer_train_idx]
+        groups_train = groups[outer_train_idx] if groups is not None else None
+
+        if verbose:
+            print(
+                f"[RANK_SELECT] trial={trial} outer_fold={outer_fold} | "
+                f"X_train={X_train.shape} | n_models={len(rank_select_cfg['models'])}"
+            )
+
+        rank_select_out = balanced_permutation_rank_select_pipeline(
+            X=X_train,
+            y=y_train,
+            groups=groups_train,
+            feature_names=feature_names_list,
+            cfg=rank_select_cfg,
+        )
+
+        fold[rank_select_out_key] = rank_select_out
+
+        if verbose:
+            final_by_model = rank_select_out["final_by_model"]
+            summary_parts = []
+
+            for model_name, model_out in final_by_model.items():
+                n_selected = len(model_out["feature_names_selected"])
+                summary_parts.append(f"{model_name}: {n_selected} feats")
+
+            summary_text = " | ".join(summary_parts)
+            print(
+                f"[DONE] trial={trial} outer_fold={outer_fold} | {summary_text}"
+            )
+
+    return nested_splits
+
+
