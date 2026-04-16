@@ -7275,7 +7275,7 @@ def plot_all_mean_pdp_with_std(
     #     x_label = "Feature value (scaled)"
 
     x_col = "grid_value"
-    x_label = "Feature value (scaled)"
+    x_label = "Feature value"
     sns.set(style=sns_style)
 
     # -------------------------
