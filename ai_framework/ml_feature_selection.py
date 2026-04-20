@@ -21,19 +21,14 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestRegressor
 
-
+from numpy.typing import NDArray
+Bundle = Dict[str, Any]
 RankingMetric = Literal[
     "auto",
     "mean_normalized_rank",
     "mean_importance",
 ]
 
-
-RankingMetric = Literal[
-    "auto",
-    "mean_normalized_rank",
-    "mean_importance",
-]
 
 # ============================================================
 # Shared data sampling function 
@@ -102,89 +97,122 @@ def sample_one_row_per_group(
     return X_sub, y_sub, groups_sub, chosen_indices
 
 
-# from numpy.typing import NDArray
-# Bundle = Dict[str, Any]
-# def prepare_training_bundle(
-#     bundle: Bundle,
-#     n_features: Optional[int] = None,
-#     keep_features: Optional[Sequence[str]] = None,
-#     *,
-#     strict: bool = True,
-#     dedupe: bool = True,
-#     copy_bundle: bool = True,
-# ) -> Bundle:
-#     """
-#     Return a training-ready bundle with flexible feature selection.
-
-#     Selection precedence:
-#       1) keep_features (exact names)
-#       2) n_features (first k)
-#       3) if both None -> return all features (no reduction)
-
-#     Args:
-#       n_features: keep first n feature columns (prefix mode)
-#       keep_features: keep these feature names (order preserved)
-#       strict: if True, error on missing keep_features; else drop missing
-#       dedupe: if True, de-duplicate keep_features while preserving order
-#       copy_bundle: if True, return shallow copy; if False, may return original bundle when unchanged
-#     """
-#     if "X_raw" not in bundle or "feature_names" not in bundle:
-#         raise KeyError("bundle must contain 'X_raw' and 'feature_names'")
-
-#     X: NDArray[np.floating] = bundle["X_raw"]
-#     feature_names: List[str] = list(bundle["feature_names"])
-
-#     if X.ndim != 2:
-#         raise ValueError(f"X_raw must be 2D, got shape {X.shape}")
-#     if X.shape[1] != len(feature_names):
-#         raise ValueError(f"Mismatch: X has {X.shape[1]} cols but feature_names has {len(feature_names)}")
-
-#     # If nothing requested: return as-is (or shallow copy)
-#     if keep_features is None and n_features is None:
-#         return dict(bundle) if copy_bundle else bundle
-
-#     # Avoid ambiguous intent
-#     if keep_features is not None and n_features is not None:
-#         raise ValueError("Provide either keep_features OR n_features, not both.")
-
-#     out = dict(bundle)  # shallow copy
-
-#     # ---- selection by names ----
-#     if keep_features is not None:
-#         if len(keep_features) == 0:
-#             raise ValueError("keep_features must be non-empty")
-
-#         if dedupe:
-#             seen = set()
-#             keep_features = [n for n in keep_features if not (n in seen or seen.add(n))]
-
-#         name_to_idx = {n: i for i, n in enumerate(feature_names)}
-
-#         missing = [n for n in keep_features if n not in name_to_idx]
-#         if missing and strict:
-#             raise KeyError(f"Requested features not found: {missing[:10]}{'...' if len(missing) > 10 else ''}")
-
-#         idxs = [name_to_idx[n] for n in keep_features if n in name_to_idx]
-#         if len(idxs) == 0:
-#             raise ValueError("No features selected (all requested features missing).")
-
-#         out["X_raw"] = X[:, idxs]
-#         out["feature_names"] = [feature_names[i] for i in idxs]
-#         return out
-
-#     # ---- selection by prefix (n_features) ----
-#     if n_features < 0:
-#         raise ValueError("n_features must be >= 0")
-
-#     k = min(n_features, X.shape[1])
-#     out["X_raw"] = X[:, :k]
-#     out["feature_names"] = feature_names[:k]
-#     return out
-
-
 # ============================================================
 # Shared validation helpers
 # ============================================================
+
+def prepare_training_bundle(
+    bundle: Bundle,
+    n_features: Optional[int] = None,
+    keep_features: Optional[Sequence[str]] = None,
+    *,
+    feature_keys: Sequence[str] = ("X_raw",),
+    feature_name_key: str = "feature_names",
+    strict: bool = True,
+    dedupe: bool = True,
+    copy_bundle: bool = True,
+) -> Bundle:
+    """
+    Return a training-ready bundle with flexible feature selection.
+
+    Selection precedence:
+      1) keep_features (exact names)
+      2) n_features (first k)
+      3) if both None -> return all features (no reduction)
+
+    Args:
+      n_features:
+          Keep first n feature columns (prefix mode).
+      keep_features:
+          Keep these feature names (order preserved).
+      feature_keys:
+          Bundle keys whose 2D matrices should be column-subset using the
+          same selected feature indices. Defaults to ("X_raw",).
+          Example: ("X_raw", "combined_X_scaled")
+      feature_name_key:
+          Bundle key containing the feature names aligned to the columns of
+          each matrix in feature_keys. Defaults to "feature_names".
+      strict:
+          If True, error on missing keep_features; else drop missing.
+      dedupe:
+          If True, de-duplicate keep_features while preserving order.
+      copy_bundle:
+          If True, return shallow copy; if False, may return original bundle
+          when unchanged.
+    """
+    if not feature_keys:
+        raise ValueError("feature_keys must be non-empty")
+
+    if feature_name_key not in bundle:
+        raise KeyError(f"bundle must contain {feature_name_key!r}")
+
+    missing_keys = [k for k in feature_keys if k not in bundle]
+    if missing_keys:
+        raise KeyError(f"bundle missing required feature matrix keys: {missing_keys}")
+
+    feature_names: List[str] = list(bundle[feature_name_key])
+    matrices = {k: bundle[k] for k in feature_keys}
+
+    # Validate matrices
+    n_cols_expected = len(feature_names)
+    for key, X in matrices.items():
+        if X.ndim != 2:
+            raise ValueError(f"{key} must be 2D, got shape {X.shape}")
+        if X.shape[1] != n_cols_expected:
+            raise ValueError(
+                f"Mismatch for {key}: has {X.shape[1]} cols but "
+                f"{feature_name_key} has {n_cols_expected}"
+            )
+
+    # If nothing requested: return as-is (or shallow copy)
+    if keep_features is None and n_features is None:
+        return dict(bundle) if copy_bundle else bundle
+
+    # Avoid ambiguous intent
+    if keep_features is not None and n_features is not None:
+        raise ValueError("Provide either keep_features OR n_features, not both.")
+
+    out = dict(bundle) if copy_bundle else bundle
+
+    # ---- selection by names ----
+    if keep_features is not None:
+        if len(keep_features) == 0:
+            raise ValueError("keep_features must be non-empty")
+
+        if dedupe:
+            seen = set()
+            keep_features = [n for n in keep_features if not (n in seen or seen.add(n))]
+
+        name_to_idx = {n: i for i, n in enumerate(feature_names)}
+
+        missing = [n for n in keep_features if n not in name_to_idx]
+        if missing and strict:
+            suffix = "..." if len(missing) > 10 else ""
+            raise KeyError(f"Requested features not found: {missing[:10]}{suffix}")
+
+        idxs = [name_to_idx[n] for n in keep_features if n in name_to_idx]
+        if len(idxs) == 0:
+            raise ValueError("No features selected (all requested features missing).")
+
+    # ---- selection by prefix (n_features) ----
+    else:
+        if n_features is None:
+            raise ValueError("Internal error: expected n_features to be set")
+        if n_features < 0:
+            raise ValueError("n_features must be >= 0")
+
+        k = min(n_features, n_cols_expected)
+        idxs = list(range(k))
+
+    # Apply the same column selection to every requested matrix key
+    for key in feature_keys:
+        out[key] = matrices[key][:, idxs]
+
+    out[feature_name_key] = [feature_names[i] for i in idxs]
+
+    return out
+
+
 
 def _validate_X_y(
     X: np.ndarray,

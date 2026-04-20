@@ -33,8 +33,6 @@ from sklearn.metrics import (
 )
 
 
-
-
 def check_bundle_alignment_for_preprocessing(
     bundle_orig: Dict[str, Any],
     bundle: Dict[str, Any],
@@ -395,138 +393,152 @@ def preprocessing_transfer_pipeline(
     return bundle
 
 
-
 def add_external_predictions_to_results(
     all_results: Dict[str, List[Dict[str, Any]]],
-    external_bundle: Dict[str, Any],
+    model_data_dict: Dict[str, pd.DataFrame],
     *,
-    x_key: str = "combined_X_raw",
-    y_key: str = "combined_y",
+    y_col: Optional[str] = None,
     external_tag: str = "external",
+    feature_names_key: str = "feature_names_used",
     strict_features: bool = True,
+    inplace: bool = True,
+    warn_on_skip: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Generate external-set predictions for every fold model in `all_results` and store them
-    back into each fold record using `*_external_*` keys (metrics only if labels exist).
+    Score model-specific external dataframes with every fold model in all_results
+    and store predictions back into each fold record.
+
+    Processes only overlapping model names between all_results and model_data_dict.
 
     Parameters
     ----------
     all_results:
-        Dict mapping model_name -> list of fold-record dicts. Each record must contain
-        `final_model` and should contain `calib_feature_names` (used to select columns).
-        If present, `calibrator_platt` and/or `calibrator_beta` are used to produce
-        calibrated external predictions.
-    external_bundle:
-        Dataset bundle for the external set. Must contain `feature_names` and `x_key`
-        (e.g., 'combined_X_raw'). If labels are available, include `y_key`
-        (e.g., 'combined_y') to compute external metrics.
-    x_key:
-        Key in `external_bundle` pointing to the feature matrix to score (default:
-        'combined_X_raw', i.e., aggregated-by-group features).
-    y_key:
-        Optional key in `external_bundle` pointing to labels. If missing or None, metrics
-        are not computed (prediction-only mode).
+        Dict mapping model_name -> list of fold-record dicts.
+
+    model_data_dict:
+        Dict mapping model_name -> external dataframe for that model.
+
+    y_col:
+        Optional label column name present in each model dataframe.
+        If provided, external metrics are computed.
+
     external_tag:
-        Tag used in the keys written into each record (default 'external'), e.g.
-        `y_external_scores`, `calib_external_predictions_platt`, `external_metrics`.
+        Prefix used for written keys, e.g. "external" -> y_external_scores.
+
+    feature_names_key:
+        Fold-record key containing the selected feature names.
+        Default: "feature_names_used"
+
     strict_features:
-        If True, require that each fold record has a feature list (`calib_feature_names`
-        or `feature_names`). If False, fall back to using all external features.
+        If True, error if a fold record is missing feature_names_key or if
+        required columns are missing from the model dataframe.
+        If False, and feature_names_key is missing, use all dataframe columns
+        except y_col.
+
+    inplace:
+        If True, modify all_results in place. If False, shallow-copy records first.
+
+    warn_on_skip:
+        If True, warn when models are skipped due to missing overlap.
 
     Returns
     -------
-    all_results:
-        The same object, modified in-place (returned for convenience).
+    Updated all_results dict.
     """
-    if "feature_names" not in external_bundle:
-        raise KeyError("external_bundle must contain 'feature_names'.")
+    if not isinstance(model_data_dict, dict):
+        raise TypeError("model_data_dict must be a dict of {model_name: dataframe}")
 
-    if x_key not in external_bundle:
+    out = all_results if inplace else {
+        model_name: [dict(rec) for rec in recs]
+        for model_name, recs in all_results.items()
+    }
+
+    all_result_models = set(out.keys())
+    data_models = set(model_data_dict.keys())
+
+    overlap_models = sorted(all_result_models & data_models)
+    missing_in_data = sorted(all_result_models - data_models)
+    extra_in_data = sorted(data_models - all_result_models)
+
+    if not overlap_models:
         raise KeyError(
-            f"external_bundle missing x_key='{x_key}'. Available keys: {list(external_bundle.keys())}"
+            "No overlapping model names between all_results and model_data_dict. "
+            f"all_results models={sorted(all_result_models)}, "
+            f"model_data_dict models={sorted(data_models)}"
         )
 
-    X_full = np.asarray(external_bundle[x_key])
-    if X_full.ndim != 2:
-        raise ValueError(f"external_bundle[{x_key}] must be 2D, got shape {X_full.shape}")
-
-    feat_names_full = list(external_bundle["feature_names"])
-    if len(feat_names_full) != X_full.shape[1]:
-        raise ValueError(
-            f"Mismatch: external X has {X_full.shape[1]} cols but feature_names has {len(feat_names_full)}"
+    if warn_on_skip and missing_in_data:
+        warnings.warn(
+            "Skipping models in all_results with no matching dataframe in model_data_dict: "
+            f"{missing_in_data}"
         )
 
-    # Labels are optional
-    y_ext = external_bundle.get(y_key, None)
-    has_labels = y_ext is not None
-    if has_labels:
-        y_ext = np.asarray(y_ext)
-        if y_ext.ndim != 1 or len(y_ext) != X_full.shape[0]:
-            raise ValueError(
-                f"external y must be 1D and aligned with X rows. Got y shape {y_ext.shape}, X rows {X_full.shape[0]}"
+    if warn_on_skip and extra_in_data:
+        warnings.warn(
+            "model_data_dict contains models not present in all_results; they will be ignored: "
+            f"{extra_in_data}"
+        )
+
+    for model_name in overlap_models:
+        fold_records = out[model_name]
+        external_df = model_data_dict[model_name]
+
+        if not isinstance(external_df, pd.DataFrame):
+            raise TypeError(f"model_data_dict[{model_name!r}] must be a pandas DataFrame")
+
+        if y_col is not None and y_col not in external_df.columns:
+            raise KeyError(
+                f"model_data_dict[{model_name!r}] is missing y_col={y_col!r}"
             )
 
-    # Map feature name -> column index for selection
-    col_index = {name: i for i, name in enumerate(feat_names_full)}
+        y_ext = None if y_col is None else np.asarray(external_df[y_col])
+        has_labels = y_ext is not None
+        idx_ext = external_df.index.to_numpy()
 
-    for model_name, fold_records in all_results.items():
         for rec in fold_records:
             if "final_model" not in rec:
-                raise KeyError(f"{model_name} record missing 'final_model'.")
+                raise KeyError(f"{model_name} record missing 'final_model'")
 
-            # ---- Determine which features to use ----
-            selected_feature_names = rec.get("calib_feature_names", None)
-            if selected_feature_names is None:
-                selected_feature_names = rec.get("feature_names", None)
+            selected_feature_names = rec.get(feature_names_key, None)
 
             if selected_feature_names is None:
                 if strict_features:
                     raise KeyError(
-                        f"{model_name} fold record is missing 'calib_feature_names' (and 'feature_names'). "
-                        "Store it during training or set strict_features=False to use all features."
+                        f"{model_name} record missing {feature_names_key!r}"
                     )
-                selected_feature_names = feat_names_full
+                selected_feature_names = [
+                    c for c in external_df.columns
+                    if c != y_col
+                ]
 
             selected_feature_names = list(selected_feature_names)
 
-
-
-            missing = [f for f in selected_feature_names if f not in col_index]
+            missing = [c for c in selected_feature_names if c not in external_df.columns]
             if missing:
-                raise KeyError(f"External bundle missing required features for {model_name}: {missing}")
-
-            cols = [col_index[f] for f in selected_feature_names]
-            X_ext = X_full[:, cols]
-
-            # ---- SIMPLE SAFETY CHECK ----
-            if X_ext.shape[1] != len(selected_feature_names):
-                raise ValueError(
-                    f"[{model_name}] Feature mismatch: X_ext has {X_ext.shape[1]} cols "
-                    f"but calib_feature_names has {len(selected_feature_names)}. "
-                    f"Check feature selection/mapping (e.g., wrong feature list)."
+                raise KeyError(
+                    f"{model_name} external dataframe missing required features: {missing}"
                 )
 
-            # ---- Predict (uncalibrated) ----
+            X_ext = external_df.loc[:, selected_feature_names].to_numpy()
+
             final_model = rec["final_model"]
             p_ext = final_model.predict_proba(X_ext)[:, 1]
 
-            # ---- Attach uncalibrated external outputs ----
-            rec[f"{external_tag}_x_key"] = x_key
-            rec[f"{external_tag}_feature_names_key"] = "feature_names"
             rec[f"{external_tag}_feature_names"] = selected_feature_names
-            rec[f"n_{external_tag}"] = int(X_ext.shape[0])
-            rec[f"y_{external_tag}_scores"] = p_ext  # mirrors y_test_scores
+            rec[f"n_{external_tag}"] = int(len(external_df))
+            rec[f"{external_tag}_idx"] = idx_ext
+            rec[f"y_{external_tag}_scores"] = p_ext
 
-            # ---- Calibrated external predictions ----
             if rec.get("calibrator_platt", None) is not None:
-                rec[f"calib_{external_tag}_predictions_platt"] = rec["calibrator_platt"].predict_proba(
-                    p_ext.reshape(-1, 1)
-                )[:, 1]
+                rec[f"calib_{external_tag}_predictions_platt"] = (
+                    rec["calibrator_platt"].predict_proba(p_ext.reshape(-1, 1))[:, 1]
+                )
 
             if rec.get("calibrator_beta", None) is not None:
-                rec[f"calib_{external_tag}_predictions_beta"] = rec["calibrator_beta"].predict(p_ext)
+                rec[f"calib_{external_tag}_predictions_beta"] = (
+                    rec["calibrator_beta"].predict(p_ext)
+                )
 
-            # ---- Metrics only if labels exist ----
             if has_labels:
                 rec[f"y_{external_tag}"] = y_ext
                 rec[f"{external_tag}_metrics"] = {
@@ -534,549 +546,424 @@ def add_external_predictions_to_results(
                     "roc_auc": float(roc_auc_score(y_ext, p_ext)),
                 }
 
-                if rec.get(f"calib_{external_tag}_predictions_platt", None) is not None:
-                    pp = rec[f"calib_{external_tag}_predictions_platt"]
+                pp = rec.get(f"calib_{external_tag}_predictions_platt", None)
+                if pp is not None:
                     rec[f"{external_tag}_metrics_platt"] = {
                         "average_precision": float(average_precision_score(y_ext, pp)),
                         "roc_auc": float(roc_auc_score(y_ext, pp)),
                     }
 
-                if rec.get(f"calib_{external_tag}_predictions_beta", None) is not None:
-                    pb = rec[f"calib_{external_tag}_predictions_beta"]
+                pb = rec.get(f"calib_{external_tag}_predictions_beta", None)
+                if pb is not None:
                     rec[f"{external_tag}_metrics_beta"] = {
                         "average_precision": float(average_precision_score(y_ext, pb)),
                         "roc_auc": float(roc_auc_score(y_ext, pb)),
                     }
 
-    return all_results
+    return out
+
 
 
 def build_long_predictions_df(
     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
     model_name: str | Sequence[str] | None = None,
-    groups_all: Optional[np.ndarray] = None,
-    group_id_to_key: Optional[Mapping[int, Tuple[str, str]]] = None,  # group -> (label_str, subject_id)
     methods: Optional[Sequence[str]] = None,
     include_uncalibrated: bool = True,
-    include_test: bool = True,
-    include_train: bool = False,
-    include_external: bool = True,
-    unit_col: str = "idx",
-    # --- external config ---
-    external_idx_key: str | None = None,   # if you later store explicit external indices
+    external_idx_key: str = "external_idx",
     external_y_key: str = "y_external",
     external_prob_key_uncalib: str = "y_external_scores",
     external_prob_key_prefix_calib: str = "calib_external_predictions_",
 ) -> pd.DataFrame:
     """
-    Build a single long-form ("tidy") predictions table with one row per predicted example,
-    pooled across models, folds, splits, and probability variants (uncalibrated + calibrated).
+    Build a long-form predictions dataframe for EXTERNAL predictions only.
 
-    This function converts your nested-CV `all_results` structure:
+    This function converts the external prediction outputs stored inside
+    `all_results` into a single tidy dataframe with one row per predicted
+    external sample.
 
-        all_results[model_name] = [fold_dict_1, fold_dict_2, ...]
+    The intended use is after calling your external-scoring function that
+    attaches keys such as:
+      - y_external_scores
+      - calib_external_predictions_beta
+      - calib_external_predictions_platt
+      - y_external (optional)
+      - external_idx (optional)
 
-    into a single pandas DataFrame suitable for downstream aggregation (e.g., pooling by
-    subject/patient), plotting, and metric computation.
-
-    Output row granularity
-    ----------------------
-    Each output row corresponds to a single prediction for a single index `idx` within a given:
-      - model (e.g., "logistic_regression")
-      - variant: "uncalib" or a calibration method name (e.g., "beta")
-      - split: "test", "train" (optional), and "external" (optional)
-      - trial and outer_fold (as stored in each fold dict)
-
-    Labels are optional for external
-    --------------------------------
-    External predictions may or may not have labels. If external labels are absent, the output
-    still includes external rows, but sets:
-      - y = np.nan
-      - and (per your rule) group_label = np.nan as well (when grouping is enabled)
-
-    Group/patient metadata (optional)
-    ---------------------------------
-    If BOTH `groups_all` and `group_id_to_key` are provided, the function will add patient/group
-    columns by mapping:
-      idx -> group_id via groups_all[idx]
-      group_id -> (group_label, subject_id) via group_id_to_key[group_id]
-
-    In this grouped mode, the output includes additional columns:
-      - group (int)
-      - group_label (str or np.nan)
-      - subject_id (str or None)
-
-    If grouping metadata is NOT provided, the function omits those columns and optionally
-    includes a "unit id" column named by `unit_col` (default "idx") for downstream code that
-    expects a unit identifier even without groups.
-
-    What variants are included
-    --------------------------
-    - If include_uncalibrated=True:
-        variant="uncalib" is included using:
-          * test:      r["y_test_scores"]
-          * train r["cv_uncalib_train_predictions"] (if include_train=True)
-          * external:  r[external_prob_key_uncalib]      (if include_external=True)
-    - Calibrated variants:
-        If `methods` is provided, those method names are used (e.g., ["beta"]).
-        If `methods` is None, methods are discovered per-model by scanning keys that start with:
-          "calib_test_predictions_"
-        Calibrated keys are expected to follow:
-          * test:      r[f"calib_test_predictions_{method}"]
-          * train: r[f"cv_calib_train_predictions_{method}"]
-          * external:  r[f"{external_prob_key_prefix_calib}{method}"]
-
-    External indexing
-    -----------------
-    External rows need an `idx` vector. This is determined as:
-      1) If external_idx_key is not None and external_idx_key exists in the fold dict:
-           idx_ex = r[external_idx_key]
-      2) Else:
-           idx_ex = np.arange(n_external)
-           where n_external is taken from r["n_external"] if present; otherwise inferred from
-           the length of r[external_prob_key_uncalib].
+    Each output row corresponds to one prediction for one external sample
+    for a given:
+      - model
+      - calibration setting
+      - trial
+      - outer fold
 
     Parameters
     ----------
     all_results:
-        Mapping model_name -> sequence of fold dictionaries.
+        Mapping of:
+            model_name -> sequence of fold result dictionaries
+
+        Each fold dictionary is expected to contain the external prediction
+        arrays created earlier in your pipeline.
 
     model_name:
-        Which models to include:
-          - None (default): include all models in all_results
-          - str: include one model
-          - sequence[str]: include listed models
-
-    groups_all:
-        Optional array mapping dataset index -> integer group id.
-
-    group_id_to_key:
-        Optional mapping group id -> (group_label_str, subject_id_str).
+        Which model(s) to include:
+          - None: include all models in all_results
+          - str: include only that model
+          - Sequence[str]: include only the listed models
 
     methods:
-        Optional list of calibration methods (e.g., ["beta"]).
-        If None, discovered per model by scanning "calib_test_predictions_*" keys.
+        Calibration methods to include, for example:
+            ["beta"]
+            ["beta", "platt"]
+
+        If None, only uncalibrated predictions are included when
+        include_uncalibrated=True.
 
     include_uncalibrated:
-        Include the "uncalib" variant.
-
-    include_test:
-        Include outer test predictions (split="test").
-
-    include_train:
-        Include train fold predictions (split="train").
-
-    include_external:
-        Include external predictions (split="external"), with optional labels.
-
-    unit_col:
-        Column name to use as a "unit id" when grouping metadata is not provided. The column
-        value will mirror idx.
+        If True, include the raw uncalibrated external probabilities using
+        `external_prob_key_uncalib`.
 
     external_idx_key:
-        Optional key in each fold dict containing explicit external indices.
+        Key in each fold dictionary containing the external sample indices.
+        If missing, the function falls back to np.arange(n_external).
 
     external_y_key:
-        Key for external labels if they exist (default "y_external"). If missing, y=np.nan.
+        Key in each fold dictionary containing the external labels.
+        If missing, labels are treated as unavailable and output y is set
+        to np.nan.
 
     external_prob_key_uncalib:
-        Key for uncalibrated external probabilities (default "y_external_scores").
+        Key containing uncalibrated external probabilities.
 
     external_prob_key_prefix_calib:
-        Prefix for calibrated external probability keys (default "calib_external_predictions_").
+        Prefix used for calibrated external probabilities.
+        For example, if method="beta", the function looks for:
+            "calib_external_predictions_beta"
 
     Returns
     -------
     pd.DataFrame
-        Long-form predictions table.
+        Long-form dataframe with columns:
+          - model
+          - calibration
+          - split
+          - trial
+          - outer_fold
+          - idx
+          - y
+          - p
 
-        Always included columns:
-          ["model", "variant", "split", "trial", "outer_fold", "idx", "y", "p"]
-
-        If grouping info is provided:
-          + ["group", "group_label", "subject_id"]
-
-        If grouping info is NOT provided:
-          + [unit_col] (mirrors idx; if unit_col == "idx" it is still present as idx)
-
-        Notes on dtypes:
-          - y is float (so missing labels can be represented as np.nan)
-          - p is float
+        Notes:
+          - split is always "external"
+          - y is float so missing labels can be represented with np.nan
+          - p is the predicted probability
 
     Raises
     ------
-    KeyError:
-        If requested models are missing, or required keys for a requested split/variant are missing.
+    KeyError
+        If requested model_name values are not found in all_results.
 
-    ValueError:
-        If idx/y/p lengths mismatch for any fold/variant/split.
-
-    IndexError:
-        If idx values are out of bounds for groups_all when grouping metadata is provided.
+    ValueError
+        If no prediction variants were requested, or if idx / y / p lengths
+        do not match for any fold.
     """
 
-
     # -------------------------
-    # Resolve model list
+    # Resolve which model names to include
     # -------------------------
+    # If model_name is None, we include every model present in all_results.
+    # Otherwise we normalize the input into a list of model names.
     if model_name is None:
-        model_names: List[str] = list(all_results.keys())
+        model_names = list(all_results.keys())
     elif isinstance(model_name, str):
         model_names = [model_name]
     else:
         model_names = list(model_name)
 
-    missing = [m for m in model_names if m not in all_results]
-    if missing:
+    # Validate that every requested model is actually present.
+    missing_models = [m for m in model_names if m not in all_results]
+    if missing_models:
         raise KeyError(
-            f"Model(s) not found in all_results: {missing}. "
+            f"Model(s) not found in all_results: {missing_models}. "
             f"Available: {list(all_results.keys())}"
         )
 
-    have_groups = (groups_all is not None) and (group_id_to_key is not None)
-    if have_groups:
-        groups_all = np.asarray(groups_all)
+    # -------------------------
+    # Resolve which calibration settings to include
+    # -------------------------
+    # We use "calibration" instead of "variant" because it is more explicit:
+    #   - "uncalib" means raw model probabilities
+    #   - "beta" / "platt" etc. mean calibrated probabilities
+    methods_list = [] if methods is None else list(methods)
 
-    all_dfs: List[pd.DataFrame] = []
+    calibrations: List[str] = []
+    if include_uncalibrated:
+        calibrations.append("uncalib")
+    calibrations.extend(methods_list)
 
+    # If neither uncalibrated nor calibrated methods were requested,
+    # there is nothing to build.
+    if not calibrations:
+        raise ValueError(
+            "No predictions requested. "
+            "Set include_uncalibrated=True and/or provide methods."
+        )
+
+    # We will accumulate one dict per output row here, then convert to DataFrame.
+    rows: List[Dict[str, Any]] = []
+
+    # -------------------------
+    # Loop over selected models
+    # -------------------------
     for mname in model_names:
+        # Each model has a sequence of fold-level result dictionaries.
         folds = all_results[mname]
 
-        # Discover calibration methods if not provided (PER MODEL)
-        if methods is None:
-            discovered = set()
-            for r in folds:
-                for k in r.keys():
-                    if k.startswith("calib_test_predictions_"):
-                        discovered.add(k.replace("calib_test_predictions_", "", 1))
-            methods_list = sorted(discovered)
-        else:
-            methods_list = list(methods)
-
-        variants: List[str] = []
-        if include_uncalibrated:
-            variants.append("uncalib")
-        variants.extend(methods_list)
-
-        rows: List[Dict[str, Any]] = []
-
-        def _append_rows(
-            *,
-            idx_arr: np.ndarray,
-            y_arr: Optional[np.ndarray],
-            p_arr: np.ndarray,
-            split_name: str,
-            trial: Any,
-            outer_fold: Any,
-            variant: str,
-        ) -> None:
-            idx_arr = np.asarray(idx_arr, dtype=int)
-            p_arr = np.asarray(p_arr, dtype=float)
-
-            if y_arr is not None:
-                y_arr = np.asarray(y_arr)
-                if len(idx_arr) != len(y_arr) or len(idx_arr) != len(p_arr):
-                    raise ValueError(
-                        f"Length mismatch: model={mname}, trial={trial}, outer_fold={outer_fold}, "
-                        f"variant={variant}, split={split_name} "
-                        f"len(idx)={len(idx_arr)}, len(y)={len(y_arr)}, len(p)={len(p_arr)}"
-                    )
-            else:
-                if len(idx_arr) != len(p_arr):
-                    raise ValueError(
-                        f"Length mismatch: model={mname}, trial={trial}, outer_fold={outer_fold}, "
-                        f"variant={variant}, split={split_name} "
-                        f"len(idx)={len(idx_arr)}, len(p)={len(p_arr)} (y is missing)"
-                    )
-
-            if have_groups:
-                assert groups_all is not None and group_id_to_key is not None
-
-                if idx_arr.max(initial=-1) >= len(groups_all) or idx_arr.min(initial=0) < 0:
-                    raise IndexError(
-                        f"Some idx values are out of bounds for groups_all (len={len(groups_all)}). "
-                        f"idx range: [{idx_arr.min()}, {idx_arr.max()}]"
-                    )
-
-                g_arr = groups_all[idx_arr]
-
-                label_strs: List[Optional[str]] = []
-                subject_ids: List[Optional[str]] = []
-                for g in g_arr:
-                    lab, sid = group_id_to_key.get(int(g), (None, None))
-                    label_strs.append(lab)
-                    subject_ids.append(sid)
-
-                if y_arr is None:
-                    # per your rule: if no y, also no group_label
-                    for i, g, sid, pp in zip(idx_arr, g_arr, subject_ids, p_arr):
-                        rows.append({
-                            "model": mname,
-                            "variant": variant,
-                            "split": split_name,
-                            "trial": trial,
-                            "outer_fold": outer_fold,
-                            "idx": int(i),
-                            "group": int(g),
-                            "group_label": np.nan,
-                            "subject_id": sid,
-                            "y": np.nan,
-                            "p": float(pp),
-                        })
-                else:
-                    for i, g, lab, sid, yy, pp in zip(idx_arr, g_arr, label_strs, subject_ids, y_arr, p_arr):
-                        rows.append({
-                            "model": mname,
-                            "variant": variant,
-                            "split": split_name,
-                            "trial": trial,
-                            "outer_fold": outer_fold,
-                            "idx": int(i),
-                            "group": int(g),
-                            "group_label": lab,
-                            "subject_id": sid,
-                            "y": int(yy),
-                            "p": float(pp),
-                        })
-            else:
-                if y_arr is None:
-                    for i, pp in zip(idx_arr, p_arr):
-                        rows.append({
-                            "model": mname,
-                            "variant": variant,
-                            "split": split_name,
-                            "trial": trial,
-                            "outer_fold": outer_fold,
-                            "idx": int(i),
-                            unit_col: int(i) if unit_col != "idx" else int(i),
-                            "y": np.nan,   # CHANGED: no pd.NA
-                            "p": float(pp),
-                        })
-                else:
-                    for i, yy, pp in zip(idx_arr, y_arr, p_arr):
-                        rows.append({
-                            "model": mname,
-                            "variant": variant,
-                            "split": split_name,
-                            "trial": trial,
-                            "outer_fold": outer_fold,
-                            "idx": int(i),
-                            unit_col: int(i) if unit_col != "idx" else int(i),
-                            "y": int(yy),
-                            "p": float(pp),
-                        })
-
+        # -------------------------
+        # Loop over fold records
+        # -------------------------
         for r in folds:
+            # Trial / outer fold are stored for traceability in the output.
             trial = r.get("trial", None)
             outer_fold = r.get("outer_fold", None)
 
-            # ---------- outer test ----------
-            if include_test:
-                idx = np.asarray(r["outer_test_idx"], dtype=int)
-                y = np.asarray(r["y_test"], dtype=int)
+            # -------------------------
+            # Resolve external indices
+            # -------------------------
+            # Preferred behavior:
+            #   use explicitly stored external indices if available.
+            # Fallback behavior:
+            #   use 0..n_external-1 so the function still works even if
+            #   explicit indices were not stored.
+            if external_idx_key in r:
+                idx_ex = np.asarray(r[external_idx_key], dtype=int)
+            else:
+                n_ex = int(r.get("n_external", len(r.get(external_prob_key_uncalib, []))))
+                idx_ex = np.arange(n_ex, dtype=int)
 
-                for v in variants:
-                    key = "y_test_scores" if v == "uncalib" else f"calib_test_predictions_{v}"
-                    if key not in r:
-                        continue
-                    p = np.asarray(r[key], dtype=float)
+            # -------------------------
+            # Resolve external labels (optional)
+            # -------------------------
+            # If labels exist, we use them.
+            # If not, we keep y as missing (np.nan) in the output.
+            y_ex = np.asarray(r[external_y_key], dtype=float) if external_y_key in r else None
 
-                    _append_rows(
-                        idx_arr=idx,
-                        y_arr=y,
-                        p_arr=p,
-                        split_name="test",
-                        trial=trial,
-                        outer_fold=outer_fold,
-                        variant=v,
-                    )
-
-            # ---------- train OOF ----------
-            if include_train:
-                idx_tr = np.asarray(r["outer_train_idx"], dtype=int)
-                y_tr = np.asarray(r["y_train"], dtype=int)
-
-                for v in variants:
-                    key = "cv_uncalib_train_predictions" if v == "uncalib" else f"cv_calib_train_predictions_{v}"
-                    if key not in r:
-                        continue
-                    p_tr = np.asarray(r[key], dtype=float)
-
-                    _append_rows(
-                        idx_arr=idx_tr,
-                        y_arr=y_tr,
-                        p_arr=p_tr,
-                        split_name="train",
-                        trial=trial,
-                        outer_fold=outer_fold,
-                        variant=v,
-                    )
-
-            # ---------- external ----------
-            if include_external:
-                # idx: prefer explicit key, else default to 0..n_external-1
-                if external_idx_key is not None and external_idx_key in r:
-                    idx_ex = np.asarray(r[external_idx_key], dtype=int)
+            # -------------------------
+            # Loop over requested calibration settings
+            # -------------------------
+            for cal in calibrations:
+                # Determine which probability key to read from the fold record.
+                if cal == "uncalib":
+                    key = external_prob_key_uncalib
                 else:
-                    n_ex = int(r.get("n_external", len(r.get(external_prob_key_uncalib, []))))
-                    idx_ex = np.arange(n_ex, dtype=int)
+                    key = f"{external_prob_key_prefix_calib}{cal}"
 
-                # labels optional
-                y_ex = np.asarray(r[external_y_key], dtype=int) if external_y_key in r else None
+                # If this fold does not contain that calibration output,
+                # we silently skip it.
+                #
+                # Example:
+                #   methods=["beta", "platt"]
+                # but this record only has beta predictions.
+                if key not in r:
+                    continue
 
-                for v in variants:
-                    if v == "uncalib":
-                        key = external_prob_key_uncalib
-                    else:
-                        key = f"{external_prob_key_prefix_calib}{v}"
+                # Convert predicted probabilities to a numeric numpy array.
+                p_ex = np.asarray(r[key], dtype=float)
 
-                    if key not in r:
-                        continue
+                # -------------------------
+                # Validate array lengths
+                # -------------------------
+                # idx and p must always align one-to-one.
+                # If labels exist, y must also align with them.
+                if y_ex is None:
+                    if len(idx_ex) != len(p_ex):
+                        raise ValueError(
+                            f"Length mismatch for model={mname}, trial={trial}, "
+                            f"outer_fold={outer_fold}, calibration={cal}: "
+                            f"len(idx)={len(idx_ex)}, len(p)={len(p_ex)}"
+                        )
+                else:
+                    if len(idx_ex) != len(y_ex) or len(idx_ex) != len(p_ex):
+                        raise ValueError(
+                            f"Length mismatch for model={mname}, trial={trial}, "
+                            f"outer_fold={outer_fold}, calibration={cal}: "
+                            f"len(idx)={len(idx_ex)}, len(y)={len(y_ex)}, len(p)={len(p_ex)}"
+                        )
 
-                    p_ex = np.asarray(r[key], dtype=float)
+                # -------------------------
+                # Append one output row per external sample
+                # -------------------------
+                if y_ex is None:
+                    # Labels unavailable: y is stored as NaN.
+                    for i, pp in zip(idx_ex, p_ex):
+                        rows.append(
+                            {
+                                "model": mname,
+                                "calibration": cal,
+                                "split": "external",
+                                "trial": trial,
+                                "outer_fold": outer_fold,
+                                "idx": int(i),
+                                "y": np.nan,
+                                "p": float(pp),
+                            }
+                        )
+                else:
+                    # Labels available: store the paired y and probability p.
+                    for i, yy, pp in zip(idx_ex, y_ex, p_ex):
+                        rows.append(
+                            {
+                                "model": mname,
+                                "calibration": cal,
+                                "split": "external",
+                                "trial": trial,
+                                "outer_fold": outer_fold,
+                                "idx": int(i),
+                                "y": float(yy),
+                                "p": float(pp),
+                            }
+                        )
 
-                    _append_rows(
-                        idx_arr=idx_ex,
-                        y_arr=y_ex,
-                        p_arr=p_ex,
-                        split_name="external",
-                        trial=trial,
-                        outer_fold=outer_fold,
-                        variant=v,
-                    )
+    # -------------------------
+    # Build final DataFrame
+    # -------------------------
+    # If no rows were collected, return an empty DataFrame with the expected schema.
+    if not rows:
+        return pd.DataFrame(
+            columns=["model", "calibration", "split", "trial", "outer_fold", "idx", "y", "p"]
+        )
 
-        df_m = pd.DataFrame(rows)
+    df_long = pd.DataFrame(rows)
 
-        if not df_m.empty:
-            df_m["model"] = df_m["model"].astype(str)
-            df_m["variant"] = df_m["variant"].astype(str)
-            df_m["split"] = df_m["split"].astype(str)
-            df_m["idx"] = df_m["idx"].astype(int)
-            df_m["p"] = pd.to_numeric(df_m["p"], errors="coerce").astype(float)
+    # -------------------------
+    # Enforce clean column dtypes
+    # -------------------------
+    # Keep text columns as strings and numeric columns as numeric types.
+    df_long["model"] = df_long["model"].astype(str)
+    df_long["calibration"] = df_long["calibration"].astype(str)
+    df_long["split"] = "external"
+    df_long["idx"] = df_long["idx"].astype(int)
+    df_long["y"] = pd.to_numeric(df_long["y"], errors="coerce").astype(float)
+    df_long["p"] = pd.to_numeric(df_long["p"], errors="coerce").astype(float)
 
-            # CHANGED: robust to np.nan / missing / accidental NA-like
-            df_m["y"] = pd.to_numeric(df_m["y"], errors="coerce").astype(float)
+    # -------------------------
+    # Stable sorting for reproducibility
+    # -------------------------
+    # This makes output order deterministic and easier to debug / compare.
+    df_long = df_long.sort_values(
+        ["model", "calibration", "split", "trial", "outer_fold", "idx"],
+        kind="mergesort",
+    ).reset_index(drop=True)
 
-            if have_groups:
-                df_m["group"] = df_m["group"].astype(int)
-                # group_label can be str or nan; leave as object
-                # subject_id leave as object
+    return df_long
 
-        all_dfs.append(df_m)
 
-    if len(all_dfs) == 0:
-        return pd.DataFrame()
-
-    df_all = pd.concat(all_dfs, ignore_index=True)
-
-    sort_cols = ["model", "variant", "split", "trial", "outer_fold", "idx"]
-    sort_cols = [c for c in sort_cols if c in df_all.columns]
-    if sort_cols:
-        df_all = df_all.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-
-    return df_all
 
 
 def aggregate_predictions_by_idx(
     df_long: pd.DataFrame,
     *,
     model_name: str | Sequence[str] | None = None,
-    split: str | Sequence[str] = "test",
-    variants: Optional[Sequence[str]] = None,
+    calibrations: Optional[Sequence[str]] = None,
     agg_stats: Sequence[str] = ("mean", "median", "std", "min", "max"),
-    # if True, adds y_label when labels exist
     add_y_label: bool = True,
-    # how to handle prevalence (optional output column)
-    prevalence: Union[bool, float] = True,  # True=auto when labels exist, False=off, float=use value
-
-    # ---- NEW: ensemble pooling across models ----
+    prevalence: Union[bool, float] = True,
     add_ensemble: bool = True,
-    ensemble_name: str = "ensemble",
-    ensemble_models: Sequence[str] | None = None,  # if None: use all selected models after filtering
+    ensemble_name: str = "Ensemble model",
+    ensemble_models: Sequence[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Aggregate repeated predictions per idx into a single row per (model, variant, split, idx),
-    and optionally add an "ensemble" model by pooling predictions across multiple models.
+    Aggregate repeated EXTERNAL predictions per idx into a single row per
+    (model, calibration, idx), and optionally add an ensemble model by pooling
+    predictions across models.
 
-    Designed to consume the output of `build_long_predictions_df`, where df_long may contain
-    repeated predictions for the same idx across trials/folds (and possibly across models).
+    This function is designed to consume the output of the simplified
+    `build_long_predictions_df(...)`, where df_long contains EXTERNAL predictions
+    only and columns like:
+        ["model", "calibration", "split", "trial", "outer_fold", "idx", "y", "p"]
 
-    Supports splits:
-      - "test"
-      - "train"
-      - "external"  (labels may be missing)
-
-    Label handling (important for external):
-      - If labels exist for the requested subset, `y` is carried as the first non-missing value
-        within each (model, variant, split, idx) group.
-      - If labels do NOT exist (all y are NaN), aggregated `y` remains NaN and y_label (if requested)
-        is set to NaN.
-
-    NEW: Ensemble pooling
-    ---------------------
-    If add_ensemble=True, this function ALSO produces rows for `model=ensemble_name` by pooling
-    *all predictions* across `ensemble_models` (or all selected models) for each (variant, split, idx).
-    In other words, if a patient idx has predictions from logistic_regression and xgboost,
-    we treat them as additional replicate predictions and aggregate over the combined set.
+    Because nested CV produces repeated predictions for the same external sample
+    across trials / outer folds, this function collapses those repeated predictions
+    into summary statistics per idx.
 
     Parameters
     ----------
     df_long:
-        Long table with columns at least: ["model","variant","split","idx","y","p"].
-        y may be np.nan for unlabeled external.
+        Long-form dataframe containing at least:
+            ["model", "calibration", "idx", "y", "p"]
+
+        Optional columns such as "split", "trial", and "outer_fold" may also be
+        present, but are not required for the aggregation itself.
 
     model_name:
-        Controls which base models to include:
+        Which models to include:
           - None: include all models in df_long
           - str: include only that model
           - Sequence[str]: include only those models
 
-    split:
-        Split name or list of splits to include (e.g., "test" or ["test","external"]).
-
-    variants:
-        Variants to include; if None, uses all variants present after filtering.
+    calibrations:
+        Which calibration settings to include, e.g.:
+            ["uncalib", "beta"]
+        If None, use all calibration values present in df_long.
 
     agg_stats:
-        Which stats to compute over repeated probabilities p:
-          subset of {"mean","median","std","min","max"}.
+        Which summary statistics to compute over repeated probabilities p.
+        Supported values:
+            "mean", "median", "std", "min", "max"
 
     add_y_label:
-        If True and labels exist, adds y_label using {0:"0 (neg)", 1:"1 (pos)"}.
+        If True and labels exist, add y_label using:
+            0 -> "0 (neg)"
+            1 -> "1 (pos)"
 
     prevalence:
-        - True: compute prevalence per (model, split) from unique labeled idx, if labels exist
-        - False: do not add prevalence_used
-        - float: use provided prevalence value (added per row as prevalence_used)
+        Controls whether to add prevalence_used:
+          - True: compute prevalence per model from unique labeled idx
+          - False: do not add prevalence_used
+          - float: use the provided prevalence value for all rows
 
     add_ensemble:
-        If True, append an ensemble "model" that pools predictions across multiple models.
+        If True, append an ensemble "model" by pooling predictions across
+        multiple models for each (calibration, idx).
 
     ensemble_name:
-        Name to use in df_agg["model"] for the pooled ensemble rows.
+        Name to assign to the pooled ensemble rows in df_agg["model"].
 
     ensemble_models:
-        Which models to pool. If None, pools all models remaining after model_name filtering.
+        Which models to pool for the ensemble.
+        If None, pool all selected models after model_name filtering.
 
     Returns
     -------
     pd.DataFrame
-        Aggregated table with one row per (model, variant, split, idx), including:
-          - y (float; NaN if unlabeled)
-          - n_preds (count of contributing predictions)
-          - p_mean / p_median / p_std / p_min / p_max depending on agg_stats
-          - optional y_label (if labels exist and add_y_label=True)
-          - optional prevalence_used (if enabled)
+        Aggregated dataframe with one row per:
+            (model, calibration, idx)
+
+        Includes:
+          - y
+          - n_preds
+          - p_mean / p_median / p_std / p_min / p_max (depending on agg_stats)
+          - optional y_label
+          - optional prevalence_used
+          - split="external" for consistency
     """
-    required = {"model", "variant", "split", "idx", "y", "p"}
+    # ---------------------------------------------------------------------
+    # Validate required columns
+    # ---------------------------------------------------------------------
+    required = {"model", "calibration", "idx", "y", "p"}
     missing = required - set(df_long.columns)
     if missing:
-        raise KeyError(f"df_long is missing required columns: {sorted(missing)}")
+        raise KeyError(
+            f"df_long is missing required columns: {sorted(missing)}"
+        )
 
+    # Work on a copy so we do not modify the caller's dataframe.
     d = df_long.copy()
 
-    # ---- filter models ----
+    # ---------------------------------------------------------------------
+    # Filter models if requested
+    # ---------------------------------------------------------------------
     if model_name is None:
         selected_models = sorted(d["model"].astype(str).unique().tolist())
     elif isinstance(model_name, str):
@@ -1086,61 +973,86 @@ def aggregate_predictions_by_idx(
 
     d["model"] = d["model"].astype(str)
     d = d[d["model"].isin(selected_models)].copy()
+
     if d.empty:
         raise ValueError(f"No rows found after filtering model_name={model_name}.")
 
-    # ---- filter split(s) ----
-    if isinstance(split, str):
-        splits = [split]
+    # ---------------------------------------------------------------------
+    # Filter calibrations if requested
+    # ---------------------------------------------------------------------
+    d["calibration"] = d["calibration"].astype(str)
+
+    if calibrations is None:
+        selected_calibrations = sorted(d["calibration"].unique().tolist())
     else:
-        splits = list(split)
+        selected_calibrations = list(calibrations)
 
-    d["split"] = d["split"].astype(str)
-    d = d[d["split"].isin(splits)].copy()
+    d = d[d["calibration"].isin(selected_calibrations)].copy()
+
     if d.empty:
-        raise ValueError(f"No rows found for split(s)={splits} (after model filter).")
+        raise ValueError(
+            f"No rows found after filtering calibrations={selected_calibrations}."
+        )
 
-    # ---- variants ----
-    d["variant"] = d["variant"].astype(str)
-    if variants is None:
-        variants = sorted(d["variant"].unique().tolist())
-    else:
-        variants = list(variants)
-
-    d = d[d["variant"].isin(variants)].copy()
-    if d.empty:
-        raise ValueError(f"No rows found after filtering variants={variants}.")
-
-    # ---- types ----
+    # ---------------------------------------------------------------------
+    # Normalize dtypes
+    # ---------------------------------------------------------------------
     d["idx"] = pd.to_numeric(d["idx"], errors="coerce").astype(int)
     d["p"] = pd.to_numeric(d["p"], errors="coerce").astype(float)
-    d["y"] = pd.to_numeric(d["y"], errors="coerce").astype(float)  # keep NaN if missing
+    d["y"] = pd.to_numeric(d["y"], errors="coerce").astype(float)
 
-    # ---- helper: y first non-nan ----
+    # ---------------------------------------------------------------------
+    # Helper to carry forward the first non-missing y value within a group
+    # ---------------------------------------------------------------------
+    # This is useful because repeated predictions for the same idx should all
+    # correspond to the same ground-truth label when labels are available.
     def _first_non_nan(x: pd.Series) -> float:
         x = pd.to_numeric(x, errors="coerce")
         x = x[~x.isna()]
         return float(x.iloc[0]) if len(x) else np.nan
 
-    # ---- base per-model aggregation ----
-    grp = d.groupby(["model", "variant", "split", "idx"], as_index=False, observed=False)
+    # ---------------------------------------------------------------------
+    # Define the aggregation operations
+    # ---------------------------------------------------------------------
+    agg_dict = {
+        "y": ("y", _first_non_nan),
+        "n_preds": ("p", "size"),
+    }
 
-    agg_dict = {"y": ("y", _first_non_nan), "n_preds": ("p", "size")}
-    if "mean" in agg_stats:   agg_dict["p_mean"]   = ("p", "mean")
-    if "median" in agg_stats: agg_dict["p_median"] = ("p", "median")
-    if "std" in agg_stats:    agg_dict["p_std"]    = ("p", "std")
-    if "min" in agg_stats:    agg_dict["p_min"]    = ("p", "min")
-    if "max" in agg_stats:    agg_dict["p_max"]    = ("p", "max")
+    if "mean" in agg_stats:
+        agg_dict["p_mean"] = ("p", "mean")
+    if "median" in agg_stats:
+        agg_dict["p_median"] = ("p", "median")
+    if "std" in agg_stats:
+        agg_dict["p_std"] = ("p", "std")
+    if "min" in agg_stats:
+        agg_dict["p_min"] = ("p", "min")
+    if "max" in agg_stats:
+        agg_dict["p_max"] = ("p", "max")
+
+    # ---------------------------------------------------------------------
+    # Aggregate repeated predictions per (model, calibration, idx)
+    # ---------------------------------------------------------------------
+    grp = d.groupby(
+        ["model", "calibration", "idx"],
+        as_index=False,
+        observed=False,
+    )
 
     df_agg = grp.agg(**agg_dict)
 
-    # ---- ensemble pooling across models ----
+    # Keep split for consistency with the rest of the pipeline.
+    df_agg["split"] = "external"
+
+    # ---------------------------------------------------------------------
+    # Optionally create an ensemble by pooling predictions across models
+    # ---------------------------------------------------------------------
     if add_ensemble:
-        # determine which models to pool
         if ensemble_models is None:
             pool_models = sorted(d["model"].unique().tolist())
         else:
-            pool_models = [m for m in ensemble_models if m in set(d["model"].unique())]
+            available_models = set(d["model"].unique())
+            pool_models = [m for m in ensemble_models if m in available_models]
 
         if len(pool_models) == 0:
             raise ValueError(
@@ -1148,27 +1060,41 @@ def aggregate_predictions_by_idx(
                 "Check ensemble_models / model_name filters."
             )
 
+        # Restrict to only the models selected for ensemble pooling.
         d_pool = d[d["model"].isin(pool_models)].copy()
 
-        # group WITHOUT model -> pool predictions across models
-        grp_e = d_pool.groupby(["variant", "split", "idx"], as_index=False, observed=False)
+        # Pool across models by grouping only on calibration and idx.
+        grp_e = d_pool.groupby(
+            ["calibration", "idx"],
+            as_index=False,
+            observed=False,
+        )
 
         df_e = grp_e.agg(**agg_dict)
-        df_e.insert(0, "model", ensemble_name)  # add model column
+        df_e.insert(0, "model", ensemble_name)
+        df_e["split"] = "external"
 
-        # append
+        # Append ensemble rows to the main aggregated dataframe.
         df_agg = pd.concat([df_agg, df_e], ignore_index=True)
 
-    # Ensure p_* columns are float
+    # ---------------------------------------------------------------------
+    # Ensure prediction summary columns are numeric floats
+    # ---------------------------------------------------------------------
     for c in df_agg.columns:
-        if c.startswith("p_") or c == "p":
+        if c.startswith("p_"):
             df_agg[c] = pd.to_numeric(df_agg[c], errors="coerce").astype(float)
 
-    # ---- y_label only if labels exist ----
+    # ---------------------------------------------------------------------
+    # Add y_label only when labels actually exist
+    # ---------------------------------------------------------------------
     labels_exist = df_agg["y"].notna().any()
+
     if add_y_label:
         if labels_exist:
-            y_map = {0.0: "0 (neg)", 1.0: "1 (pos)"}
+            y_map = {
+                0.0: "0 (neg)",
+                1.0: "1 (pos)",
+            }
             df_agg["y_label"] = df_agg["y"].map(y_map)
             df_agg["y_label"] = pd.Categorical(
                 df_agg["y_label"],
@@ -1178,18 +1104,23 @@ def aggregate_predictions_by_idx(
         else:
             df_agg["y_label"] = np.nan
 
-    # ---- prevalence_used ----
+    # ---------------------------------------------------------------------
+    # Add prevalence_used if requested
+    # ---------------------------------------------------------------------
     if prevalence is not False:
         if isinstance(prevalence, bool):
             if prevalence is True and labels_exist:
-                # prevalence per (model, split) using unique labeled idx
+                # Compute prevalence per model using unique labeled idx.
                 base = (
                     df_agg[df_agg["y"].notna()]
-                    .drop_duplicates(["model", "split", "idx"])[["model", "split", "y"]]
+                    .drop_duplicates(["model", "idx"])[["model", "y"]]
                 )
-                prev_map = base.groupby(["model", "split"])["y"].mean().to_dict()
+
+                prev_map = base.groupby("model")["y"].mean().to_dict()
+
                 df_agg["prevalence_used"] = [
-                    float(prev_map.get((m, s), np.nan)) for m, s in zip(df_agg["model"], df_agg["split"])
+                    float(prev_map.get(m, np.nan))
+                    for m in df_agg["model"]
                 ]
             else:
                 df_agg["prevalence_used"] = np.nan
@@ -1199,13 +1130,17 @@ def aggregate_predictions_by_idx(
                 raise ValueError(f"prevalence must be in [0,1]; got {prev_val}")
             df_agg["prevalence_used"] = prev_val
 
-    # stable ordering (keep ensemble alongside other models)
+    # ---------------------------------------------------------------------
+    # Stable sort for reproducibility
+    # ---------------------------------------------------------------------
     df_agg = df_agg.sort_values(
-        ["model", "variant", "split", "idx"],
+        ["model", "calibration", "idx"],
         kind="mergesort",
     ).reset_index(drop=True)
 
     return df_agg
+
+
 
 
 def compute_logloss_brier_from_df_agg(
@@ -1213,7 +1148,7 @@ def compute_logloss_brier_from_df_agg(
     *,
     split: str | Sequence[str] = "test",
     pred_col: str = "p_mean",
-    variants: Optional[Sequence[str]] = None,
+    calibration: Optional[Sequence[str]] = None,
     model_names: str | Sequence[str] | None = None,
     method_alias: Mapping[str, str] | None = None,
     prevalence_col: str | None = "prevalence_used",
@@ -1224,7 +1159,7 @@ def compute_logloss_brier_from_df_agg(
     and also compute prevalence-only baselines for each metric.
 
     Expected df_agg columns (minimum):
-      - model, variant, split, idx, y, <pred_col>
+      - model, calibration, split, idx, y, <pred_col>
     Optional:
       - prevalence_used (or a user-specified prevalence_col)
 
@@ -1235,7 +1170,7 @@ def compute_logloss_brier_from_df_agg(
 
     Baselines
     ---------
-    For each (variant, split) subset we compute a baseline prevalence π from:
+    For each (calibration, split) subset we compute a baseline prevalence π from:
       1) prevalence_col (if provided and present and non-null), else
       2) π = mean(y) on unique idx in that subset.
 
@@ -1246,13 +1181,13 @@ def compute_logloss_brier_from_df_agg(
     Returns
     -------
     pd.DataFrame with columns:
-      ["model","model_label","variant","split","n_labeled","prevalence_used",
+      ["model","model_label","calibration","split","n_labeled","prevalence_used",
        "log_loss","brier","baseline_log_loss","baseline_brier"]
     """
     if method_alias is None:
         method_alias = {}
 
-    required = {"model", "variant", "split", "idx", "y", pred_col}
+    required = {"model", "calibration", "split", "idx", "y", pred_col}
     missing = required - set(df_agg.columns)
     if missing:
         raise KeyError(f"df_agg is missing required columns: {sorted(missing)}")
@@ -1272,14 +1207,14 @@ def compute_logloss_brier_from_df_agg(
         if d.empty:
             raise ValueError(f"No rows found after filtering model_names={mlist} for split(s)={splits}.")
 
-    # ---- variant filter ----
-    if variants is None:
-        variants = sorted(d["variant"].astype(str).unique().tolist())
+    # ---- calibration filter ----
+    if calibration is None:
+        calibration = sorted(d["calibration"].astype(str).unique().tolist())
     else:
-        variants = list(variants)
-    d = d[d["variant"].isin(variants)].copy()
+        calibration = list(calibration)
+    d = d[d["calibration"].isin(calibration)].copy()
     if d.empty:
-        raise ValueError(f"No rows found after filtering variants={variants}.")
+        raise ValueError(f"No rows found after filtering calibration={calibration}.")
 
     # types
     d["idx"] = pd.to_numeric(d["idx"], errors="coerce").astype(int)
@@ -1289,10 +1224,10 @@ def compute_logloss_brier_from_df_agg(
     # display labels
     d["model_label"] = d["model"].map(lambda m: method_alias.get(str(m), str(m))).astype(str)
 
-    # ---- compute prevalence baseline per (variant, split) ----
+    # ---- compute prevalence baseline per (calibration, split) ----
     prev_map: dict[tuple[str, str], float] = {}
 
-    for (v, s), sub_vs in d.groupby(["variant", "split"], observed=False):
+    for (v, s), sub_vs in d.groupby(["calibration", "split"], observed=False):
         sub_l = sub_vs[sub_vs["y"].notna()].drop_duplicates(["idx"]).copy()
         if sub_l.empty:
             continue
@@ -1313,7 +1248,7 @@ def compute_logloss_brier_from_df_agg(
     # ---- compute per-model metrics ----
     out_rows: list[dict[str, Any]] = []
 
-    for (m, mlabel, v, s), sub in d.groupby(["model", "model_label", "variant", "split"], observed=False):
+    for (m, mlabel, v, s), sub in d.groupby(["model", "model_label", "calibration", "split"], observed=False):
         sub = sub.drop_duplicates(["idx"])  # safety
         sub_l = sub[sub["y"].notna()].copy()
         if sub_l.empty:
@@ -1333,7 +1268,7 @@ def compute_logloss_brier_from_df_agg(
             dict(
                 model=str(m),
                 model_label=str(mlabel),
-                variant=str(v),
+                calibration=str(v),
                 split=str(s),
                 n_labeled=int(len(y)),
                 prevalence_used=float(pi),
@@ -1352,7 +1287,7 @@ def compute_logloss_brier_from_df_agg(
         )
 
     df_metrics = df_metrics.sort_values(
-        ["split", "variant", "model_label"],
+        ["split", "calibration", "model_label"],
         kind="mergesort",
     ).reset_index(drop=True)
 
@@ -1364,7 +1299,7 @@ def plot_logloss_brier_from_df_agg(
     *,
     split: str | Sequence[str] = "test",
     pred_col: str = "p_mean",
-    variants: Optional[Sequence[str]] = None,
+    calibration: Optional[Sequence[str]] = None,
     model_names: str | Sequence[str] | None = None,
     method_alias: Mapping[str, str] | None = None,
     model_palette: Mapping[str, str] | None = None,  # keys should be *model_label*
@@ -1375,7 +1310,7 @@ def plot_logloss_brier_from_df_agg(
     baseline_color: str = "#D5F713",
     baseline_lw: float = 1.5,
     baseline_ls: str = "--",
-    show_variant_legend: bool | None = None,  # auto: show if len(variants)>1
+    show_calibration_legend: bool | None = None,  # auto: show if len(calibration)>1
     legend_loc: str = "best",
     # y-lims
     logloss_ylim: tuple[float, float] | None = None,
@@ -1391,7 +1326,7 @@ def plot_logloss_brier_from_df_agg(
 
     - Colors are applied per model_label using model_palette.
     - By default, no legend is shown for models (x-axis already labels them).
-      If multiple variants are provided, a variant legend is shown unless disabled.
+      If multiple calibration are provided, a calibration legend is shown unless disabled.
 
     Returns the metrics dataframe (same as compute_logloss_brier_from_df_agg).
     """
@@ -1405,16 +1340,16 @@ def plot_logloss_brier_from_df_agg(
         df_agg,
         split=split,
         pred_col=pred_col,
-        variants=variants,
+        calibration=calibration,
         model_names=model_names,
         method_alias=method_alias,
         prevalence_col=prevalence_col,
     )
 
-    # Decide whether to show variant legend
-    uniq_variants = sorted(df_metrics["variant"].unique().tolist())
-    if show_variant_legend is None:
-        show_variant_legend = len(uniq_variants) > 1
+    # Decide whether to show calibration legend
+    uniq_calibration = sorted(df_metrics["calibration"].unique().tolist())
+    if show_calibration_legend is None:
+        show_calibration_legend = len(uniq_calibration) > 1
 
     # Prepare palette (by model label)
     model_labels = df_metrics["model_label"].tolist()
@@ -1427,27 +1362,27 @@ def plot_logloss_brier_from_df_agg(
     model_order = uniq_models
 
     def _plot(metric_col: str, baseline_col: str, title: str, ylim: tuple[float, float] | None):
-        # aggregate over variants? no: keep variant-separated bars if multiple variants
-        # but most of your use is variants=["beta"], so it becomes single bar per model.
+        # aggregate over calibration? no: keep calibration-separated bars if multiple calibration
+        # but most of your use is calibration=["beta"], so it becomes single bar per model.
         plot_df = df_metrics.copy()
         plot_df["model_label"] = pd.Categorical(plot_df["model_label"], categories=model_order, ordered=True)
 
-        # If multiple variants, we plot grouped bars (variant within model).
-        # If single variant, no grouping needed.
+        # If multiple calibration, we plot grouped bars (calibration within model).
+        # If single calibration, no grouping needed.
         fig, ax = plt.subplots(figsize=figsize)
 
         x = np.arange(len(model_order), dtype=float)
 
-        if len(uniq_variants) == 1:
-            v = uniq_variants[0]
-            sub = plot_df[plot_df["variant"] == v].sort_values("model_label")
+        if len(uniq_calibration) == 1:
+            v = uniq_calibration[0]
+            sub = plot_df[plot_df["calibration"] == v].sort_values("model_label")
 
             heights = sub[metric_col].to_numpy(dtype=float)
 
             colors = [model_palette.get(m, None) for m in sub["model_label"].astype(str).tolist()]
             bars = ax.bar(x, heights, color=colors)
 
-            # Baseline: same for all models within (variant, split) (by construction)
+            # Baseline: same for all models within (calibration, split) (by construction)
             base_val = float(sub[baseline_col].iloc[0])
             ax.axhline(base_val, color=baseline_color, lw=baseline_lw, ls=baseline_ls, label=f"Baseline = {base_val:.3f}")
 
@@ -1472,14 +1407,14 @@ def plot_logloss_brier_from_df_agg(
             ax.legend(loc=legend_loc, prop={"size": font_size, "weight": "bold"}, title="")
 
         else:
-            # grouped bars by variant (legend for variant is useful)
-            width = 0.8 / max(1, len(uniq_variants))
-            for j, v in enumerate(uniq_variants):
-                sub = plot_df[plot_df["variant"] == v].sort_values("model_label")
+            # grouped bars by calibration (legend for calibration is useful)
+            width = 0.8 / max(1, len(uniq_calibration))
+            for j, v in enumerate(uniq_calibration):
+                sub = plot_df[plot_df["calibration"] == v].sort_values("model_label")
                 heights = sub[metric_col].to_numpy(dtype=float)
                 xj = x - 0.4 + width / 2.0 + j * width
 
-                # color by model, but variants differ by bar position, not color.
+                # color by model, but calibration differ by bar position, not color.
                 colors = [model_palette.get(m, None) for m in sub["model_label"].astype(str).tolist()]
                 bars = ax.bar(xj, heights, width=width, color=colors, label=v)
 
@@ -1496,7 +1431,7 @@ def plot_logloss_brier_from_df_agg(
                             fontweight="bold",
                         )
 
-                # baseline line per variant (usually same across variants if same labels;
+                # baseline line per calibration (usually same across calibration if same labels;
                 # but we keep it correct in case you pass subsets later)
                 base_val = float(sub[baseline_col].iloc[0])
                 ax.axhline(base_val, color=baseline_color, lw=baseline_lw, ls=baseline_ls)
@@ -1504,7 +1439,7 @@ def plot_logloss_brier_from_df_agg(
             ax.set_xticks(x)
             ax.set_xticklabels(model_order, rotation=x_tick_rotation, fontsize=font_size, fontweight="bold")
 
-            if show_variant_legend:
+            if show_calibration_legend:
                 ax.legend(loc=legend_loc, prop={"size": font_size, "weight": "bold"}, title="")
 
         ax.set_title(title, fontsize=font_size + 2, fontweight="bold")
@@ -1522,19 +1457,20 @@ def plot_logloss_brier_from_df_agg(
         plt.show()
 
     split_title = split if isinstance(split, str) else ",".join(map(str, split))
-    _plot("log_loss", "baseline_log_loss", f"Log loss across models — split={split_title}", logloss_ylim)
-    _plot("brier", "baseline_brier", f"Brier score across models — split={split_title}", brier_ylim)
+    _plot("log_loss", "baseline_log_loss", f"Log loss across models", logloss_ylim)
+    _plot("brier", "baseline_brier", f"Brier score across models", brier_ylim)
 
     return df_metrics
+
 
 
 def plot_auroc_auprc_from_df_agg(
     df_agg: pd.DataFrame,
     *,
-    split: str = "test",
+    split: str = "external",
     pred_col: str = "p_mean",
     prevalence_col: str = "prevalence_used",
-    variants: Optional[Sequence[str]] = None,
+    calibration: Optional[Sequence[str]] = None,
 
     # --- labeling / styling ---
     method_alias: Optional[Mapping[str, str]] = None,      # model_key -> display label
@@ -1564,14 +1500,14 @@ def plot_auroc_auprc_from_df_agg(
     Compute and plot AUROC and AUPRC across models from an *already aggregated* prediction table (df_agg).
 
     This is designed to consume the output of your `aggregate_predictions_by_idx(...)` (or equivalent),
-    where each row corresponds to one unit (idx) for a given (model, variant, split) and contains:
+    where each row corresponds to one unit (idx) for a given (model, calibration, split) and contains:
       - predicted probability summary (e.g., p_mean) in `pred_col`
       - optional labels in column `y` (may be NaN for unlabeled external)
       - optional prevalence baseline value in `prevalence_col` (often repeated across rows)
 
     Behavior
     --------
-    - If labels are present (at least one non-NaN y), computes AUROC/AUPRC for each (model, variant)
+    - If labels are present (at least one non-NaN y), computes AUROC/AUPRC for each (model, calibration)
       within the requested split using (y, pred_col).
     - If labels are missing (all y NaN), returns a metrics table with NaN metrics and does not
       error (plots will be skipped because metrics can’t be computed).
@@ -1587,10 +1523,10 @@ def plot_auroc_auprc_from_df_agg(
     Parameters
     ----------
     df_agg:
-        Aggregated table with columns: ["model","variant","split","idx","y", pred_col, prevalence_col(optional)].
+        Aggregated table with columns: ["model","calibration","split","idx","y", pred_col, prevalence_col(optional)].
 
     split:
-        Which split to evaluate (e.g., "test", "train_oof", "external").
+        Which split to evaluate "external"
 
     pred_col:
         Which probability column to evaluate (e.g., "p_mean").
@@ -1599,8 +1535,8 @@ def plot_auroc_auprc_from_df_agg(
         Column containing prevalence baseline value (used only for AUPRC baseline). If missing or NaN,
         AUPRC baseline is skipped.
 
-    variants:
-        Which variants to include. If None, uses all variants in df_agg for that split.
+    calibration:
+        Which calibration to include. If None, uses all calibration in df_agg for that split.
 
     method_alias:
         Optional mapping model_key -> display label (used on x-axis and for model_palette lookup).
@@ -1611,13 +1547,13 @@ def plot_auroc_auprc_from_df_agg(
     Returns
     -------
     pd.DataFrame
-        Metrics table with one row per (model, variant, split), columns:
-          ["model","model_display","variant","split","n","prevalence","auprc","auroc"]
+        Metrics table with one row per (model, calibration, split), columns:
+          ["model","model_display","calibration","split","n","prevalence","auprc","auroc"]
     """
 
     sns.set(style="whitegrid")
     
-    required = {"model", "variant", "split", "idx", "y", pred_col}
+    required = {"model", "calibration", "split", "idx", "y", pred_col}
     missing = required - set(df_agg.columns)
     if missing:
         raise KeyError(f"df_agg missing required columns: {sorted(missing)}")
@@ -1630,18 +1566,18 @@ def plot_auroc_auprc_from_df_agg(
     if d.empty:
         raise ValueError(f"No rows found in df_agg for split='{split}'.")
 
-    # variants filter
-    if variants is None:
-        variants = sorted(d["variant"].astype(str).unique().tolist())
+    # calibration filter
+    if calibration is None:
+        calibration = sorted(d["calibration"].astype(str).unique().tolist())
     else:
-        variants = list(variants)
-    d = d[d["variant"].isin(variants)].copy()
+        calibration = list(calibration)
+    d = d[d["calibration"].isin(calibration)].copy()
     if d.empty:
-        raise ValueError(f"No rows found after filtering variants={variants} for split='{split}'.")
+        raise ValueError(f"No rows found after filtering calibration={calibration} for split='{split}'.")
 
     # types
     d["model"] = d["model"].astype(str)
-    d["variant"] = d["variant"].astype(str)
+    d["calibration"] = d["calibration"].astype(str)
     d["idx"] = pd.to_numeric(d["idx"], errors="coerce").astype("Int64")
     d[pred_col] = pd.to_numeric(d[pred_col], errors="coerce").astype(float)
     d["y"] = pd.to_numeric(d["y"], errors="coerce").astype(float)
@@ -1662,10 +1598,10 @@ def plot_auroc_auprc_from_df_agg(
                 prev_val = float(pv.iloc[0])
 
     # -------------------------
-    # Compute metrics per (model, variant)
+    # Compute metrics per (model, calibration)
     # -------------------------
     rows = []
-    for (m, v), sub in d.groupby(["model", "variant"], observed=False):
+    for (m, v), sub in d.groupby(["model", "calibration"], observed=False):
         sub_labeled = sub[sub["y"].notna()].copy()
 
         n = int(sub_labeled["idx"].nunique()) if labels_exist else int(sub["idx"].nunique())
@@ -1675,7 +1611,7 @@ def plot_auroc_auprc_from_df_agg(
                 {
                     "model": m,
                     "model_display": method_alias.get(m, m),
-                    "variant": v,
+                    "calibration": v,
                     "split": split,
                     "n": n,
                     "prevalence": np.nan,
@@ -1702,7 +1638,7 @@ def plot_auroc_auprc_from_df_agg(
             {
                 "model": m,
                 "model_display": method_alias.get(m, m),
-                "variant": v,
+                "calibration": v,
                 "split": split,
                 "n": int(sub_u.shape[0]),
                 "prevalence": prevalence,
@@ -1725,29 +1661,29 @@ def plot_auroc_auprc_from_df_agg(
         title: str,
         ylim: Optional[tuple[float, float]],
     ) -> None:
-        # Expecting one variant or multiple; plot each variant separately (simple + explicit)
-        # Here: we’ll plot a grouped-by-variant bar chart if more than 1 variant.
+        # Expecting one calibration or multiple; plot each calibration separately (simple + explicit)
+        # Here: we’ll plot a grouped-by-calibrationt bar chart if more than 1 calibration.
         plot_df = df_metrics.copy()
 
         # Order by display label (stable)
         model_order = plot_df["model_display"].unique().tolist()
 
-        variants_order = variants if variants is not None else sorted(plot_df["variant"].unique().tolist())
+        calibration_order = calibration if calibration is not None else sorted(plot_df["calibration"].unique().tolist())
 
         # build bar positions
         x = np.arange(len(model_order), dtype=float)
-        n_var = len(variants_order)
+        n_var = len(calibration_order)
         width = 0.8 / max(1, n_var)
 
         fig, ax = plt.subplots(figsize=figsize)
 
-        for j, v in enumerate(variants_order):
-            sub = plot_df[plot_df["variant"] == v].copy()
+        for j, v in enumerate(calibration_order):
+            sub = plot_df[plot_df["calibration"] == v].copy()
             sub = sub.set_index("model_display").reindex(model_order).reset_index()
 
             vals = sub[metric_col].to_numpy(dtype=float)
 
-            # colors by model label (NOT by variant)
+            # colors by model label (NOT by calibration)
             if model_palette is not None:
                 colors = [model_palette.get(lbl, None) for lbl in sub["model_display"].tolist()]
             else:
@@ -1759,7 +1695,7 @@ def plot_auroc_auprc_from_df_agg(
                 xpos,
                 vals,
                 width=width,
-                label=v if n_var > 1 else None,  # only show variant legend if multiple variants
+                label=v if n_var > 1 else None,  # only show calibration legend if multiple calibration
                 color=colors,
             )
 
@@ -1820,16 +1756,16 @@ def plot_auroc_auprc_from_df_agg(
 
         # Legend:
         # - NO model legend (models are x-axis labels)
-        # - Only show legend if multiple variants OR baseline exists
+        # - Only show legend if multiple calibration OR baseline exists
         handles, labels = ax.get_legend_handles_labels()
         keep_H, keep_L = [], []
 
-        # keep variant legend only if we have >1 variant
+        # keep calibration legend only if we have >1 calibration
         if n_var > 1:
-            # keep unique variant labels
+            # keep unique calibration labels
             seen = set()
             for h, l in zip(handles, labels):
-                if l in variants_order and l not in seen:
+                if l in calibration_order and l not in seen:
                     seen.add(l)
                     keep_H.append(h)
                     keep_L.append(l)
@@ -1862,384 +1798,330 @@ def plot_auroc_auprc_from_df_agg(
     return df_metrics
 
 
+
 def barplot_balanced_accuracy_from_agg(
     df_agg: pd.DataFrame,
     *,
     model_names: str | Sequence[str] | None = None,
-    variant: str | None = None,
+    calibration: str | None = None,
     prob_col: str = "p_mean",
-    threshold_split: str = "train",
-    evaluation_split: str = "test",
-    exclude_splits: str | Sequence[str] | None = None,
-    n_grid: int = 101,
-    mode: Literal["train_threshold", "test_threshold", "split_best", "mean_train_threshold"] = "train_threshold",
-    # ---- labels / aliasing ----
+    evaluation_split: str = "external",
+
+    # --- threshold handling ---
+    threshold_value: float | Mapping[str, float] | None = None,
+    fallback_threshold: float = 0.50,
+
+    # --- labels / aliasing ---
     method_alias: Mapping[str, str] | None = None,
-    split_display_names: Mapping[str, str] | None = None,
-    # ---- styling ----
+
+    # --- styling ---
     figsize: tuple[float, float] = (9.0, 5.0),
     font_size: float = 12.0,
-    legend_loc: str = "best",
     x_tick_rotation: int = 0,
-    split_palette: Mapping[str, str] | None = None,   # e.g. {"train": "...", "test": "...", "external": "..."}
-    bar_width: float = 0.36,
-    capsize: float = 5.0,
-    # ---- baseline ----
+    bar_color: str = "#2E9B4E",
+    bar_width: float = 0.55,
+
+    # --- baseline ---
     show_baseline: bool = True,
     baseline_value: float = 0.50,
     baseline_color: str = "#D5F713",
     baseline_lw: float = 1.5,
     baseline_ls: str = "--",
-    # ---- annotation ----
-    annotate_mean_sd: bool = True,
+
+    # --- annotation ---
+    annotate: bool = True,
     annotate_decimals: int = 3,
     annotate_font_size: float | None = None,
     annotate_offset: float = 0.015,
-    # ---- y limits ----
+
+    # --- y limits ---
     ylim: tuple[float, float] | None = None,
-    # ---- console threshold summary ----
+
+    # --- console threshold summary ---
     print_threshold_summary: bool = True,
 ) -> pd.DataFrame:
     """
-    Plot balanced accuracy from an aggregated predictions table (`df_agg`) and return a
-    per-model summary table.
+    Plot balanced accuracy from an aggregated predictions table (`df_agg`) and
+    return a per-model summary table.
 
-    For each selected model, the function uses one probability column (for example `p_mean`)
-    and computes balanced accuracy on two splits:
-    - `threshold_split`: split used to choose the threshold
-    - `evaluation_split`: split used for evaluation
+    This function evaluates balanced accuracy on ONE split (typically "external")
+    using an explicitly supplied classification threshold.
 
-    The plot can show one or both split bars. If `exclude_splits` is used, those splits are
-    hidden at plotting time only; threshold selection and metric calculation are still done
-    as specified by `threshold_split`, `evaluation_split`, and `mode`.
+    Expected input
+    --------------
+    `df_agg` should contain one row per aggregated unit (for example one patient)
+    for a given:
+      - model
+      - calibration
+      - split
+      - idx
+
+    and should include:
+      - a binary label column `y`
+      - a probability column such as `p_mean`
+
+    Threshold behavior
+    ------------------
+    Thresholds are handled in this order:
+
+    1) If `threshold_value` is a float:
+         use that same threshold for all models.
+
+    2) If `threshold_value` is a mapping:
+         use the threshold for each model by model name.
+         Example:
+             {
+                 "logistic_regression": 0.41,
+                 "xgboost": 0.53,
+                 "Ensemble model": 0.47,
+             }
+
+    3) If `threshold_value` is None:
+         use `fallback_threshold` for all models.
 
     Parameters
     ----------
     df_agg:
-        Aggregated predictions table with columns such as `model`, `variant`, `split`, `y`,
-        and a probability column like `p_mean`.
+        Aggregated predictions table with columns including:
+            ["model", "calibration", "split", "idx", "y", prob_col]
 
     model_names:
-        Model name, list of model names, or None to include all models in `df_agg`.
+        Which model(s) to include:
+          - None: include all models in df_agg
+          - str: include only that model
+          - Sequence[str]: include only those models
 
-    variant:
-        Probability variant to use (for example `"beta"`). If None, the function expects only
-        one variant to be present after filtering.
+    calibration:
+        Which calibration setting to use (for example "beta").
+        If None, the function expects only one calibration to remain after filtering.
 
     prob_col:
-        Name of the probability column used for thresholding and balanced-accuracy calculation.
-
-    threshold_split:
-        Split used to select the threshold, usually `"train"`.
+        Probability column used to create hard predictions via thresholding.
 
     evaluation_split:
-        Split used for evaluation, usually `"test"` or `"external"`.
+        Which split to evaluate balanced accuracy on.
+        In your current workflow this is usually "external".
 
-    exclude_splits:
-        Split name or list of split names to hide from the plot. This affects plotting only.
+    threshold_value:
+        Threshold specification.
+          - float: same threshold for every model
+          - mapping: per-model thresholds
+          - None: use `fallback_threshold`
 
-    n_grid:
-        Number of thresholds searched on the grid from 0 to 1.
-
-    mode:
-        Thresholding strategy:
-        - `"train_threshold"`: choose threshold on `threshold_split`
-        - `"test_threshold"`: choose threshold on `evaluation_split`
-        - `"split_best"`: choose best threshold separately for each split
-        - `"mean_train_threshold"`: same intent as the fold-level version; for aggregated data
-        this behaves like `"train_threshold"`
+    fallback_threshold:
+        Threshold used when `threshold_value` is None, or when `threshold_value`
+        is a mapping and a model is missing from that mapping.
 
     method_alias:
         Optional mapping from internal model names to display labels.
 
-    split_display_names:
-        Optional mapping from split names (for example `"train"`, `"test"`, `"external"`)
-        to legend/display labels.
+    figsize, font_size, x_tick_rotation:
+        Standard plotting controls.
 
-    figsize:
-        Figure size in inches.
-
-    font_size:
-        Base font size for title, labels, ticks, and legend.
-
-    legend_loc:
-        Matplotlib legend location string.
-
-    x_tick_rotation:
-        Rotation angle for x-axis tick labels.
-
-    split_palette:
-        Optional mapping from split name to bar color.
+    bar_color:
+        Bar color used for all models.
 
     bar_width:
-        Width used for grouped bars.
-
-    capsize:
-        Error-bar cap size.
+        Width of the bars.
 
     show_baseline:
         Whether to draw a horizontal baseline reference line.
 
     baseline_value:
-        Y-value of the baseline reference line.
+        Y-value of the baseline line. For balanced accuracy this is usually 0.50.
 
-    baseline_color:
-        Color of the baseline line.
+    baseline_color, baseline_lw, baseline_ls:
+        Styling for the baseline line.
 
-    baseline_lw:
-        Line width of the baseline.
-
-    baseline_ls:
-        Line style of the baseline.
-
-    annotate_mean_sd:
-        Whether to write `mean ± SD` above each plotted bar.
+    annotate:
+        If True, annotate each bar with its balanced accuracy value.
 
     annotate_decimals:
-        Number of decimals used in bar annotations.
+        Number of decimals in bar annotations.
 
     annotate_font_size:
         Font size for annotations. If None, derived from `font_size`.
 
     annotate_offset:
-        Vertical offset added above each bar annotation.
+        Vertical offset above each bar annotation.
 
     ylim:
-        Optional y-axis limits as `(ymin, ymax)`. If None, limits are chosen automatically.
+        Optional y-axis limits.
 
     print_threshold_summary:
-        Whether to print the selected threshold(s) to the console.
+        If True, print per-model threshold summaries to the console.
 
     Returns
     -------
     pd.DataFrame
-        Summary table with one row per model, including the chosen threshold and balanced
-        accuracy for `threshold_split` and `evaluation_split`.
+        Summary table with one row per model, including:
+          - model
+          - model_label
+          - calibration
+          - evaluation_split
+          - balanced_accuracy
+          - threshold
+          - n
     """
     sns.set(style="whitegrid")
 
-    required = {"model", "variant", "split", "idx", "y", prob_col}
+    # ------------------------------------------------------------------
+    # Validate required columns
+    # ------------------------------------------------------------------
+    required = {"model", "calibration", "split", "idx", "y", prob_col}
     missing = required - set(df_agg.columns)
     if missing:
         raise KeyError(f"df_agg is missing required columns: {sorted(missing)}")
 
-    if mode not in {"train_threshold", "test_threshold", "split_best", "mean_train_threshold"}:
-        raise ValueError(
-            "mode must be 'train_threshold', 'test_threshold', 'split_best', or 'mean_train_threshold'."
-        )
-
+    # ------------------------------------------------------------------
+    # Defaults
+    # ------------------------------------------------------------------
     if method_alias is None:
         method_alias = {}
 
-    if split_display_names is None:
-        split_display_names = {
-            "train": "Train",
-            "test": "Test",
-            "external": "External",
-        }
-
-    if split_palette is None:
-        split_palette = {
-            "train": "#1587F8",
-            "test": "#F14949",
-            "external": "#2E9B4E",
-        }
-
-    if threshold_split not in split_palette:
-        raise ValueError(
-            f"threshold_split={threshold_split!r} is missing from split_palette. "
-            f"Available keys: {sorted(split_palette.keys())}"
-        )
-    if evaluation_split not in split_palette:
-        raise ValueError(
-            f"evaluation_split={evaluation_split!r} is missing from split_palette. "
-            f"Available keys: {sorted(split_palette.keys())}"
-        )
-
+    # ------------------------------------------------------------------
+    # Copy and normalize dtypes
+    # ------------------------------------------------------------------
     d = df_agg.copy()
     d["model"] = d["model"].astype(str)
-    d["variant"] = d["variant"].astype(str)
+    d["calibration"] = d["calibration"].astype(str)
     d["split"] = d["split"].astype(str)
+    d["idx"] = pd.to_numeric(d["idx"], errors="coerce").astype(int)
     d["y"] = pd.to_numeric(d["y"], errors="coerce").astype(float)
     d[prob_col] = pd.to_numeric(d[prob_col], errors="coerce").astype(float)
 
-    # -------------------------
-    # Filter model(s)
-    # -------------------------
-    if model_names is None:
-        selected = sorted(d["model"].unique().tolist())
-    elif isinstance(model_names, str):
-        selected = [model_names]
-    else:
-        selected = list(model_names)
+    # ------------------------------------------------------------------
+    # Filter evaluation split first
+    # ------------------------------------------------------------------
+    d = d[d["split"] == evaluation_split].copy()
+    if d.empty:
+        raise ValueError(f"No rows found in df_agg for evaluation_split={evaluation_split!r}.")
 
-    missing_models = [m for m in selected if m not in set(d["model"].unique())]
+    # ------------------------------------------------------------------
+    # Filter model(s)
+    # ------------------------------------------------------------------
+    available_models = sorted(d["model"].unique().tolist())
+
+    if model_names is None:
+        selected_models = available_models
+    elif isinstance(model_names, str):
+        selected_models = [model_names]
+    else:
+        selected_models = list(model_names)
+
+    missing_models = [m for m in selected_models if m not in set(available_models)]
     if missing_models:
         raise KeyError(
-            f"Model(s) not found in df_agg: {missing_models}. "
-            f"Available: {sorted(d['model'].unique().tolist())}"
+            f"Model(s) not found in df_agg for split={evaluation_split!r}: {missing_models}. "
+            f"Available: {available_models}"
         )
 
-    d = d[d["model"].isin(selected)].copy()
+    d = d[d["model"].isin(selected_models)].copy()
     if d.empty:
         raise ValueError("No rows remain after model filtering.")
 
-    # -------------------------
-    # Filter variant
-    # -------------------------
-    if variant is not None:
-        d = d[d["variant"] == variant].copy()
+    # ------------------------------------------------------------------
+    # Filter calibration
+    # ------------------------------------------------------------------
+    if calibration is not None:
+        d = d[d["calibration"] == calibration].copy()
         if d.empty:
-            raise ValueError(f"No rows found for variant={variant!r}.")
+            raise ValueError(f"No rows found for calibration={calibration!r}.")
+        calibration_value = calibration
     else:
-        variants_present = sorted(d["variant"].unique().tolist())
-        if len(variants_present) > 1:
+        calibrations_present = sorted(d["calibration"].unique().tolist())
+        if len(calibrations_present) != 1:
             raise ValueError(
-                "Multiple variants are present in df_agg after filtering. "
-                f"Please specify `variant`. Available: {variants_present}"
+                "Multiple calibration values remain after filtering. "
+                f"Please specify `calibration`. Available: {calibrations_present}"
             )
+        calibration_value = calibrations_present[0]
 
-    # -------------------------
-    # Labels
-    # -------------------------
-    model_labels = [method_alias.get(m, m) for m in selected]
+    # ------------------------------------------------------------------
+    # Resolve display labels and ensure they are unique
+    # ------------------------------------------------------------------
+    model_labels = [method_alias.get(m, m) for m in selected_models]
+
     dupes = sorted({x for x in model_labels if model_labels.count(x) > 1})
     if dupes:
-        raise ValueError(f"method_alias causes duplicate model labels: {dupes}. Make aliases unique.")
+        raise ValueError(f"method_alias causes duplicate display labels: {dupes}")
 
-    threshold_split_label = split_display_names.get(threshold_split, str(threshold_split))
-    evaluation_split_label = split_display_names.get(evaluation_split, str(evaluation_split))
+    # ------------------------------------------------------------------
+    # Helper to resolve threshold for one model
+    # ------------------------------------------------------------------
+    def _resolve_threshold(model: str) -> float:
+        # Same threshold for every model
+        if isinstance(threshold_value, (int, float, np.floating)):
+            t = float(threshold_value)
+        # Per-model threshold mapping
+        elif isinstance(threshold_value, Mapping):
+            t = float(threshold_value.get(model, fallback_threshold))
+        # Nothing provided -> fallback
+        elif threshold_value is None:
+            t = float(fallback_threshold)
+        else:
+            raise TypeError(
+                "threshold_value must be None, a float, or a mapping of {model_name: threshold}."
+            )
 
-    grid = np.linspace(0.0, 1.0, int(n_grid))
+        if not (0.0 <= t <= 1.0):
+            raise ValueError(f"Threshold for model={model!r} must be in [0, 1], got {t}")
+        return t
 
-    # -------------------------
-    # Helpers
-    # -------------------------
-    def _get_xy(model: str, split_name: str) -> tuple[np.ndarray, np.ndarray]:
-        sub = d[(d["model"] == model) & (d["split"] == split_name)].copy()
+    # ------------------------------------------------------------------
+    # Compute balanced accuracy per model
+    # ------------------------------------------------------------------
+    ba_vals: list[float] = []
+    thresholds: list[float] = []
+    n_vals: list[int] = []
 
-        # keep only labeled rows
-        sub = sub[sub["y"].notna()].copy()
+    for model in selected_models:
+        # Keep only labeled rows for the requested model and evaluation split.
+        sub = d[(d["model"] == model) & d["y"].notna()].copy()
+
         if sub.empty:
-            raise ValueError(f"No labeled rows for model={model!r}, split={split_name!r}.")
+            raise ValueError(
+                f"No labeled rows for model={model!r}, split={evaluation_split!r}."
+            )
 
-        y = sub["y"].to_numpy(dtype=float)
-        p = sub[prob_col].to_numpy(dtype=float)
+        # Defensive de-duplication: df_agg should already be one row per idx,
+        # but we keep the first just in case duplicates exist.
+        sub = sub.drop_duplicates("idx", keep="first")
 
-        uniq = set(np.unique(y[~np.isnan(y)]).tolist())
+        y_true = sub["y"].to_numpy(dtype=float)
+        y_score = sub[prob_col].to_numpy(dtype=float)
+
+        uniq = set(np.unique(y_true[~np.isnan(y_true)]).tolist())
         if not uniq.issubset({0.0, 1.0}):
             raise ValueError(
-                f"Non-binary labels found for model={model!r}, split={split_name!r}: {sorted(uniq)}"
+                f"Non-binary labels found for model={model!r}, split={evaluation_split!r}: {sorted(uniq)}"
             )
 
-        return y.astype(int), p.astype(float)
+        y_true = y_true.astype(int)
+        t_star = _resolve_threshold(model)
+        y_pred = (y_score >= t_star).astype(int)
 
-    def _best_ba_and_t(y: np.ndarray, s: np.ndarray) -> tuple[float, float]:
-        ba = np.array([balanced_accuracy_score(y, (s >= t).astype(int)) for t in grid], dtype=float)
-        j = int(np.argmax(ba))
-        return float(ba[j]), float(grid[j])
+        ba = float(balanced_accuracy_score(y_true, y_pred))
 
-    # -------------------------
-    # Compute BA per model
-    # -------------------------
-    threshold_split_vals: list[float] = []
-    evaluation_split_vals: list[float] = []
-    thresholds: list[float] = []
+        ba_vals.append(ba)
+        thresholds.append(t_star)
+        n_vals.append(int(len(sub)))
 
-    for model in selected:
-        y_thr, s_thr = _get_xy(model, threshold_split)
-        y_eval, s_eval = _get_xy(model, evaluation_split)
+    ba_means = np.array(ba_vals, dtype=float)
 
-        if mode == "split_best":
-            ba_thr, _ = _best_ba_and_t(y_thr, s_thr)
-            ba_eval, _ = _best_ba_and_t(y_eval, s_eval)
-            t_star = np.nan
-        else:
-            # mean_train_threshold collapses to train_threshold in aggregated data
-            if mode in {"train_threshold", "mean_train_threshold"}:
-                _, t_star = _best_ba_and_t(y_thr, s_thr)
-            else:  # test_threshold
-                _, t_star = _best_ba_and_t(y_eval, s_eval)
-
-            ba_thr = balanced_accuracy_score(y_thr, (s_thr >= t_star).astype(int))
-            ba_eval = balanced_accuracy_score(y_eval, (s_eval >= t_star).astype(int))
-
-        threshold_split_vals.append(float(ba_thr))
-        evaluation_split_vals.append(float(ba_eval))
-        thresholds.append(float(t_star) if not np.isnan(t_star) else np.nan)
-
-    # One aggregated BA per model, so SD is zero by construction
-    threshold_split_means = np.array(threshold_split_vals, dtype=float)
-    evaluation_split_means = np.array(evaluation_split_vals, dtype=float)
-    threshold_split_sds = np.zeros_like(threshold_split_means)
-    evaluation_split_sds = np.zeros_like(evaluation_split_means)
-
-
-
-    # -------------------------
+    # ------------------------------------------------------------------
     # Plot
-    # -------------------------
-    plot_rows = [
-        {
-            "split": threshold_split,
-            "split_label": threshold_split_label,
-            "means": threshold_split_means,
-            "sds": threshold_split_sds,
-            "color": split_palette[threshold_split],
-        },
-        {
-            "split": evaluation_split,
-            "split_label": evaluation_split_label,
-            "means": evaluation_split_means,
-            "sds": evaluation_split_sds,
-            "color": split_palette[evaluation_split],
-        },
-    ]
-
-    # Optional: exclude split bars only at plotting time
-    if exclude_splits is not None:
-        if isinstance(exclude_splits, str):
-            exclude_splits = [exclude_splits]
-        else:
-            exclude_splits = list(exclude_splits)
-
-        plot_rows = [row for row in plot_rows if row["split"] not in exclude_splits]
-
-        if len(plot_rows) == 0:
-            raise ValueError(
-                f"No split bars remain to plot after exclude_splits={exclude_splits}."
-            )
-
-    x = np.arange(len(model_labels), dtype=float)
-    width = float(bar_width)
-
-    n_bars = len(plot_rows)
-    if n_bars == 1:
-        offsets = [0.0]
-        widths = [width * 0.9]
-    else:
-        offsets = np.linspace(
-            -width * (n_bars - 1) / 2.0,
-            width * (n_bars - 1) / 2.0,
-            n_bars,
-        )
-        widths = [width] * n_bars
-
+    # ------------------------------------------------------------------
     fig, ax = plt.subplots(figsize=figsize)
 
-    bar_containers = []
+    x = np.arange(len(model_labels), dtype=float)
 
-    for row, offset, this_width in zip(plot_rows, offsets, widths):
-        bars = ax.bar(
-            x + offset,
-            row["means"],
-            this_width,
-            yerr=row["sds"],
-            capsize=capsize,
-            color=row["color"],
-            label=row["split_label"],
-        )
-        bar_containers.append((bars, row["means"], row["sds"]))
+    bars = ax.bar(
+        x,
+        ba_means,
+        width=float(bar_width),
+        color=bar_color,
+    )
 
     if show_baseline:
         ax.axhline(
@@ -2251,7 +2133,7 @@ def barplot_balanced_accuracy_from_agg(
         )
 
     ax.set_title(
-        "Balanced accuracy from aggregated predictions",
+        f"Balanced accuracy on {evaluation_split}",
         fontsize=font_size + 1,
         fontweight="bold",
     )
@@ -2259,975 +2141,67 @@ def barplot_balanced_accuracy_from_agg(
     ax.set_ylabel("Balanced accuracy", fontsize=font_size, fontweight="bold")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(model_labels, fontsize=font_size, fontweight="bold", rotation=x_tick_rotation)
+    ax.set_xticklabels(
+        model_labels,
+        fontsize=font_size,
+        fontweight="bold",
+        rotation=x_tick_rotation,
+    )
     ax.tick_params(axis="y", labelsize=font_size)
     for lab in ax.get_yticklabels():
         lab.set_fontweight("bold")
 
-    if annotate_mean_sd:
+    if annotate:
         ann_fs = annotate_font_size if annotate_font_size is not None else max(8.0, float(font_size) - 3.0)
-        offset = float(annotate_offset)
-
-        def _annotate(bars, means, sds):
-            for bar, mean, sd in zip(bars, means, sds):
-                x0 = bar.get_x() + bar.get_width() / 2.0
-                y0 = float(mean) + float(sd) + offset
-                ax.text(
-                    x0,
-                    y0,
-                    f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=ann_fs,
-                    fontweight="bold",
-                )
-
-        for bars, means, sds in bar_containers:
-            _annotate(bars, means, sds)
+        for bar, val in zip(bars, ba_means):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                float(val) + float(annotate_offset),
+                f"{val:.{annotate_decimals}f}",
+                ha="center",
+                va="bottom",
+                fontsize=ann_fs,
+                fontweight="bold",
+            )
 
     if ylim is not None:
         ax.set_ylim(*ylim)
     else:
-        top = max(
-            max(float(np.max(row["means"] + row["sds"])) for row in plot_rows),
-            float(baseline_value) if show_baseline else 0.0,
-        )
-        pad = 0.08 if annotate_mean_sd else 0.05
-        ax.set_ylim(0.0, min(1.10, top + pad))
+        top = max(float(np.max(ba_means)), float(baseline_value) if show_baseline else 0.0)
+        ax.set_ylim(0.0, min(1.10, top + 0.08))
 
-    handles, labels = ax.get_legend_handles_labels()
-    handle_map = {lab: h for h, lab in zip(handles, labels)}
-
-    ordered_labels = [row["split_label"] for row in plot_rows]
     if show_baseline:
-        ordered_labels.append(f"Baseline = {baseline_value:.2f}")
-
-    ordered_handles = [handle_map[lbl] for lbl in ordered_labels if lbl in handle_map]
-
-    ax.legend(
-        ordered_handles,
-        ordered_labels,
-        loc=legend_loc,
-        frameon=True,
-        prop={"size": font_size, "weight": "bold"},
-        title="",
-    )
+        ax.legend(
+            loc="lower right",
+            frameon=True,
+            prop={"size": font_size, "weight": "bold"},
+            title="",
+        )
 
     fig.tight_layout()
     plt.show()
 
-    # -------------------------
+    # ------------------------------------------------------------------
     # Summary output
-    # -------------------------
+    # ------------------------------------------------------------------
     summary = pd.DataFrame(
         {
-            "model": selected,
+            "model": selected_models,
             "model_label": model_labels,
-            "variant": variant if variant is not None else d["variant"].iloc[0],
-            "threshold_split": threshold_split,
+            "calibration": calibration_value,
             "evaluation_split": evaluation_split,
-            "threshold_split_ba": threshold_split_means,
-            "evaluation_split_ba": evaluation_split_means,
+            "balanced_accuracy": ba_means,
             "threshold": thresholds,
+            "n": n_vals,
         }
     )
 
     if print_threshold_summary:
-        if mode == "split_best":
-            print("Per-model threshold summary:")
-            print("  split_best uses independent best thresholds per split, so no single shared threshold is reported.")
-        else:
-            print("Per-model selected threshold summary:")
-            for label, t in zip(model_labels, thresholds):
-                print(f"  {label}: {t:.3f}")
-
-
+        print("Per-model threshold summary:")
+        for label, t in zip(model_labels, thresholds):
+            print(f"  {label}: {t:.3f}")
 
     return summary
 
 
 
-# def evaluate_external_validation_results(
-#     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
-#     metrics_to_compute: Optional[list[str]] = None,
-#     calibration_methods: Optional[list[str]] = None,
-# ) -> dict[str, list[dict[str, Any]]]:
-#     """
-#     Recompute metrics from stored y/scores for external validation.
-
-#     Expected keys per fold dict (if external validation exists):
-#       - "y_external"
-#       - "y_external_scores"                      (uncalibrated)
-#     Optional calibrated keys (per method):
-#       - "calib_external_predictions_<method>"    (e.g. platt, beta)
-
-#     Supported metrics (by name):
-#       - "average_precision"
-#       - "roc_auc"
-#       - "brier_score_loss"
-#       - "log_loss"
-
-#     Returns
-#     -------
-#     eval_results : dict[str, list[dict[str, Any]]]
-#         Fold-level entries keyed by model name. Each fold entry includes:
-#           - "model_name", "trial", "outer_fold"
-#           - "external_prevalence": positive-class prevalence on external set
-#           - "n_external" (if present in the fold dict)
-#           - metric keys:
-#               external_<metric>
-#               external_<method>_<metric>   (if calibrated preds exist)
-#     """
-#     if metrics_to_compute is None:
-#         metrics_to_compute = [
-#             "average_precision",
-#             "roc_auc",
-#             "brier_score_loss",
-#             "log_loss",
-#         ]
-
-#     if calibration_methods is None:
-#         calibration_methods = []
-
-#     # Map metric name -> sklearn function
-#     metric_fns: dict[str, Any] = {}
-#     for m in metrics_to_compute:
-#         if m == "average_precision":
-#             metric_fns[m] = metrics.average_precision_score
-#         elif m == "roc_auc":
-#             metric_fns[m] = metrics.roc_auc_score
-#         elif m == "brier_score_loss":
-#             metric_fns[m] = metrics.brier_score_loss
-#         elif m == "log_loss":
-#             # wrap so we can safely pass labels=[0,1]
-#             metric_fns[m] = lambda y, p: metrics.log_loss(y, p, labels=[0, 1])
-#         else:
-#             raise ValueError(f"Unsupported metric: {m}")
-
-#     eval_results: dict[str, list[dict[str, Any]]] = {}
-
-#     for model_name, folds in all_results.items():
-#         model_entries: list[dict[str, Any]] = []
-
-#         for r in folds:
-#             # Skip folds that don't have external validation
-#             if "y_external" not in r or "y_external_scores" not in r:
-#                 continue
-
-#             y_ext = np.asarray(r["y_external"])
-#             y_ext_scores = np.asarray(r["y_external_scores"])
-
-#             external_prevalence = float(np.mean(y_ext))
-
-#             entry: dict[str, Any] = {
-#                 "model_name": r.get("model_name", model_name),
-#                 "trial": r.get("trial"),
-#                 "outer_fold": r.get("outer_fold"),
-#                 "external_prevalence": external_prevalence,
-#             }
-
-#             if "n_external" in r:
-#                 entry["n_external"] = int(r["n_external"])
-
-#             # Uncalibrated external metrics
-#             for m_name, scorer in metric_fns.items():
-#                 entry[f"external_{m_name}"] = float(scorer(y_ext, y_ext_scores))
-
-#                 # Calibrated external metrics per method (if present)
-#                 for method in calibration_methods:
-#                     ext_calib_key = f"calib_external_predictions_{method}"
-#                     if ext_calib_key in r:
-#                         entry[f"external_{method}_{m_name}"] = float(
-#                             scorer(y_ext, np.asarray(r[ext_calib_key]))
-#                         )
-
-#             model_entries.append(entry)
-
-#         eval_results[model_name] = model_entries
-
-#     return eval_results
-
-
-
-# from typing import Any, Mapping, Sequence, Optional
-# import numpy as np
-# import pandas as pd
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-
-
-# def plot_external_brier_logloss(
-#     external_eval_results: Mapping[str, Sequence[Mapping[str, Any]]],
-#     model_names: str | Sequence[str] | None = None,
-#     use_calibrated: bool = False,
-#     calibration_method: str | None = None,
-#     figsize: tuple[float, float] = (9.0, 4.0),
-#     font_size: float = 12.0,
-#     x_tick_rotation: int = 0,
-#     method_alias: Mapping[str, str] | None = None,
-#     external_color: str = "#06B850",   # DEFAULT as requested
-#     show_prevalence_baseline: bool = True,
-#     prevalence: float | None = None,
-#     brier_baseline_color: str = "#D5F713",
-#     logloss_baseline_color: str = "#D5F713",
-#     baseline_lw: float = 1.5,
-#     baseline_ls: str = "--",
-#     annotate_mean_sd: bool = True,
-#     annotate_decimals: int = 3,
-#     annotate_font_size: float | None = None,
-#     annotate_offset: float = 0.015,
-#     brier_ylim: tuple[float, float] | None = None,
-#     logloss_ylim: tuple[float, float] | None = None,
-# ) -> None:
-#     """
-#     Plot external validation Brier score and Log loss as two separate bar charts across models,
-#     using mean ± SD across outer folds, with optional prevalence baselines and per-bar annotations.
-
-#     Expected keys in each fold entry (from evaluate_external_validation_results):
-#       - external_prevalence
-#       - external_brier_score_loss, external_log_loss (uncalibrated)
-#       - external_<method>_brier_score_loss, external_<method>_log_loss (if calibrated)
-#     """
-
-#     if method_alias is None:
-#         method_alias = {}
-
-#     # -------------------------
-#     # Choose models
-#     # -------------------------
-#     if model_names is None:
-#         model_names = list(external_eval_results.keys())
-#     elif isinstance(model_names, str):
-#         model_names = [model_names]
-#     else:
-#         model_names = list(model_names)
-
-#     missing = [m for m in model_names if m not in external_eval_results]
-#     if missing:
-#         raise KeyError(
-#             f"Model(s) not found in external_eval_results: {missing}. "
-#             f"Available: {list(external_eval_results.keys())}"
-#         )
-
-#     model_labels = [method_alias.get(m, m) for m in model_names]
-#     if len(set(model_labels)) != len(model_labels):
-#         dupes = pd.Series(model_labels)[pd.Series(model_labels).duplicated(keep=False)].unique().tolist()
-#         raise ValueError(
-#             f"method_alias causes duplicate model labels {dupes}. "
-#             f"Make aliases unique (or omit aliasing for colliding model names)."
-#         )
-
-#     # -------------------------
-#     # Prevalence baseline (optional)
-#     # -------------------------
-#     if show_prevalence_baseline:
-#         if prevalence is not None:
-#             p_mean = float(prevalence)
-#         else:
-#             prev_vals = [
-#                 float(entry["external_prevalence"])
-#                 for m in model_names
-#                 for entry in external_eval_results[m]
-#                 if "external_prevalence" in entry
-#             ]
-#             if len(prev_vals) == 0:
-#                 raise KeyError(
-#                     "No 'external_prevalence' values found in external_eval_results entries. "
-#                     "Pass prevalence=... explicitly or ensure evaluate_external_validation_results stores it."
-#                 )
-#             p_mean = float(np.mean(prev_vals))
-
-#         if not (0.0 < p_mean < 1.0):
-#             raise ValueError(f"prevalence must be in (0, 1); got {p_mean}")
-
-#         brier_baseline = float(p_mean * (1.0 - p_mean))
-#         logloss_baseline = float(-(p_mean * np.log(p_mean) + (1.0 - p_mean) * np.log(1.0 - p_mean)))
-#     else:
-#         brier_baseline = None
-#         logloss_baseline = None
-
-#     # -------------------------
-#     # Helper: build tidy DF (single split: External)
-#     # -------------------------
-#     def _collect(metric_label: str, key: str) -> pd.DataFrame:
-#         rows: list[dict[str, Any]] = []
-#         for m in model_names:
-#             display = method_alias.get(m, m)
-#             for f in external_eval_results[m]:
-#                 if key not in f:
-#                     raise KeyError(
-#                         f"Key '{key}' not found for model '{m}'. "
-#                         f"Did you compute external metrics (and calibration='{calibration_method}' if applicable)?"
-#                     )
-#                 rows.append({"model": display, "split": "External", "score": f[key]})
-#         df = pd.DataFrame(rows)
-#         df["metric"] = metric_label
-#         return df
-
-#     # -------------------------
-#     # Pick metric keys
-#     # -------------------------
-#     if not use_calibrated:
-#         brier_key = "external_brier_score_loss"
-#         ll_key = "external_log_loss"
-#         title_suffix = " (external, uncalibrated)"
-#     else:
-#         if calibration_method is None:
-#             raise ValueError("calibration_method must be provided when use_calibrated=True.")
-#         brier_key = f"external_{calibration_method}_brier_score_loss"
-#         ll_key = f"external_{calibration_method}_log_loss"
-#         title_suffix = f" (external, calibrated: {calibration_method})"
-
-#     df_brier = _collect("Brier", brier_key)
-#     df_ll = _collect("LogLoss", ll_key)
-
-#     sns.set(style="whitegrid")
-
-#     # -------------------------
-#     # Plot helper
-#     # -------------------------
-#     def _plot_metric(
-#         df: pd.DataFrame,
-#         y_label: str,
-#         baseline_value: float | None,
-#         baseline_color: str,
-#         baseline_label: str | None,
-#         ylim: tuple[float, float] | None = None,
-#     ) -> None:
-#         plt.figure(figsize=figsize)
-#         ax = sns.barplot(
-#             data=df,
-#             x="model",
-#             y="score",
-#             estimator=np.mean,
-#             errorbar=("sd"),
-#             order=model_labels,
-#             saturation=1,
-#             color=external_color,   # single-color bars
-#         )
-
-#         if baseline_value is not None and baseline_label is not None:
-#             ax.axhline(
-#                 float(baseline_value),
-#                 ls=baseline_ls,
-#                 lw=baseline_lw,
-#                 color=baseline_color,
-#                 label=baseline_label,
-#             )
-
-#         ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
-#         ax.set_ylabel(y_label, fontsize=font_size, fontweight="bold")
-#         ax.set_title(
-#             f"{y_label} across models{title_suffix}",
-#             fontsize=font_size + 2,
-#             fontweight="bold",
-#         )
-
-#         ax.tick_params(axis="both", labelsize=font_size)
-#         for label in ax.get_xticklabels() + ax.get_yticklabels():
-#             label.set_fontweight("bold")
-#         ax.tick_params(axis="x", rotation=x_tick_rotation)
-
-#         if ylim is not None:
-#             ax.set_ylim(*ylim)
-
-#         # -------------------------
-#         # Annotate mean ± SD above each bar (one bar per model)
-#         # -------------------------
-#         if annotate_mean_sd:
-#             summary = (
-#                 df.groupby(["model"])["score"]
-#                   .agg(mean="mean", sd=lambda x: np.std(x, ddof=1))
-#                   .reset_index()
-#             )
-#             summary["sd"] = summary["sd"].fillna(0.0)
-
-#             stats = {r["model"]: (float(r["mean"]), float(r["sd"])) for _, r in summary.iterrows()}
-
-#             ann_fs = annotate_font_size if annotate_font_size is not None else max(8, float(font_size) - 3)
-#             offset = float(annotate_offset)
-
-#             # ax.patches aligns with order=model_labels
-#             for model_label, bar in zip(model_labels, ax.patches):
-#                 mean, sd = stats[model_label]
-#                 x = bar.get_x() + bar.get_width() / 2.0
-#                 y = mean + sd + offset
-#                 ax.text(
-#                     x, y,
-#                     f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
-#                     ha="center", va="bottom",
-#                     fontsize=ann_fs, fontweight="bold",
-#                 )
-
-#             # expand y-limit if not forced
-#             top = max(m + s for (m, s) in stats.values()) + offset + 0.05
-#             if ylim is None:
-#                 y0, y1 = ax.get_ylim()
-#                 ax.set_ylim(y0, max(y1, top))
-
-#         # If baseline is shown, keep legend; otherwise omit
-#         if baseline_value is not None and baseline_label is not None:
-#             ax.legend(title="", loc="best", prop={"size": font_size, "weight": "bold"})
-
-#         plt.tight_layout()
-#         plt.show()
-
-#     _plot_metric(
-#         df_brier,
-#         "Brier score",
-#         brier_baseline,
-#         brier_baseline_color,
-#         None if brier_baseline is None else f"Baseline = {brier_baseline:.2f}",
-#         ylim=brier_ylim,
-#     )
-
-#     _plot_metric(
-#         df_ll,
-#         "Log loss",
-#         logloss_baseline,
-#         logloss_baseline_color,
-#         None if logloss_baseline is None else f"Baseline = {logloss_baseline:.2f}",
-#         ylim=logloss_ylim,
-#     )
-
-
-
-# from typing import Any, Mapping, Sequence, Optional
-# import numpy as np
-# import pandas as pd
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-
-
-# def plot_external_auprc_auroc(
-#     external_eval_results: Mapping[str, Sequence[Mapping[str, Any]]],
-#     model_names: str | Sequence[str] | None = None,
-#     use_calibrated: bool = False,
-#     calibration_method: str | None = None,
-#     figsize: tuple[float, float] = (9.0, 4.0),
-#     font_size: float = 12.0,
-#     legend_loc: str = "best",
-#     x_tick_rotation: int = 0,
-#     method_alias: Mapping[str, str] | None = None,
-#     external_color: str = "#06B850",   # DEFAULT requested
-#     # ---- baseline / prevalence handling ----
-#     show_prevalence_baseline: bool = True,
-#     prevalence: float | None = None,  # override; else mean of entry["external_prevalence"]
-#     auroc_baseline_color: str = "#D5F713",
-#     auprc_baseline_color: str = "#D5F713",
-#     baseline_lw: float = 1.5,
-#     baseline_ls: str = "--",
-#     # ---- annotation ----
-#     annotate_mean_sd: bool = True,
-#     annotate_decimals: int = 3,
-#     annotate_font_size: float | None = None,
-#     annotate_offset: float = 0.015,
-#     # ---- per-metric y-limits ----
-#     auprc_ylim: tuple[float, float] | None = None,
-#     auroc_ylim: tuple[float, float] | None = None,
-# ) -> None:
-#     """
-#     Plot External AUPRC and AUROC as two separate bar charts across models,
-#     using mean ± SD across outer folds.
-
-#     Expected keys in each fold entry (from evaluate_external_validation_results):
-#       - external_prevalence
-#       - external_average_precision, external_roc_auc (uncalibrated)
-#       - external_<method>_average_precision, external_<method>_roc_auc (calibrated)
-#     """
-
-#     if method_alias is None:
-#         method_alias = {}
-
-#     # -------------------------
-#     # Choose models
-#     # -------------------------
-#     if model_names is None:
-#         model_names = list(external_eval_results.keys())
-#     elif isinstance(model_names, str):
-#         model_names = [model_names]
-#     else:
-#         model_names = list(model_names)
-
-#     missing = [m for m in model_names if m not in external_eval_results]
-#     if missing:
-#         raise KeyError(
-#             f"Model(s) not found in external_eval_results: {missing}. "
-#             f"Available: {list(external_eval_results.keys())}"
-#         )
-
-#     model_labels = [method_alias.get(m, m) for m in model_names]
-#     if len(set(model_labels)) != len(model_labels):
-#         dupes = pd.Series(model_labels)[pd.Series(model_labels).duplicated(keep=False)].unique().tolist()
-#         raise ValueError(
-#             f"method_alias causes duplicate model labels {dupes}. "
-#             f"Make aliases unique (or omit aliasing for colliding model names)."
-#         )
-
-#     # -------------------------
-#     # Prevalence baseline (AUPRC baseline)
-#     # -------------------------
-#     p_mean: float | None = None
-#     if show_prevalence_baseline:
-#         if prevalence is not None:
-#             p_mean = float(prevalence)
-#         else:
-#             prev_vals = [
-#                 float(entry["external_prevalence"])
-#                 for m in model_names
-#                 for entry in external_eval_results[m]
-#                 if "external_prevalence" in entry
-#             ]
-#             if len(prev_vals) == 0:
-#                 raise KeyError(
-#                     "No 'external_prevalence' values found in external_eval_results entries. "
-#                     "Pass prevalence=... explicitly or ensure external evaluator stores it."
-#                 )
-#             p_mean = float(np.mean(prev_vals))
-
-#     # -------------------------
-#     # Build tidy DF per metric (single split: External)
-#     # -------------------------
-#     def _collect(metric: str, key: str) -> pd.DataFrame:
-#         rows: list[dict[str, Any]] = []
-#         for m in model_names:
-#             display = method_alias.get(m, m)
-#             for f in external_eval_results[m]:
-#                 if key not in f:
-#                     raise KeyError(
-#                         f"Key '{key}' not found for model '{m}'. "
-#                         f"Did you compute external metrics (and calibration='{calibration_method}' if applicable)?"
-#                     )
-#                 rows.append({"model": display, "split": "External", "score": f[key]})
-#         df = pd.DataFrame(rows)
-#         df["metric"] = metric
-#         return df
-
-#     # -------------------------
-#     # Pick metric keys
-#     # -------------------------
-#     if not use_calibrated:
-#         ap_key = "external_average_precision"
-#         roc_key = "external_roc_auc"
-#         title_suffix = " (external, uncalibrated)"
-#     else:
-#         if calibration_method is None:
-#             raise ValueError("calibration_method must be provided when use_calibrated=True.")
-#         ap_key = f"external_{calibration_method}_average_precision"
-#         roc_key = f"external_{calibration_method}_roc_auc"
-#         title_suffix = f" (external, calibrated: {calibration_method})"
-
-#     df_ap = _collect("AUPRC", ap_key)
-#     df_roc = _collect("AUROC", roc_key)
-
-#     sns.set(style="whitegrid")
-
-#     # -------------------------
-#     # Plot helper
-#     # -------------------------
-#     def _plot_df(
-#         df: pd.DataFrame,
-#         metric_name: str,
-#         ylim: tuple[float, float] | None = None,
-#     ) -> None:
-#         plt.figure(figsize=figsize)
-#         ax = sns.barplot(
-#             data=df,
-#             x="model",
-#             y="score",
-#             estimator=np.mean,
-#             errorbar=("sd"),
-#             order=model_labels,
-#             saturation=1,
-#             color=external_color,
-#         )
-
-#         # Baselines
-#         if metric_name == "AUPRC" and show_prevalence_baseline and p_mean is not None:
-#             ax.axhline(
-#                 float(p_mean),
-#                 ls=baseline_ls,
-#                 lw=baseline_lw,
-#                 color=auprc_baseline_color,
-#                 label=f"Baseline = {float(p_mean):.2f}",
-#             )
-
-#         if metric_name == "AUROC":
-#             ax.axhline(
-#                 0.5,
-#                 ls=baseline_ls,
-#                 lw=baseline_lw,
-#                 color=auroc_baseline_color,
-#                 label="Baseline = 0.50",
-#             )
-
-#         ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
-#         ax.set_ylabel(metric_name, fontsize=font_size, fontweight="bold")
-#         ax.set_title(
-#             f"{metric_name} across models{title_suffix}",
-#             fontsize=font_size + 2,
-#             fontweight="bold",
-#         )
-
-#         ax.tick_params(axis="both", labelsize=font_size)
-#         for label in ax.get_xticklabels() + ax.get_yticklabels():
-#             label.set_fontweight("bold")
-
-#         ax.tick_params(axis="x", rotation=x_tick_rotation)
-
-#         if ylim is not None:
-#             ax.set_ylim(*ylim)
-
-#         # Annotate mean ± SD (one bar per model)
-#         if annotate_mean_sd:
-#             summary = (
-#                 df.groupby(["model"])["score"]
-#                   .agg(mean="mean", sd=lambda x: np.std(x, ddof=1))
-#                   .reset_index()
-#             )
-#             summary["sd"] = summary["sd"].fillna(0.0)
-#             stats = {r["model"]: (float(r["mean"]), float(r["sd"])) for _, r in summary.iterrows()}
-
-#             ann_fs = annotate_font_size if annotate_font_size is not None else max(8, float(font_size) - 3)
-#             offset = float(annotate_offset)
-
-#             for model_label, bar in zip(model_labels, ax.patches):
-#                 mean, sd = stats[model_label]
-#                 x = bar.get_x() + bar.get_width() / 2.0
-#                 y = mean + sd + offset
-#                 ax.text(
-#                     x, y,
-#                     f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
-#                     ha="center", va="bottom",
-#                     fontsize=ann_fs, fontweight="bold",
-#                 )
-
-#             top = max(m + s for (m, s) in stats.values()) + offset + 0.05
-#             if ylim is None:
-#                 y0, y1 = ax.get_ylim()
-#                 ax.set_ylim(y0, max(y1, max(1.05, top)))
-#         else:
-#             if ylim is None:
-#                 ax.set_ylim(0.0, 1.05)
-
-#         ax.legend(title="", loc=legend_loc, prop={"size": font_size, "weight": "bold"})
-#         plt.tight_layout()
-#         plt.show()
-
-#     _plot_df(df_ap, "AUPRC", ylim=auprc_ylim)
-#     _plot_df(df_roc, "AUROC", ylim=auroc_ylim)
-
-
-# from typing import Any, Mapping, Sequence, Literal
-# import numpy as np
-# import matplotlib.pyplot as plt
-# from sklearn.metrics import balanced_accuracy_score
-
-
-# def barplot_external_balanced_accuracy(
-#     all_results: Mapping[str, Sequence[Mapping[str, Any]]],
-#     model_names: str | Sequence[str] | None = None,
-#     use_calibrated: bool = False,
-#     calibration_method: str | None = None,
-#     n_grid: int = 101,
-#     mode: Literal["train_threshold", "test_threshold"] = "train_threshold",
-#     # ---- labels / aliasing ----
-#     method_alias: Mapping[str, str] | None = None,
-#     # ---- styling ----
-#     figsize: tuple[float, float] = (9.0, 5.0),
-#     font_size: float = 12.0,
-#     legend_loc: str = "best",
-#     x_tick_rotation: int = 0,
-#     external_color: str = "#06B850",   # DEFAULT requested
-#     bar_width: float = 0.55,
-#     capsize: float = 5.0,
-#     # ---- baseline ----
-#     show_baseline: bool = True,
-#     baseline_value: float = 0.50,
-#     baseline_color: str = "#D5F713",
-#     baseline_lw: float = 1.5,
-#     baseline_ls: str = "--",
-#     # ---- annotation ----
-#     annotate_mean_sd: bool = True,
-#     annotate_decimals: int = 3,
-#     annotate_font_size: float | None = None,
-#     annotate_offset: float = 0.015,
-#     # ---- y limits ----
-#     ylim: tuple[float, float] | None = None,
-#     # ---- console threshold summary ----
-#     print_threshold_summary: bool = True,
-# ) -> None:
-#     """
-#     External-only balanced accuracy bar plot.
-
-#     For each model and each outer fold record `r` that contains external predictions:
-#       1) Choose a threshold t* on a grid over [0,1] using either:
-#            mode="train_threshold": (y_train, train_scores)
-#            mode="test_threshold" : (y_test,  test_scores)
-#       2) Apply that t* to external scores and compute BA on (y_external, external_scores).
-#       3) Aggregate external BA across folds: mean ± SD, plot one bar per model ("External").
-
-#     Score sources:
-#       If use_calibrated=False:
-#         - threshold selection:
-#             train: y_train_scores, test: y_test_scores
-#         - external eval:
-#             y_external_scores
-#       If use_calibrated=True:
-#         - threshold selection:
-#             train: cv_calib_train_predictions_{method}
-#             test : calib_test_predictions_{method}
-#         - external eval:
-#             calib_external_predictions_{method}
-#     """
-#     # -------------------------
-#     # Validation / defaults
-#     # -------------------------
-#     if use_calibrated and calibration_method is None:
-#         raise ValueError("calibration_method must be provided when use_calibrated=True.")
-#     if mode not in {"train_threshold", "test_threshold"}:
-#         raise ValueError("mode must be 'train_threshold' or 'test_threshold'.")
-
-#     if method_alias is None:
-#         method_alias = {}
-
-#     # -------------------------
-#     # Choose models
-#     # -------------------------
-#     if model_names is None:
-#         selected = list(all_results.keys())
-#     elif isinstance(model_names, str):
-#         selected = [model_names]
-#     else:
-#         selected = list(model_names)
-
-#     missing = [m for m in selected if m not in all_results]
-#     if missing:
-#         raise KeyError(f"Model(s) not found in all_results: {missing}. Available: {list(all_results.keys())}")
-
-#     model_labels = [method_alias.get(m, m) for m in selected]
-#     if len(set(model_labels)) != len(model_labels):
-#         dupes = sorted({x for x in model_labels if model_labels.count(x) > 1})
-#         raise ValueError(f"method_alias causes duplicate model labels: {dupes}. Make aliases unique.")
-
-#     grid = np.linspace(0.0, 1.0, int(n_grid))
-
-#     # -------------------------
-#     # Helpers
-#     # -------------------------
-#     def _get_threshold_split_y_scores(r: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-#         """Return (y, scores) for threshold selection split (train or test)."""
-#         if mode == "train_threshold":
-#             y_key = "y_train"
-#             if not use_calibrated:
-#                 s_key = "y_train_scores"
-#             else:
-#                 s_key = f"cv_calib_train_predictions_{calibration_method}"
-#         else:  # test_threshold
-#             y_key = "y_test"
-#             if not use_calibrated:
-#                 s_key = "y_test_scores"
-#             else:
-#                 s_key = f"calib_test_predictions_{calibration_method}"
-
-#         if y_key not in r or s_key not in r:
-#             raise KeyError(f"Missing keys '{y_key}'/'{s_key}' in fold record.")
-#         return np.asarray(r[y_key]), np.asarray(r[s_key])
-
-#     def _get_external_y_scores(r: Mapping[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-#         """Return (y_external, external_scores)."""
-#         y_key = "y_external"
-#         if not use_calibrated:
-#             s_key = "y_external_scores"
-#         else:
-#             s_key = f"calib_external_predictions_{calibration_method}"
-
-#         if y_key not in r or s_key not in r:
-#             raise KeyError(f"Missing keys '{y_key}'/'{s_key}' in fold record.")
-#         return np.asarray(r[y_key]), np.asarray(r[s_key])
-
-#     def _best_ba_and_t(y: np.ndarray, s: np.ndarray) -> tuple[float, float]:
-#         ba = np.array([balanced_accuracy_score(y, (s >= t).astype(int)) for t in grid], dtype=float)
-#         j = int(np.argmax(ba))
-#         return float(ba[j]), float(grid[j])
-
-#     # -------------------------
-#     # Compute per-fold external BA for each model
-#     # -------------------------
-#     ext_vals_per_model: list[np.ndarray] = []
-#     tstars_per_model: list[np.ndarray] = []
-
-#     for model in selected:
-#         folds = all_results[model]
-
-#         ext_ba: list[float] = []
-#         tstars: list[float] = []
-
-#         for r in folds:
-#             # need external keys present; if not, skip fold
-#             if "y_external" not in r:
-#                 continue
-
-#             try:
-#                 y_thr, s_thr = _get_threshold_split_y_scores(r)
-#                 _, t_star = _best_ba_and_t(y_thr, s_thr)
-
-#                 y_ext, s_ext = _get_external_y_scores(r)
-#                 ext_ba.append(balanced_accuracy_score(y_ext, (s_ext >= t_star).astype(int)))
-#                 tstars.append(t_star)
-#             except KeyError:
-#                 continue
-
-#         if len(ext_ba) == 0:
-#             raise ValueError(
-#                 f"No usable folds with external predictions found for model '{model}'. "
-#                 "Check that your fold dicts contain y_external + external score keys."
-#             )
-
-#         ext_vals_per_model.append(np.array(ext_ba, dtype=float))
-#         tstars_per_model.append(np.array(tstars, dtype=float))
-
-#     ext_means = np.array([v.mean() for v in ext_vals_per_model], dtype=float)
-#     ext_sds = np.array([v.std(ddof=1) if v.size > 1 else 0.0 for v in ext_vals_per_model], dtype=float)
-
-#     # -------------------------
-#     # Plot
-#     # -------------------------
-#     x = np.arange(len(model_labels), dtype=float)
-
-#     fig, ax = plt.subplots(figsize=figsize)
-
-#     bars_ext = ax.bar(
-#         x,
-#         ext_means,
-#         bar_width,
-#         yerr=ext_sds,
-#         capsize=capsize,
-#         color=external_color,
-#         label="External",
-#     )
-
-#     if show_baseline:
-#         ax.axhline(
-#             float(baseline_value),
-#             linestyle=baseline_ls,
-#             linewidth=baseline_lw,
-#             color=baseline_color,
-#             label=f"Baseline = {baseline_value:.2f}",
-#         )
-
-#     # title_suffix = " (calibrated)" if use_calibrated else " (uncalibrated)"
-#     # if use_calibrated:
-#     #     title_suffix = f" (calibrated: {calibration_method})"
-#     # title_suffix += f", threshold via {mode.replace('_', ' ')}"
-#     title_suffix=''
-
-#     ax.set_title(
-#         f"External balanced accuracy across folds{title_suffix}",
-#         fontsize=font_size + 1,
-#         fontweight="bold",
-#     )
-#     ax.set_xlabel("Model", fontsize=font_size, fontweight="bold")
-#     ax.set_ylabel("Balanced accuracy", fontsize=font_size, fontweight="bold")
-
-#     ax.set_xticks(x)
-#     ax.set_xticklabels(model_labels, fontsize=font_size, fontweight="bold", rotation=x_tick_rotation)
-#     ax.tick_params(axis="y", labelsize=font_size)
-#     for lab in ax.get_yticklabels():
-#         lab.set_fontweight("bold")
-
-#     # ---- annotations ----
-#     if annotate_mean_sd:
-#         ann_fs = annotate_font_size if annotate_font_size is not None else max(8.0, float(font_size) - 3.0)
-#         offset = float(annotate_offset)
-#         for bar, mean, sd in zip(bars_ext, ext_means, ext_sds):
-#             x0 = bar.get_x() + bar.get_width() / 2.0
-#             y0 = float(mean) + float(sd) + offset
-#             ax.text(
-#                 x0,
-#                 y0,
-#                 f"{mean:.{annotate_decimals}f} ± {sd:.{annotate_decimals}f}",
-#                 ha="center",
-#                 va="bottom",
-#                 fontsize=ann_fs,
-#                 fontweight="bold",
-#             )
-
-#     # ---- y-lims ----
-#     if ylim is not None:
-#         ax.set_ylim(*ylim)
-#     else:
-#         top = max(
-#             float(np.max(ext_means + ext_sds)),
-#             float(baseline_value) if show_baseline else 0.0,
-#         )
-#         pad = 0.08 if annotate_mean_sd else 0.05
-#         ax.set_ylim(0.0, min(1.10, top + pad))
-
-#     ax.legend(loc=legend_loc, frameon=True, prop={"size": font_size, "weight": "bold"}, title="")
-#     fig.tight_layout()
-#     plt.show()
-
-#     # -------------------------
-#     # Optional: print threshold summary
-#     # -------------------------
-#     if print_threshold_summary and mode in {"train_threshold", "test_threshold"}:
-#         print("Per-model selected threshold summary (mean ± SD across folds):")
-#         for label, tarr in zip(model_labels, tstars_per_model):
-#             if tarr.size == 0:
-#                 print(f"  {label}: (no thresholds computed)")
-#                 continue
-#             t_mean = float(np.mean(tarr))
-#             t_sd = float(np.std(tarr, ddof=1)) if tarr.size > 1 else 0.0
-#             print(f"  {label}: {t_mean:.3f} ± {t_sd:.3f}")
-
-# external_eval_results = evaluate_external_validation_results(
-#     all_results,
-#     metrics_to_compute=["average_precision", "roc_auc", "brier_score_loss", "log_loss"],
-#     calibration_methods=["platt", "beta"],
-# )
-
-# plot_external_brier_logloss(
-#     external_eval_results,
-#     model_names=None,
-#     use_calibrated=True,
-#     calibration_method="beta",
-#     method_alias={"logistic_regression": "Logistic regression", "xgboost": "XGBoost"},
-#     external_color="#06B850",  # optional, already default
-#     figsize=(7, 5),
-#     show_prevalence_baseline=True,
-#     annotate_font_size=10,
-#     logloss_ylim=(0, 1),
-# )
-
-# plot_external_auprc_auroc(
-#     external_eval_results,
-#     model_names=None,
-#     use_calibrated=True,
-#     calibration_method="beta",
-#     method_alias={"logistic_regression": "Logistic regression", "xgboost": "XGBoost"},
-#     external_color="#06B850",   # optional; default already
-#     figsize=(7, 5),
-#     legend_loc="lower right",
-#     show_prevalence_baseline=True,
-#     annotate_font_size=10,
-#     auprc_ylim=(0, 1.0),
-#     auroc_ylim=(0, 1.0),
-# )
-
-# barplot_external_balanced_accuracy(
-#     all_results,
-#     model_names=None,
-#     use_calibrated=True,
-#     calibration_method="beta",
-#     mode="train_threshold",
-#     method_alias={"logistic_regression": "Logistic regression", "xgboost": "XGBoost"},
-#     external_color="#06B850",   # optional; default already
-#     show_baseline=True,
-#     baseline_color="#D5F713",
-#     figsize=(7, 5),
-#     legend_loc="lower right",
-#     annotate_font_size=10,
-#     ylim=(0, 1),
-#     print_threshold_summary=True,
-# )
