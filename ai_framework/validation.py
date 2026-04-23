@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapp
 import numpy as np
 import pandas as pd
 
-
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
 from sklearn.model_selection._split import BaseCrossValidator  # for typing
@@ -859,8 +860,6 @@ def build_long_predictions_df(
     return df_long
 
 
-
-
 def aggregate_predictions_by_idx(
     df_long: pd.DataFrame,
     *,
@@ -872,6 +871,7 @@ def aggregate_predictions_by_idx(
     add_ensemble: bool = True,
     ensemble_name: str = "Ensemble model",
     ensemble_models: Sequence[str] | None = None,
+    truncate_decimals: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Aggregate repeated EXTERNAL predictions per idx into a single row per
@@ -934,6 +934,10 @@ def aggregate_predictions_by_idx(
         Which models to pool for the ensemble.
         If None, pool all selected models after model_name filtering.
 
+    truncate_decimals:
+        If not None, truncate probability-style output columns to this many decimal
+        places after all calculations are complete. This is truncation, not rounding.
+
     Returns
     -------
     pd.DataFrame
@@ -948,6 +952,12 @@ def aggregate_predictions_by_idx(
           - optional prevalence_used
           - split="external" for consistency
     """
+    def _truncate_decimals(x: float, decimals: int):
+        if pd.isna(x):
+            return x
+        factor = 10 ** decimals
+        return np.trunc(float(x) * factor) / factor
+
     # ---------------------------------------------------------------------
     # Validate required columns
     # ---------------------------------------------------------------------
@@ -1004,8 +1014,6 @@ def aggregate_predictions_by_idx(
     # ---------------------------------------------------------------------
     # Helper to carry forward the first non-missing y value within a group
     # ---------------------------------------------------------------------
-    # This is useful because repeated predictions for the same idx should all
-    # correspond to the same ground-truth label when labels are available.
     def _first_non_nan(x: pd.Series) -> float:
         x = pd.to_numeric(x, errors="coerce")
         x = x[~x.isna()]
@@ -1131,6 +1139,17 @@ def aggregate_predictions_by_idx(
             df_agg["prevalence_used"] = prev_val
 
     # ---------------------------------------------------------------------
+    # Apply truncation to probability-style columns at the very end
+    # ---------------------------------------------------------------------
+    if truncate_decimals is not None:
+        if truncate_decimals < 0:
+            raise ValueError("truncate_decimals must be >= 0 or None.")
+        prob_cols = [c for c in df_agg.columns if c.startswith("p_")]
+        df_agg[prob_cols] = df_agg[prob_cols].apply(
+            lambda s: s.map(lambda x: _truncate_decimals(x, truncate_decimals))
+        )
+
+    # ---------------------------------------------------------------------
     # Stable sort for reproducibility
     # ---------------------------------------------------------------------
     df_agg = df_agg.sort_values(
@@ -1139,9 +1158,6 @@ def aggregate_predictions_by_idx(
     ).reset_index(drop=True)
 
     return df_agg
-
-
-
 
 def compute_logloss_brier_from_df_agg(
     df_agg: pd.DataFrame,
@@ -2204,4 +2220,359 @@ def barplot_balanced_accuracy_from_agg(
     return summary
 
 
+
+
+def plot_screening_predictions(
+    df_pred: pd.DataFrame,
+    *,
+    models: Sequence[str],
+    calibration: str = "beta",
+    center_col: str = "p_mean",
+    std_col: str = "p_std",
+    cutoff: float = 0.70,
+    reference_order_model: str | None = None,
+    method_alias: Mapping[str, str] | None = None,
+    model_colors: Sequence[str] = ("#4C97E8", "#EC6868", "#55A868", "#8172B2"),
+    selected_color: str = "#4C97E8",
+    below_threshold_color: str = "#EC6868",
+    ribbon_color_single_model: str = "#ADAAAA",
+    ylim: tuple[float, float] = (0.0, 1.0),
+    shade_alpha: float = 0.16,
+    linewidth: float = 1.8,
+    marker: str = "o",
+    markersize: float = 3.0,
+    markevery: int = 1,
+    figsize: tuple[float, float] = (12, 6),
+    font_size: int = 12,
+    cutoff_color: str = "#222222",
+    cutoff_ls: str = "--",
+    cutoff_lw: float = 1.5,
+    positive_rule: str = "gt",
+    title_prefix: str = "Ranked screening risk",
+    line_zorder: int = 3,
+    ribbon_zorder: int = 1,
+    cutoff_zorder: int = 4,
+    return_ranked: bool = True,
+) -> dict[str, pd.DataFrame] | None:
+    """
+    Plot ranked screening probabilities using a shared patient order.
+
+    Behavior
+    --------
+    - Patients are ordered once using `reference_order_model`.
+    - That same patient order is then reused for all plotted models.
+    - If multiple models are plotted, each model gets its own color.
+    - If exactly one model is plotted, the single ranked curve is split into
+      two threshold-defined color segments:
+        * selected for enrichment
+        * below threshold
+      and the uncertainty ribbon uses a neutral color.
+
+    Parameters
+    ----------
+    df_pred : pd.DataFrame
+        Patient-level prediction summary dataframe. Must contain:
+        ["model", "calibration", "idx", center_col, std_col].
+
+    models : Sequence[str]
+        Model names to plot.
+
+    calibration : str, default="beta"
+        Calibration variant to filter on.
+
+    center_col : str, default="p_mean"
+        Prediction summary column used for sorting patients and plotting the
+        ranked screening curve.
+
+    std_col : str, default="p_std"
+        Standard deviation column used for the shaded uncertainty ribbon.
+
+    cutoff : float, default=0.70
+        Enrichment threshold.
+
+    reference_order_model : str | None, default=None
+        Model used to define the shared patient order. Patients are sorted by
+        descending `center_col` from this model, and that same order is reused
+        for all plotted models. If None, the first model in `models` is used.
+
+    method_alias : Mapping[str, str] | None, default=None
+        Optional display-name mapping for plot labels.
+
+    model_colors : Sequence[str]
+        Colors used for model lines when plotting multiple models.
+
+    selected_color : str, default="#4C97E8"
+        Line color for points above threshold when plotting a single model.
+
+    below_threshold_color : str, default="#EC6868"
+        Line color for points at/below threshold when plotting a single model.
+
+    ribbon_color_single_model : str, default="#BFBFBF"
+        Neutral ribbon color used in single-model mode so the uncertainty band
+        does not visually imply membership in the selected group.
+
+    ylim : tuple[float, float], default=(0.0, 1.0)
+        Y-axis range.
+
+    shade_alpha : float, default=0.16
+        Transparency of the shaded ±1 SD ribbon.
+
+    positive_rule : str, default="gt"
+        Rule used to define selected patients:
+          - "gt": selected if center_col > cutoff
+          - "ge": selected if center_col >= cutoff
+
+    title_prefix : str, default="Ranked screening risk"
+        Plot title.
+
+    line_zorder, ribbon_zorder, cutoff_zorder : int
+        Z-order controls for line, ribbon, and cutoff line.
+
+    return_ranked : bool, default=True
+        If True, return ranked/ordered dataframes per model.
+
+    Returns
+    -------
+    dict[str, pd.DataFrame] | None
+        Ordered dataframe per model if `return_ranked=True`, else None.
+    """
+    required_cols = {"model", "calibration", "idx", center_col, std_col}
+    missing = required_cols - set(df_pred.columns)
+    if missing:
+        raise KeyError(f"df_pred is missing required columns: {sorted(missing)}")
+
+    if not models:
+        raise ValueError("You must provide at least one model name in `models`.")
+
+    if positive_rule not in {"gt", "ge"}:
+        raise ValueError("positive_rule must be either 'gt' or 'ge'.")
+
+    if method_alias is None:
+        method_alias = {}
+
+    if reference_order_model is None:
+        reference_order_model = str(models[0])
+
+    def _pretty_prediction_name(col: str) -> str:
+        """Convert internal column names into reader-friendly phrases."""
+        mapping = {
+            "p_mean": "mean predicted probability",
+            "p_median": "median predicted probability",
+            "p_max": "maximum predicted probability",
+            "p_min": "minimum predicted probability",
+            "p_std": "prediction standard deviation",
+        }
+        return mapping.get(col, col.replace("_", " "))
+
+    # Build the reference ordering once.
+    ref = df_pred.copy()
+    ref = ref[
+        (ref["model"].astype(str) == str(reference_order_model))
+        & (ref["calibration"].astype(str) == str(calibration))
+    ].copy()
+
+    if ref.empty:
+        raise ValueError(
+            f"No rows found for reference_order_model='{reference_order_model}' "
+            f"and calibration='{calibration}'."
+        )
+
+    ref[center_col] = pd.to_numeric(ref[center_col], errors="coerce")
+    ref = ref.dropna(subset=[center_col]).copy()
+
+    if ref.empty:
+        raise ValueError(
+            f"Reference model '{reference_order_model}' has no valid "
+            f"'{center_col}' values."
+        )
+
+    # Shared patient order for all models.
+    ref = ref.sort_values(center_col, ascending=False).reset_index(drop=True)
+    reference_patient_order: list = ref["idx"].tolist()
+    reference_rank_map: dict = {
+        patient_idx: rank
+        for rank, patient_idx in enumerate(reference_patient_order, start=1)
+    }
+
+    ranked_results: dict[str, pd.DataFrame] = {}
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Collect valid model data first so we know whether we are in single-model
+    # or multi-model mode.
+    plot_data: list[tuple[str, str, pd.DataFrame]] = []
+
+    for model_name in models:
+        d = df_pred.copy()
+        d = d[
+            (d["model"].astype(str) == str(model_name))
+            & (d["calibration"].astype(str) == str(calibration))
+        ].copy()
+
+        # Skip requested models that do not exist in the data.
+        if d.empty:
+            continue
+
+        d[center_col] = pd.to_numeric(d[center_col], errors="coerce")
+        d[std_col] = pd.to_numeric(d[std_col], errors="coerce")
+        d = d.dropna(subset=[center_col]).copy()
+
+        if d.empty:
+            continue
+
+        # Keep only patients present in the reference ordering so all plotted
+        # models share the same patient x-axis meaning.
+        d = d[d["idx"].isin(reference_rank_map)].copy()
+        if d.empty:
+            continue
+
+        # Apply shared patient order from the reference model.
+        d["patient_rank"] = d["idx"].map(reference_rank_map)
+        d = d.sort_values("patient_rank", ascending=True).reset_index(drop=True)
+
+        if positive_rule == "gt":
+            selected_mask = d[center_col] > cutoff
+        else:
+            selected_mask = d[center_col] >= cutoff
+
+        d["selected_for_enrichment"] = selected_mask
+        ranked_results[str(model_name)] = d.copy()
+
+        display_name = method_alias.get(str(model_name), str(model_name))
+        plot_data.append((str(model_name), display_name, d))
+
+    if not plot_data:
+        raise ValueError(
+            "No valid rows were found for the requested model(s) and calibration."
+        )
+
+    single_model_mode = len(plot_data) == 1
+
+    for i, (model_name, display_name, d) in enumerate(plot_data):
+        x = d["patient_rank"].to_numpy(dtype=int)
+        y = d[center_col].to_numpy(dtype=float)
+        s = d[std_col].fillna(0.0).to_numpy(dtype=float)
+        selected_mask = d["selected_for_enrichment"].to_numpy(dtype=bool)
+
+        lo = np.clip(y - s, ylim[0], ylim[1])
+        hi = np.clip(y + s, ylim[0], ylim[1])
+
+        # Use a neutral ribbon for the single-model case so the uncertainty band
+        # is visually separate from the threshold-based line colors.
+        ribbon_color = (
+            ribbon_color_single_model
+            if single_model_mode
+            else model_colors[i % len(model_colors)]
+        )
+
+        ax.fill_between(
+            x,
+            lo,
+            hi,
+            color=ribbon_color,
+            alpha=shade_alpha,
+            zorder=ribbon_zorder,
+            label="±1 SD" if (single_model_mode and i == 0) else None,
+        )
+
+        n_selected = int(selected_mask.sum())
+        n_total = int(len(d))
+
+        if single_model_mode:
+            # Single-model mode:
+            # Plot the same ranked patient sequence in two color segments based
+            # on whether each patient is above or below the enrichment cutoff.
+            x_sel = x[selected_mask]
+            y_sel = y[selected_mask]
+
+            x_not = x[~selected_mask]
+            y_not = y[~selected_mask]
+
+            if len(x_sel) > 0:
+                ax.plot(
+                    x_sel,
+                    y_sel,
+                    color=selected_color,
+                    linewidth=linewidth,
+                    marker=marker,
+                    markersize=markersize,
+                    markevery=markevery,
+                    label=f"Selected for enrichment (n={len(x_sel)})",
+                    zorder=line_zorder,
+                )
+
+            if len(x_not) > 0:
+                ax.plot(
+                    x_not,
+                    y_not,
+                    color=below_threshold_color,
+                    linewidth=linewidth,
+                    marker=marker,
+                    markersize=markersize,
+                    markevery=markevery,
+                    label=f"Below threshold (n={len(x_not)})",
+                    zorder=line_zorder,
+                )
+        else:
+            # Multi-model mode:
+            # Each model gets a distinct color, since color now encodes method.
+            line_color = model_colors[i % len(model_colors)]
+            ax.plot(
+                x,
+                y,
+                color=line_color,
+                linewidth=linewidth,
+                marker=marker,
+                markersize=markersize,
+                markevery=markevery,
+                label=f"{display_name} (selected {n_selected}/{n_total})",
+                zorder=line_zorder,
+            )
+
+    ax.axhline(
+        y=cutoff,
+        color=cutoff_color,
+        linestyle=cutoff_ls,
+        linewidth=cutoff_lw,
+        label=f"Cutoff = {cutoff:.2f}",
+        zorder=cutoff_zorder,
+    )
+
+    ref_display_name = method_alias.get(
+        str(reference_order_model), str(reference_order_model)
+    )
+    center_col_label = _pretty_prediction_name(center_col)
+
+    ax.set_ylim(*ylim)
+    ax.set_xlabel(
+        f"Patients (ordered by descending {center_col_label} from {ref_display_name})",
+        fontsize=font_size,
+        fontweight="bold",
+    )
+    ax.set_ylabel(
+        "Predicted probability",
+        fontsize=font_size,
+        fontweight="bold",
+    )
+    ax.set_title(
+        title_prefix,
+        fontsize=font_size + 2,
+        fontweight="bold",
+    )
+
+    # Patient rank is discrete, so keep x-axis ticks as integers.
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Make axis values bold as well.
+    ax.tick_params(axis="both", labelsize=font_size)
+    for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
+        tick_label.set_fontweight("bold")
+
+    ax.legend(prop={"size": font_size, "weight": "bold"})
+    fig.tight_layout()
+    plt.show()
+
+    if return_ranked:
+        return ranked_results
+    return None
 

@@ -8241,6 +8241,7 @@ def pooled_patient_risk_summary(
     splits: Optional[Sequence[str]] = None,
     include_test: bool = True,
     include_train_oof: bool = False,
+    truncate_decimals: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Aggregate row-/window-level predicted probabilities into unit-level (e.g., patient-level) summaries.
@@ -8305,6 +8306,9 @@ def pooled_patient_risk_summary(
     splits / include_test / include_train_oof:
         Controls which split rows are kept before aggregation.
         If `splits` is provided it is used directly; otherwise it is built from the include_* flags.
+    truncate_decimals:
+        If not None, truncate probability-style output columns to this many decimal places
+        after all calculations are complete. This is truncation, not rounding.
 
     Returns
     -------
@@ -8320,7 +8324,13 @@ def pooled_patient_risk_summary(
         - winsorization metadata: lower_q, upper_q, p_cap_low, p_cap_high
         - softmax metadata: beta, eps (if agg="softmax")
         - quantile metadata: quantile (if agg="quantile")
-"""
+    """
+
+    def _truncate_decimals(x: float, decimals: int):
+        if pd.isna(x):
+            return x
+        factor = 10 ** decimals
+        return np.trunc(float(x) * factor) / factor
 
     # -------------------------
     # Split filtering
@@ -8368,7 +8378,7 @@ def pooled_patient_risk_summary(
         raise KeyError(f"unit_col='{unit_col}' not found in df_long columns.")
 
     # -------------------------
-    # grouping=None -> "all_trials" (minimal change)
+    # grouping=None -> "all_trials"
     # -------------------------
     if grouping is None:
         grouping = "all_trials"
@@ -8386,7 +8396,7 @@ def pooled_patient_risk_summary(
     group_cols = GROUPING_SCHEMES[grouping]
 
     # -------------------------
-    # Validation (minimal: subject_id/group_label optional)
+    # Validation
     # -------------------------
     required_base = {"model", "variant", "split", "y", "p", unit_col}
     missing = required_base - set(d.columns)
@@ -8475,7 +8485,6 @@ def pooled_patient_risk_summary(
                 "p_cap_high": hi,
             }
         )
-                
 
         if agg == "quantile":
             row["quantile"] = float(quantile)
@@ -8485,7 +8494,279 @@ def pooled_patient_risk_summary(
 
         out_rows.append(row)
 
-    return pd.DataFrame(out_rows)
+    out = pd.DataFrame(out_rows)
+
+    if truncate_decimals is not None:
+        if truncate_decimals < 0:
+            raise ValueError("truncate_decimals must be >= 0 or None.")
+        prob_cols = [c for c in out.columns if c.startswith("p_")]
+        out[prob_cols] = out[prob_cols].apply(
+            lambda s: s.map(lambda x: _truncate_decimals(x, truncate_decimals))
+        )
+
+    return out
+
+# def pooled_patient_risk_summary(
+#     df_long: pd.DataFrame,
+#     *,
+#     agg: Literal["mean", "median", "max", "quantile", "softmax"] = "mean",
+#     quantile: float = 0.75,
+#     beta: float = 5.0,
+#     eps: float = 1e-6,
+#     lower_q: float = 0.05,
+#     upper_q: float = 0.95,
+#     ddof: int = 0,
+#     grouping: Literal["all_trials", "per_trial_fold"] | None = "all_trials",
+#     unit_col: Optional[str] = "group",
+#     splits: Optional[Sequence[str]] = None,
+#     include_test: bool = True,
+#     include_train_oof: bool = False,
+# ) -> pd.DataFrame:
+#     """
+#     Aggregate row-/window-level predicted probabilities into unit-level (e.g., patient-level) summaries.
+
+#     This function takes a "long" prediction table where each unit (patient/subject) may appear multiple
+#     times (e.g., many EEG windows, and/or repeated cross-validation runs), and returns one row per unit
+#     (within each model/variant/split), summarizing the distribution of predicted probabilities.
+
+#     Expected input (df_long)
+#     ------------------------
+#     Must include:
+#     - model:   model name/identifier
+#     - variant: calibration/variant label (e.g., "beta", "uncalib")
+#     - split:   split label (e.g., "test", "train_oof")
+#     - p:       predicted probability in [0, 1]
+#     - y:       true label (0/1)
+#     - unit_col: column identifying the unit you want to aggregate to (default "group"; can be "idx")
+
+#     May include (optional):
+#     - subject_id: string subject identifier
+#     - group_label: human-readable label (if missing, the output uses y as group_label)
+
+#     If grouping="per_trial_fold", df_long must also include:
+#     - trial, outer_fold
+
+#     Key idea
+#     --------
+#     Within each grouping bucket, probabilities are optionally winsorized (capped at within-bucket
+#     quantiles), then aggregated to a single "center" probability (mean/median/max/quantile/softmax),
+#     and a within-bucket spread (std) is computed.
+
+#     Parameters
+#     ----------
+#     agg:
+#         How to summarize probabilities within each unit bucket:
+#         - "mean": mean(p_used)
+#         - "median": median(p_used)
+#         - "max": max(p_used)
+#         - "quantile": quantile(p_used, quantile)
+#         - "softmax": softmax-pooled weighted mean emphasizing higher-evidence windows
+#             weights = softmax(beta * logit(p_used)), p_softmax = sum_i w_i * p_used_i
+#     quantile:
+#         Quantile used when agg="quantile" (e.g., 0.75 for 75th percentile).
+#     beta, eps:
+#         Softmax sharpness and numerical stability when agg="softmax".
+#     lower_q, upper_q:
+#         Winsorization cutoffs applied *within each group bucket*.
+#         - lower_q == 0.0 disables lower capping
+#         - upper_q == 1.0 disables upper capping
+#         - lower_q=0.0 and upper_q=1.0 disables winsorization entirely (p_used == p)
+#     ddof:
+#         Degrees of freedom for std computation (np.std).
+#     grouping:
+#         Defines the groupby key (the aggregation unit):
+#         - "all_trials":      ["model","variant","split", unit_col]
+#             Pools all rows for a unit across all trials/folds (if present).
+#         - "per_trial_fold":  ["model","variant","split","trial","outer_fold", unit_col]
+#             Produces one unit summary per CV run (trial × outer_fold).
+#         - None: alias for "all_trials".
+#     unit_col:
+#         Column name identifying the unit being summarized (e.g., "group" or "idx").
+#     splits / include_test / include_train_oof:
+#         Controls which split rows are kept before aggregation.
+#         If `splits` is provided it is used directly; otherwise it is built from the include_* flags.
+
+#     Returns
+#     -------
+#     pd.DataFrame
+#         One row per grouping key with:
+#         - grouping key columns (depends on grouping)
+#         - subject_id (if present, else NaN)
+#         - group_label (if present, else y)
+#         - y
+#         - n_windows: number of non-NaN probabilities used
+#         - p_mean / p_median / p_max / p_qXX / p_softmax (depending on agg)
+#         - p_total_std: std of p_used within the bucket
+#         - winsorization metadata: lower_q, upper_q, p_cap_low, p_cap_high
+#         - softmax metadata: beta, eps (if agg="softmax")
+#         - quantile metadata: quantile (if agg="quantile")
+# """
+
+#     # -------------------------
+#     # Split filtering
+#     # -------------------------
+#     if "split" not in df_long.columns:
+#         raise KeyError("df_long must contain a 'split' column for split filtering.")
+
+#     if splits is not None:
+#         splits_list = list(splits)
+#         if len(splits_list) == 0:
+#             raise ValueError("If provided, splits must be a non-empty list/sequence of split names.")
+#     else:
+#         splits_list = []
+#         if include_test:
+#             splits_list.append("test")
+#         if include_train_oof:
+#             splits_list.append("train_oof")
+#         if len(splits_list) == 0:
+#             raise ValueError(
+#                 "No splits selected. Set include_test/include_train_oof to True, "
+#                 "or pass splits=['test', 'train_oof', ...]."
+#             )
+
+#     d = df_long[df_long["split"].isin(splits_list)].copy()
+
+#     if d.empty:
+#         present = sorted(df_long["split"].dropna().unique().tolist())
+#         raise ValueError(
+#             f"After filtering, no rows remain for splits={splits_list}. "
+#             f"Splits present in df_long: {present}"
+#         )
+
+#     # -------------------------
+#     # Infer unit_col if needed
+#     # -------------------------
+#     if unit_col is None:
+#         for cand in ("group", "subject_id", "idx"):
+#             if cand in d.columns:
+#                 unit_col = cand
+#                 break
+#         if unit_col is None:
+#             raise KeyError("Could not infer unit_col. Please pass unit_col='group' or 'idx' (or another id column).")
+
+#     if unit_col not in d.columns:
+#         raise KeyError(f"unit_col='{unit_col}' not found in df_long columns.")
+
+#     # -------------------------
+#     # grouping=None -> "all_trials" (minimal change)
+#     # -------------------------
+#     if grouping is None:
+#         grouping = "all_trials"
+
+#     # -------------------------
+#     # Grouping schemes
+#     # -------------------------
+#     GROUPING_SCHEMES = {
+#         "all_trials": ["model", "variant", "split", unit_col],
+#         "per_trial_fold": ["model", "variant", "split", "trial", "outer_fold", unit_col],
+#     }
+#     if grouping not in GROUPING_SCHEMES:
+#         raise ValueError(f"Unknown grouping='{grouping}'. Choose one of {list(GROUPING_SCHEMES)}")
+
+#     group_cols = GROUPING_SCHEMES[grouping]
+
+#     # -------------------------
+#     # Validation (minimal: subject_id/group_label optional)
+#     # -------------------------
+#     required_base = {"model", "variant", "split", "y", "p", unit_col}
+#     missing = required_base - set(d.columns)
+#     if missing:
+#         raise KeyError(f"df_long missing required columns: {sorted(missing)}")
+
+#     need_cols = set(group_cols) - set(d.columns)
+#     if need_cols:
+#         raise KeyError(f"grouping='{grouping}' requires missing columns: {sorted(need_cols)}")
+
+#     d["p"] = pd.to_numeric(d["p"], errors="coerce")
+
+#     # -------------------------
+#     # Output column naming
+#     # -------------------------
+#     if agg == "quantile":
+#         q_tag = int(round(quantile * 100))
+#         center_col = f"p_q{q_tag}"
+#     elif agg == "softmax":
+#         center_col = "p_softmax"
+#     else:
+#         center_col = {"mean": "p_mean", "median": "p_median", "max": "p_max"}[agg]
+
+#     out_rows: list[dict] = []
+
+#     apply_low = (lower_q > 0.0)
+#     apply_high = (upper_q < 1.0)
+
+#     for keys, gdf in d.groupby(group_cols, sort=False):
+#         p = gdf["p"].to_numpy(dtype=float)
+#         p = p[~np.isnan(p)]
+#         if p.size == 0:
+#             continue
+
+#         # Winsorize (optional, per side)
+#         if not apply_low and not apply_high:
+#             lo = np.nan
+#             hi = np.nan
+#             p_used = p
+#         else:
+#             lo = float(np.quantile(p, lower_q)) if apply_low else np.nan
+#             hi = float(np.quantile(p, upper_q)) if apply_high else np.nan
+#             lo_clip = lo if apply_low else -np.inf
+#             hi_clip = hi if apply_high else np.inf
+#             p_used = np.clip(p, lo_clip, hi_clip)
+
+#         # Aggregate
+#         if agg == "mean":
+#             p_center = float(np.mean(p_used))
+#         elif agg == "median":
+#             p_center = float(np.median(p_used))
+#         elif agg == "max":
+#             p_center = float(np.max(p_used))
+#         elif agg == "quantile":
+#             p_center = float(np.quantile(p_used, quantile))
+#         else:  # "softmax"
+#             p_clip = np.clip(p_used, eps, 1.0 - eps)
+#             s = np.log(p_clip) - np.log1p(-p_clip)  # logit(p)
+#             t = beta * s
+#             t = t - np.max(t)
+#             w = np.exp(t)
+#             w_sum = np.sum(w)
+#             if not np.isfinite(w_sum) or w_sum == 0.0:
+#                 p_center = float(np.mean(p_used))
+#             else:
+#                 w = w / w_sum
+#                 p_center = float(np.sum(w * p_used))
+
+#         # Spread
+#         p_std = float(np.std(p_used, ddof=ddof))
+
+#         row = dict(zip(group_cols, keys if isinstance(keys, tuple) else (keys,)))
+#         row.update(
+#             {
+#                 "grouping": grouping,
+#                 "unit_col": unit_col,
+#                 "subject_id": gdf["subject_id"].iloc[0] if "subject_id" in gdf.columns else np.nan,
+#                 "group_label": gdf["group_label"].iloc[0] if "group_label" in gdf.columns else int(gdf["y"].iloc[0]),
+#                 "y": int(gdf["y"].iloc[0]),
+#                 "n_windows": int(p.size),
+#                 center_col: p_center,
+#                 "p_total_std": p_std,
+#                 "lower_q": float(lower_q),
+#                 "upper_q": float(upper_q),
+#                 "p_cap_low": lo,
+#                 "p_cap_high": hi,
+#             }
+#         )
+                
+
+#         if agg == "quantile":
+#             row["quantile"] = float(quantile)
+#         if agg == "softmax":
+#             row["beta"] = float(beta)
+#             row["eps"] = float(eps)
+
+#         out_rows.append(row)
+
+#     return pd.DataFrame(out_rows)
+
 
 
 def plot_ranked_patients_patient_level(
@@ -8924,7 +9205,6 @@ from tqdm.auto import tqdm, trange
 def _drop_none_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Remove keys whose value is None."""
     return {k: v for k, v in params.items() if v is not None}
-
 
 
 def _instantiate_model_from_cfg(
@@ -9610,6 +9890,8 @@ def plot_permutation_importances_barplot(
       run_permutation_importance_pipeline(...)[2] (model_feature_names).
     - Error bars show standard deviation across repeats (concatenated across folds).
     """
+
+    
     if method_alias is None:
         method_alias = {}
 
