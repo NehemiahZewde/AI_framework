@@ -3114,25 +3114,19 @@ def make_synthetic_feature_selection_dataset(
 
 
 
-
-from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
-from sklearn.model_selection._split import BaseCrossValidator  # for typing
-
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping
-
-
-from typing import Any, Dict, List, Optional, Sequence
-import numpy as np
-
-
-
-from typing import Any, Dict, List, Optional, Sequence
-import numpy as np
-
-
 # ---------------------------------------------------------------------
 # Nested cross-validation feature selection 
 # ---------------------------------------------------------------------
+
+from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
+from sklearn.model_selection._split import BaseCrossValidator  # for typing
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping
+from typing import Any, Dict, List, Optional, Sequence
+import numpy as np
+from typing import Any, Dict, List, Optional, Sequence
+import numpy as np
+
+
 def make_outer_inner_cv(
     model_selection: str,
     n_outer_splits: int,
@@ -3363,12 +3357,6 @@ def build_nested_cv_splits(
             )
 
     return split_plan
-
-
-
-
-
-
 
 
 
