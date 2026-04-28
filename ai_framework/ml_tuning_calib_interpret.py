@@ -9069,6 +9069,12 @@ def plot_ranked_patients_patient_level(
             return np.linspace(0.0, 100.0, n, dtype=float)
         raise ValueError(f"x_mode must be 'index' or 'percentile', got: {x_mode}")
 
+
+    # -------------------------
+    # Plot style
+    # -------------------------
+    sns.set(style="whitegrid")
+
     # -------------------------
     # Build plots per variant
     # -------------------------

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, Optional, Tuple, Union, Sequence, List, Mapping
+from typing import Any, Dict, Optional, Tuple, Union, Sequence, List, Mapping, Literal
 import math
 from statistics import NormalDist
-
+from scipy.stats import binom, binomtest
 
 Threshold = Union[float, Tuple[float, float]]
 
+
+
+Threshold = Union[float, Tuple[float, float]]
 
 def preprocess_by_threshold(
     df: pd.DataFrame,
@@ -1013,6 +1016,409 @@ def ppv_precision_sample_size_from_summary(
 
     return out
 
+
+def _binary_power_binomial(
+    *,
+    n: int,
+    p_alt: float,
+    p_null: float,
+    alpha: float,
+    alternative: Literal["larger", "smaller", "two-sided"],
+) -> float:
+    """
+    Binomial power for a binary enrichment endpoint.
+
+    This computes the probability of rejecting H0 under the assumed true
+    selected positive rate p_alt.
+
+    The rejection region is defined using an exact binomial test under p_null.
+    Power is then computed by summing the binomial probabilities of that
+    rejection region under p_alt.
+    """
+    if alternative == "larger":
+        reject_ks = [
+            k
+            for k in range(n + 1)
+            if binomtest(k, n, p=p_null, alternative="greater").pvalue <= alpha
+        ]
+
+    elif alternative == "smaller":
+        reject_ks = [
+            k
+            for k in range(n + 1)
+            if binomtest(k, n, p=p_null, alternative="less").pvalue <= alpha
+        ]
+
+    else:
+        reject_ks = [
+            k
+            for k in range(n + 1)
+            if binomtest(k, n, p=p_null, alternative="two-sided").pvalue <= alpha
+        ]
+
+    if len(reject_ks) == 0:
+        return 0.0
+
+    power = sum(binom.pmf(k, n, p_alt) for k in reject_ks)
+
+    return float(np.clip(power, 0.0, 1.0))
+
+
+def _binary_power_normal(
+    *,
+    n: int,
+    p_alt: float,
+    p_null: float,
+    alpha: float,
+    alternative: Literal["larger", "smaller", "two-sided"],
+) -> float:
+    """
+    Normal-approximation power for a binary enrichment endpoint.
+
+    This approximates the selected positive rate as normally distributed.
+
+    This is less exact than the binomial method, but can be useful as a quick
+    approximation or comparison.
+    """
+    nd = NormalDist()
+
+    # Standard error under the null defines the rejection boundary.
+    se_null = math.sqrt(p_null * (1.0 - p_null) / n)
+
+    # Standard error under the alternative defines variability when p=p_alt.
+    se_alt = math.sqrt(p_alt * (1.0 - p_alt) / n)
+
+    if se_null == 0 or se_alt == 0:
+        return float("nan")
+
+    if alternative == "larger":
+        z_alpha = nd.inv_cdf(1.0 - alpha)
+        critical_rate = p_null + z_alpha * se_null
+
+        power = 1.0 - nd.cdf((critical_rate - p_alt) / se_alt)
+
+    elif alternative == "smaller":
+        z_alpha = nd.inv_cdf(1.0 - alpha)
+        critical_rate = p_null - z_alpha * se_null
+
+        power = nd.cdf((critical_rate - p_alt) / se_alt)
+
+    else:
+        z_alpha = nd.inv_cdf(1.0 - alpha / 2.0)
+
+        lower_critical = p_null - z_alpha * se_null
+        upper_critical = p_null + z_alpha * se_null
+
+        power_lower = nd.cdf((lower_critical - p_alt) / se_alt)
+        power_upper = 1.0 - nd.cdf((upper_critical - p_alt) / se_alt)
+
+        power = power_lower + power_upper
+
+    return float(np.clip(power, 0.0, 1.0))
+
+
+
+def binary_enrichment_power(
+    *,
+    n: int,
+    p_alt: float,
+    p_null: float,
+    alpha: float = 0.05,
+    alternative: Literal["larger", "smaller", "two-sided"] = "larger",
+    power_endpoint: Literal["binary"] = "binary",
+    power_method: Literal["binomial", "normal"] = "binomial",
+) -> float:
+    """
+    Compute power for a binary enrichment endpoint.
+
+    This function supports the current enrichment use case where the outcome is
+    binary.
+
+    Examples
+    --------
+    Diagnostic enrichment:
+        y = 1 -> disease case
+        y = 0 -> control
+
+    Prognostic enrichment:
+        y = 1 -> responder
+        y = 0 -> non-responder
+
+    The default hypothesis for enrichment is:
+
+        H0: selected positive rate = benchmark positive rate
+        H1: selected positive rate > benchmark positive rate
+
+    For prognostic enrichment, this becomes:
+
+        H0: selected response rate = baseline response rate
+        H1: selected response rate > baseline response rate
+
+    Parameters
+    ----------
+    n:
+        Number of selected participants used for the power calculation.
+
+    p_alt:
+        Assumed true positive rate in the selected subgroup.
+
+        For prognostic enrichment, this is the assumed selected response rate.
+
+    p_null:
+        Benchmark/null positive rate.
+
+        For prognostic enrichment, this is the benchmark or baseline response rate.
+
+    alpha:
+        Type I error rate. Default is 0.05.
+
+    alternative:
+        Direction of the test.
+
+        "larger":
+            Tests whether p_alt > p_null. This is the usual enrichment case.
+
+        "smaller":
+            Tests whether p_alt < p_null.
+
+        "two-sided":
+            Tests whether p_alt != p_null.
+
+    power_endpoint:
+        Endpoint type. Currently only "binary" is supported.
+
+    power_method:
+        Method used for the binary power calculation.
+
+        "binomial":
+            Uses the binomial distribution for the number of positive outcomes.
+            This is the recommended default for binary enrichment endpoints.
+
+        "normal":
+            Uses a normal approximation to the selected positive rate.
+
+    Returns
+    -------
+    float
+        Estimated statistical power, between 0 and 1.
+    """
+    if power_endpoint != "binary":
+        raise ValueError("Only power_endpoint='binary' is currently supported.")
+
+    if not isinstance(n, int):
+        raise TypeError("n must be an integer.")
+    if n <= 0:
+        raise ValueError("n must be > 0.")
+
+    if not (0.0 <= p_alt <= 1.0):
+        raise ValueError(f"p_alt must be in (0.0, 1.0). Got {p_alt}.")
+    if not (0.0 <= p_null <= 1.0):
+        raise ValueError(f"p_null must be in (0.0, 1.0). Got {p_null}.")
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError(f"alpha must be in (0.0, 1.0). Got {alpha}.")
+
+    if alternative not in {"larger", "smaller", "two-sided"}:
+        raise ValueError("alternative must be 'larger', 'smaller', or 'two-sided'.")
+
+    if power_method not in {"binomial", "normal"}:
+        raise ValueError("power_method must be 'binomial' or 'normal'.")
+
+    if power_method == "binomial":
+        return _binary_power_binomial(
+            n=n,
+            p_alt=p_alt,
+            p_null=p_null,
+            alpha=alpha,
+            alternative=alternative,
+        )
+
+    return _binary_power_normal(
+        n=n,
+        p_alt=p_alt,
+        p_null=p_null,
+        alpha=alpha,
+        alternative=alternative,
+    )
+
+
+
+def enrichment_power_from_summary(
+    summary_df: pd.DataFrame,
+    *,
+    ppv_col: str = "ppv",
+    baseline_col: str = "baseline_prevalence",
+    n_selected_col: str = "n_selected",
+    pct_selected_col: str = "pct_selected",
+    assumed_enriched_rate: Optional[float] = None,
+    benchmark_rate: Optional[float] = None,
+    selected_n: Optional[int] = None,
+    alpha: float = 0.05,
+    alternative: Literal["larger", "smaller", "two-sided"] = "larger",
+    power_endpoint: Literal["binary"] = "binary",
+    power_method: Literal["binomial", "normal"] = "binomial",
+) -> pd.DataFrame:
+    """
+    Add enrichment power calculations to a 1-row operating or planning summary.
+
+    This function is generic and can be used for both diagnostic and prognostic
+    enrichment.
+
+    What this function tests
+    ------------------------
+    The default enrichment power question is:
+
+        Is the selected subgroup positive rate higher than the baseline
+        positive rate in the full eligible population?
+
+    Diagnostic interpretation:
+        Is the selected disease-case rate higher than the baseline disease
+        prevalence?
+
+    Prognostic interpretation:
+        Is the selected response rate higher than the baseline response rate?
+
+    Default behavior
+    ----------------
+    If no overrides are provided:
+
+        assumed_enriched_rate = summary_df[ppv_col]
+        benchmark_rate        = summary_df[baseline_col]
+        selected_n            = summary_df[n_selected_col]
+
+    This means the default power calculation uses the observed selected
+    subgroup rate, the observed baseline rate, and the observed selected N.
+
+    Endpoint and method
+    -------------------
+    Currently, only binary enrichment endpoints are supported.
+
+    For binary endpoints, the method can be:
+
+        "binomial":
+            Uses the binomial distribution for the number of positive outcomes
+            among selected participants. This is the recommended default.
+
+        "normal":
+            Uses a normal approximation to the selected positive rate.
+
+    Parameters
+    ----------
+    summary_df:
+        A 1-row summary dataframe, usually the operating summary or planning
+        summary from the enrichment pipeline.
+
+    ppv_col:
+        Column containing the selected subgroup positive rate.
+
+    baseline_col:
+        Column containing the full-population baseline positive rate.
+
+    n_selected_col:
+        Column containing the number of selected participants.
+
+    pct_selected_col:
+        Column containing the fraction of screened candidates selected by the
+        threshold. Used to compute implied screened N.
+
+    assumed_enriched_rate:
+        Optional assumed selected subgroup positive rate for planning.
+        If None, uses observed ppv_col.
+
+    benchmark_rate:
+        Optional benchmark/null positive rate.
+        If None, uses baseline_col.
+
+    selected_n:
+        Optional selected sample size for the power calculation.
+        If None, uses observed n_selected_col.
+
+    alpha:
+        Type I error rate. Default is 0.05.
+
+    alternative:
+        Test direction. Default is "larger", which is the usual enrichment
+        question.
+
+    power_endpoint:
+        Endpoint type for power analysis. Currently only "binary" is supported.
+
+    power_method:
+        Method used for binary endpoint power.
+
+        "binomial":
+            Uses the binomial distribution.
+
+        "normal":
+            Uses a normal approximation.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of summary_df with added power-planning columns:
+          - power_alpha
+          - power_alternative
+          - power_endpoint
+          - power_method
+          - power_benchmark_rate
+          - power_assumed_enriched_rate
+          - power_selected_n
+          - power
+          - power_absolute_lift
+          - power_relative_enrichment
+          - power_implied_screened_n
+    """
+    if summary_df is None or summary_df.empty:
+        raise ValueError("summary_df must be a non-empty dataframe.")
+    if len(summary_df) != 1:
+        raise ValueError("summary_df must contain exactly one row.")
+
+    required = [ppv_col, baseline_col, n_selected_col, pct_selected_col]
+    missing = [c for c in required if c not in summary_df.columns]
+    if missing:
+        raise KeyError(f"summary_df missing required columns: {missing}")
+
+    out = summary_df.copy()
+
+    observed_ppv = float(out.iloc[0][ppv_col])
+    observed_baseline = float(out.iloc[0][baseline_col])
+    observed_n_selected = int(out.iloc[0][n_selected_col])
+    pct_selected = float(out.iloc[0][pct_selected_col])
+
+    p_alt = observed_ppv if assumed_enriched_rate is None else float(assumed_enriched_rate)
+    p_null = observed_baseline if benchmark_rate is None else float(benchmark_rate)
+    n_power = observed_n_selected if selected_n is None else int(selected_n)
+
+    power = binary_enrichment_power(
+        n=n_power,
+        p_alt=p_alt,
+        p_null=p_null,
+        alpha=alpha,
+        alternative=alternative,
+        power_endpoint=power_endpoint,
+        power_method=power_method,
+    )
+
+    implied_screened_n = (
+        math.ceil(n_power / pct_selected)
+        if pct_selected > 0 and pd.notna(pct_selected)
+        else float("nan")
+    )
+
+    out["power_alpha"] = alpha
+    out["power_alternative"] = alternative
+    out["power_endpoint"] = power_endpoint
+    out["power_method"] = power_method
+    out["power_benchmark_rate"] = p_null
+    out["power_assumed_enriched_rate"] = p_alt
+    out["power_selected_n"] = n_power
+    out["power"] = power
+    out["power_absolute_lift"] = p_alt - p_null
+    out["power_relative_enrichment"] = p_alt / p_null if p_null > 0 else float("nan")
+    out["power_implied_screened_n"] = implied_screened_n
+
+    return out
+
+
 def enrichment_pipeline_by_model(
     df: pd.DataFrame,
     threshold: Threshold,
@@ -1031,6 +1437,14 @@ def enrichment_pipeline_by_model(
     confidence: float = 0.95,
     precision: float = 0.05,
     ceil_n: bool = True,
+    compute_power: bool = True,
+    power_alpha: float = 0.05,
+    power_alternative: Literal["larger", "smaller", "two-sided"] = "larger",
+    power_endpoint: Literal["binary"] = "binary",
+    power_method: Literal["binomial", "normal"] = "binomial",
+    power_assumed_enriched_rate: Optional[float] = None,
+    power_benchmark_rate: Optional[float] = None,
+    power_selected_n: Optional[int] = None,
 ) -> Dict[str, Dict[str, pd.DataFrame]]:
     """
     Run the full enrichment workflow separately for each model and return all
@@ -1044,28 +1458,157 @@ def enrichment_pipeline_by_model(
       2. builds the full eligible population (`df_all`)
       3. computes the pocket summary
       4. computes the threshold operating summary
-      5. computes PPV-based sample-size planning
+      5. computes precision-based sample-size planning
+      6. optionally computes power-based planning
 
     This is the top-level enrichment wrapper. It replaces the need to call:
       - `pocket_metrics_by_model(...)`
       - `enrichment_metrics_by_model(...)`
       - `ppv_precision_sample_size_from_summary(...)`
+      - `enrichment_power_from_summary(...)`
     separately.
 
     Why this is useful
     ------------------
-    The enrichment workflow now has three layers:
+    The enrichment workflow has three layers:
 
       - Pocket summary:
           describes the selected subgroup itself
+
       - Operating summary:
           describes what the threshold does to the full screened population
+
       - Planning summary:
           estimates how many selected and screened patients are needed in the
-          next study to validate PPV at the chosen threshold
+          next study and, when requested, estimates power to detect enrichment
+          relative to a benchmark rate.
 
     This wrapper keeps those outputs aligned and makes the workflow easier to
     use and less error-prone.
+
+    Power planning
+    --------------
+    If compute_power=True, the planning summary is augmented with a power
+    calculation.
+
+    For the current implementation, power_endpoint must be "binary".
+
+    Binary endpoint examples:
+      - diagnostic enrichment: disease vs control
+      - prognostic enrichment: responder vs non-responder
+
+    For binary endpoints, power_method controls the statistical calculation:
+
+      - "binomial":
+          Uses the binomial distribution for the number of positive outcomes.
+          This is the recommended default for binary enrichment endpoints.
+
+      - "normal":
+          Uses a normal approximation to the selected positive rate.
+
+    By default, the power calculation uses:
+
+      - observed PPV as the assumed enriched subgroup positive rate
+      - observed baseline prevalence as the benchmark/null positive rate
+      - observed selected N as the selected sample size
+
+    These defaults can be overridden with:
+
+      - power_assumed_enriched_rate
+      - power_benchmark_rate
+      - power_selected_n
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    threshold:
+        Threshold used to define the enriched subgroup.
+
+        If a float is provided, subjects with score_col >= threshold are selected.
+
+        If a tuple is provided, it is interpreted as an interval:
+            low <= score_col < high
+
+    model:
+        Model name or sequence of model names to analyze.
+        If None, all models present in df are analyzed.
+
+    score_col:
+        Patient-level prediction column used for thresholding.
+
+    split:
+        Split to analyze, such as "test" or "external".
+        If None, no split filtering is applied.
+
+    variants:
+        Prediction or calibration variant to analyze, such as "beta".
+        If None, all variants are included.
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context before
+        applying the threshold.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude from both df_hi and df_all.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary outcome column. y=1 is treated as the positive class.
+
+    label_col:
+        Optional human-readable label column corresponding to y_col.
+
+    meta_cols:
+        Metadata columns to retain in summary outputs.
+
+    confidence:
+        Confidence level used for precision-based planning.
+
+    precision:
+        Desired half-width for estimating PPV / selected positive rate.
+
+    ceil_n:
+        If True, round required sample sizes up to the nearest integer.
+
+    compute_power:
+        If True, add power-based planning columns to planning_summary.
+
+    power_alpha:
+        Type I error rate for the power calculation.
+
+    power_alternative:
+        Direction of the power test.
+
+        "larger" is the usual enrichment setting, testing whether the selected
+        subgroup positive rate is higher than the benchmark positive rate.
+
+    power_endpoint:
+        Endpoint type for power analysis. Currently only "binary" is supported.
+
+    power_method:
+        Method used for binary endpoint power.
+
+        "binomial" uses the binomial distribution.
+        "normal" uses a normal approximation.
+
+    power_assumed_enriched_rate:
+        Optional assumed selected subgroup positive rate for power planning.
+        If None, uses the observed PPV.
+
+    power_benchmark_rate:
+        Optional benchmark/null positive rate for power planning.
+        If None, uses the observed baseline prevalence.
+
+    power_selected_n:
+        Optional selected sample size for power planning.
+        If None, uses the observed n_selected.
 
     Returns
     -------
@@ -1075,12 +1618,17 @@ def enrichment_pipeline_by_model(
 
         - "pocket_summary":
             1-row summary of the selected subgroup
+
         - "operating_summary":
             1-row summary of threshold operating characteristics
+
         - "planning_summary":
-            1-row PPV-precision sample-size planning table
+            1-row planning table containing precision-based planning and,
+            when compute_power=True, power-based planning
+
         - "df_hi":
             threshold-selected subjects
+
         - "df_all":
             full eligible population before thresholding
     """
@@ -1103,9 +1651,14 @@ def enrichment_pipeline_by_model(
         #-------------------------------------------------------
         # Step 1: Build the threshold-selected subgroup and its
         # pocket summary. This describes the enriched subgroup
-        # after applying the threshold (for example: how many
-        # patients were selected, PPV, contamination, and
-        # enrichment factor).
+        # after applying the threshold.
+        #
+        # Examples:
+        #   diagnostic enrichment:
+        #       selected subgroup enriched for disease cases
+        #
+        #   prognostic enrichment:
+        #       selected subgroup enriched for responders
         #-------------------------------------------------------
         pocket_summary, df_hi = pocket_metrics_from_raw(
             df=df,
@@ -1124,9 +1677,9 @@ def enrichment_pipeline_by_model(
         )
 
         #-------------------------------------------------------
-        # Step 2: Build the full eligible population before thresholding.
-        # This is the denominator population used to understand what the
-        # threshold is doing overall, not just inside the selected pocket.
+        # Step 2: Build the full eligible population before
+        # thresholding. This is the denominator population used
+        # to understand what the threshold is doing overall.
         #-------------------------------------------------------
         df_all = preprocess_by_threshold(
             df=df,
@@ -1142,11 +1695,21 @@ def enrichment_pipeline_by_model(
         )
 
         #-------------------------------------------------------
-        # Step 3: Compute threshold operating characteristics using the
-        # selected subgroup (df_hi) and the full eligible population (df_all).
-        # This tells us how the threshold behaves as a screening rule in the
-        # full population, including sensitivity, specificity, NPV,
-        # percent selected, screen-fail rate, and number needed to screen.
+        # Step 3: Compute threshold operating characteristics.
+        #
+        # This uses the selected subgroup (df_hi) and the full
+        # eligible population (df_all) to summarize how the
+        # threshold behaves as a screening / enrichment rule.
+        #
+        # Outputs include:
+        #   - percent selected
+        #   - screen-fail rate
+        #   - PPV / selected positive rate
+        #   - NPV
+        #   - sensitivity
+        #   - specificity
+        #   - enrichment factor
+        #   - number needed to screen
         #-------------------------------------------------------
         operating_summary = threshold_operating_metrics_df(
             df_hi=df_hi,
@@ -1158,11 +1721,13 @@ def enrichment_pipeline_by_model(
         )
 
         #-------------------------------------------------------
-        # Step 4: Use the operating summary to estimate study-planning
-        # quantities for the next round of enrichment. In particular, this
-        # computes how many selected patients are needed to estimate PPV with
-        # the desired precision, and how many total patients would need to be
-        # screened to obtain them.
+        # Step 4: Precision-based planning.
+        #
+        # This estimates how many selected subjects are needed
+        # to estimate PPV / selected positive rate with the
+        # desired confidence interval precision, and how many
+        # total candidates would need to be screened to obtain
+        # that selected N.
         #-------------------------------------------------------
         planning_summary = ppv_precision_sample_size_from_summary(
             operating_summary,
@@ -1172,10 +1737,49 @@ def enrichment_pipeline_by_model(
         )
 
         #-------------------------------------------------------
-        # Step 5: Store all outputs for this model in one place so downstream
-        # code can access the pocket summary, operating summary, planning
-        # summary, selected subgroup, and full population without additional
-        # function calls.
+        # Step 5: Optional power-based planning.
+        #
+        # compute_power is the on/off switch.
+        #
+        # If compute_power=True, the remaining power_* parameters
+        # are passed into enrichment_power_from_summary:
+        #
+        #   power_alpha                 -> alpha
+        #   power_alternative           -> alternative
+        #   power_endpoint              -> power_endpoint
+        #   power_method                -> power_method
+        #   power_assumed_enriched_rate -> assumed_enriched_rate
+        #   power_benchmark_rate        -> benchmark_rate
+        #   power_selected_n            -> selected_n
+        #
+        # The power helper expects generic enrichment column names:
+        #
+        #   ppv
+        #   baseline_prevalence
+        #   n_selected
+        #   pct_selected
+        #
+        # Therefore, power is added here, before any downstream
+        # diagnostic- or prognostic-specific renaming.
+        #-------------------------------------------------------
+        if compute_power:
+            planning_summary = enrichment_power_from_summary(
+                planning_summary,
+                ppv_col="ppv",
+                baseline_col="baseline_prevalence",
+                n_selected_col="n_selected",
+                pct_selected_col="pct_selected",
+                assumed_enriched_rate=power_assumed_enriched_rate,
+                benchmark_rate=power_benchmark_rate,
+                selected_n=power_selected_n,
+                alpha=power_alpha,
+                alternative=power_alternative,
+                power_endpoint=power_endpoint,
+                power_method=power_method,
+            )
+
+        #-------------------------------------------------------
+        # Step 6: Store all outputs for this model in one place.
         #-------------------------------------------------------
         results[str(m)] = {
             "pocket_summary": pocket_summary,
@@ -1186,6 +1790,593 @@ def enrichment_pipeline_by_model(
         }
 
     return results
+
+
+def diagnostic_enrichment_pipeline_by_model(
+    df: pd.DataFrame,
+    threshold: Threshold,
+    *,
+    model: Optional[Union[str, Sequence[str]]] = None,
+    score_col: str = "p_mean",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[List[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+    confidence: float = 0.95,
+    precision: float = 0.05,
+    ceil_n: bool = True,
+    compute_power: bool = True,
+    power_alpha: float = 0.05,
+    power_alternative: Literal["larger", "smaller", "two-sided"] = "larger",
+    power_endpoint: Literal["binary"] = "binary",
+    power_method: Literal["binomial", "normal"] = "binomial",
+    power_assumed_enriched_rate: Optional[float] = None,
+    power_benchmark_rate: Optional[float] = None,
+    power_selected_n: Optional[int] = None,
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Run diagnostic enrichment analysis separately by model.
+
+    This function is a diagnostic-specific wrapper around the generic
+    `enrichment_pipeline_by_model(...)`.
+
+    Interpretation
+    --------------
+    This wrapper is intended for diagnostic enrichment, where the binary outcome
+    is interpreted as:
+
+        y = 1  -> disease case / diagnostic positive class
+        y = 0  -> control / diagnostic negative class
+
+    The score column, usually `p_mean`, is interpreted as a patient-level
+    predicted probability of belonging to the diagnostic positive class.
+
+    Patients with score >= threshold are selected into the diagnostic-enriched
+    subgroup.
+
+    What this function does
+    -----------------------
+    For each requested model, this wrapper calls the generic enrichment engine to:
+
+      1. build the threshold-selected subgroup
+      2. build the full eligible population
+      3. compute the pocket summary
+      4. compute the threshold operating summary
+      5. compute precision-based sample-size planning
+      6. optionally compute binary-endpoint power planning
+
+    Notes
+    -----
+    Unlike `prognostic_enrichment_pipeline_by_model(...)`, this diagnostic
+    wrapper does not rename columns into response-specific terminology.
+
+    Generic columns such as:
+
+        ppv
+        baseline_prevalence
+        enrichment_factor
+        sensitivity
+        specificity
+
+    are appropriate for diagnostic enrichment, where the positive class is the
+    diagnostic target.
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    threshold:
+        Threshold used to define the diagnostic-enriched subgroup.
+
+    model:
+        Model name or sequence of model names to analyze. If None, all models
+        present in df are analyzed.
+
+    score_col:
+        Patient-level predicted probability column used for thresholding.
+
+    split:
+        Split to analyze, such as "test" or "external".
+
+    variants:
+        Prediction or calibration variant to analyze, such as "beta".
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context before
+        thresholding.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude from both selected and full populations.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary diagnostic outcome column. y=1 is interpreted as the diagnostic
+        positive class.
+
+    label_col:
+        Optional human-readable label column corresponding to y_col.
+
+    meta_cols:
+        Metadata columns to retain in summary outputs.
+
+    confidence:
+        Confidence level for precision-based planning.
+
+    precision:
+        Desired half-width for estimating PPV / selected positive rate.
+
+    ceil_n:
+        If True, round required sample sizes up to the nearest integer.
+
+    compute_power:
+        If True, add power-based planning columns to planning_summary.
+
+    power_alpha:
+        Type I error rate for power calculation.
+
+    power_alternative:
+        Direction of the power test. For enrichment, "larger" is usually used.
+
+    power_endpoint:
+        Endpoint type for power analysis. Currently only "binary" is supported.
+
+    power_method:
+        Method used for binary endpoint power.
+
+        "binomial":
+            Uses the binomial distribution for the number of positive outcomes.
+
+        "normal":
+            Uses a normal approximation to the selected positive rate.
+
+    power_assumed_enriched_rate:
+        Optional assumed selected positive rate for power planning.
+        If None, uses observed PPV.
+
+    power_benchmark_rate:
+        Optional benchmark/null positive rate for power planning.
+        If None, uses observed baseline prevalence.
+
+    power_selected_n:
+        Optional selected sample size for power planning.
+        If None, uses observed n_selected.
+
+    Returns
+    -------
+    Dict[str, Dict[str, pd.DataFrame]]
+        Dictionary keyed by model name.
+
+        Each model block contains:
+
+          - pocket_summary
+          - operating_summary
+          - planning_summary
+          - df_hi
+          - df_all
+    """
+
+    # ------------------------------------------------------------------
+    # Diagnostic enrichment is a thin wrapper around the generic
+    # enrichment engine.
+    #
+    # The generic engine already computes:
+    #   - selected subgroup
+    #   - full denominator population
+    #   - pocket summary
+    #   - operating summary
+    #   - precision planning
+    #   - optional power planning
+    #
+    # This wrapper exists so notebook code can call a diagnostic-specific
+    # function name, while keeping all core calculations centralized in
+    # enrichment_pipeline_by_model(...).
+    # ------------------------------------------------------------------
+    return enrichment_pipeline_by_model(
+        df=df,
+        threshold=threshold,
+        model=model,
+        score_col=score_col,
+        split=split,
+        variants=variants,
+        grouping_keys=grouping_keys,
+        enforce_unique=enforce_unique,
+        drop_subject_ids=drop_subject_ids,
+        subject_col=subject_col,
+        y_col=y_col,
+        label_col=label_col,
+        meta_cols=meta_cols,
+        confidence=confidence,
+        precision=precision,
+        ceil_n=ceil_n,
+        compute_power=compute_power,
+        power_alpha=power_alpha,
+        power_alternative=power_alternative,
+        power_endpoint=power_endpoint,
+        power_method=power_method,
+        power_assumed_enriched_rate=power_assumed_enriched_rate,
+        power_benchmark_rate=power_benchmark_rate,
+        power_selected_n=power_selected_n,
+    )
+
+
+# ---------------------------------------------------------------------
+# Column renaming for prognostic enrichment for treatment response
+# ---------------------------------------------------------------------
+# The generic enrichment pipeline is written for binary enrichment where
+# y=1 is the positive class and y=0 is the negative class.
+#
+# In prognostic enrichment for treatment response, we interpret:
+#
+#   y=1 -> responder
+#   y=0 -> non-responder
+#
+# Therefore, generic columns such as ppv, fdr, sensitivity, and
+# baseline_prevalence should be renamed so the output tables directly
+# communicate treatment-response meaning.
+# ---------------------------------------------------------------------
+RESPONSE_ENRICHMENT_RENAME_MAP: Dict[str, str] = {
+    # Full-population counts
+    "n_pos_total": "n_responders_total",
+    "n_neg_total": "n_nonresponders_total",
+
+    # Threshold-selected subgroup counts
+    "n_pos_selected": "n_responders_selected",
+    "n_neg_selected": "n_nonresponders_selected",
+
+    # Threshold-not-selected subgroup counts
+    "n_pos_not_selected": "n_responders_not_selected",
+    "n_neg_not_selected": "n_nonresponders_not_selected",
+
+    # Selected / non-selected subgroup rates
+    "ppv": "selected_response_rate",
+    "fdr": "selected_nonresponse_rate",
+    "npv": "nonselected_nonresponse_rate",
+
+    # Operating characteristics
+    "sensitivity": "responder_capture_rate",
+    "specificity": "nonresponder_exclusion_rate",
+    "fnr": "responder_miss_rate",
+
+    # Enrichment / screening burden
+    "baseline_prevalence": "baseline_response_rate",
+    "enrichment_factor": "response_enrichment_factor",
+    "nns": "number_needed_to_screen",
+}
+
+
+# ---------------------------------------------------------------------
+# Planning-specific renaming
+# ---------------------------------------------------------------------
+# The generic planning table estimates how many selected participants are
+# needed to estimate PPV with the requested confidence and precision, and
+# how many total candidates must be screened to obtain that selected N.
+#
+# For prognostic enrichment, PPV is interpreted as the selected response
+# rate. Therefore, planning names should also be response-specific.
+# ---------------------------------------------------------------------
+RESPONSE_PLANNING_RENAME_MAP = {
+    # Precision planning
+    "precision": "response_rate_precision",
+    "required_selected_n": "required_selected_response_enriched_n",
+    "implied_screened_n": "implied_screened_candidates_n",
+
+    # Power planning
+    "power_benchmark_rate": "power_benchmark_response_rate",
+    "power_assumed_enriched_rate": "power_assumed_selected_response_rate",
+    "power_selected_n": "power_selected_response_enriched_n",
+    "power_absolute_lift": "power_absolute_response_rate_lift",
+    "power_relative_enrichment": "power_relative_response_enrichment",
+    "power_implied_screened_n": "power_implied_screened_candidates_n",
+}
+
+
+# ---------------------------------------------------------------------
+# Combined map
+# ---------------------------------------------------------------------
+# Use this when renaming planning_summary, because planning_summary is a
+# copy of operating_summary with additional planning columns added.
+# ---------------------------------------------------------------------
+RESPONSE_PLANNING_FULL_RENAME_MAP: Dict[str, str] = {
+    **RESPONSE_ENRICHMENT_RENAME_MAP,
+    **RESPONSE_PLANNING_RENAME_MAP,
+}
+
+
+
+def rename_enrichment_columns_for_response(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename generic binary-enrichment columns into treatment-response terminology.
+
+    For prognostic enrichment:
+
+        y = 1 -> responder
+        y = 0 -> non-responder
+    """
+    return df.rename(columns=RESPONSE_ENRICHMENT_RENAME_MAP).copy()
+
+
+def rename_planning_columns_for_response(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename generic planning-summary columns into treatment-response terminology.
+
+    The planning summary contains both:
+      - generic enrichment columns
+      - precision/power planning columns
+    """
+    return df.rename(columns=RESPONSE_PLANNING_FULL_RENAME_MAP).copy()
+
+
+def prognostic_enrichment_pipeline_by_model(
+    df: pd.DataFrame,
+    threshold: Threshold,
+    *,
+    model: Optional[Union[str, Sequence[str]]] = None,
+    score_col: str = "p_mean",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[list[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+    confidence: float = 0.95,
+    precision: float = 0.05,
+    ceil_n: bool = True,
+    compute_power: bool = True,
+    power_alpha: float = 0.05,
+    power_alternative: Literal["larger", "smaller", "two-sided"] = "larger",
+    power_endpoint: Literal["binary"] = "binary",
+    power_method: Literal["binomial", "normal"] = "binomial",
+    power_assumed_enriched_rate: Optional[float] = None,
+    power_benchmark_rate: Optional[float] = None,
+    power_selected_n: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Run prognostic enrichment analysis for treatment response, separately by model.
+
+    This function is a treatment-response-specific wrapper around the generic
+    threshold-based enrichment pipeline.
+
+    The generic enrichment pipeline computes:
+      - threshold-selected subgroup
+      - full eligible population
+      - pocket summary
+      - operating summary
+      - precision-based planning summary
+
+    This wrapper adds optional power-based planning and then renames the summary
+    columns into treatment-response terminology.
+
+    Interpretation
+    --------------
+    This function assumes the binary outcome is a response outcome:
+
+        y = 1  -> responder
+        y = 0  -> non-responder
+
+    The score column, usually `p_mean`, is interpreted as a patient-level
+    predicted probability of response:
+
+        score_col = P(response | baseline features)
+
+    Patients with score >= threshold are selected into the response-enriched
+    subgroup.
+
+    This is prognostic enrichment, not predictive treatment-effect enrichment.
+
+    It asks:
+
+        "Is this patient likely to respond?"
+
+    It does not ask:
+
+        "Is this patient more likely to benefit from treatment compared with
+        control or no treatment?"
+
+    Power planning
+    --------------
+    If compute_power=True, this function adds a power calculation to each
+    model's planning summary.
+
+    By default, power is computed using:
+
+        power_assumed_enriched_rate = observed selected response rate
+        power_benchmark_rate        = observed baseline response rate
+        power_selected_n            = observed number selected
+
+    The user may override these values.
+
+    For example, the user can set:
+
+        power_assumed_enriched_rate = 0.80
+
+    to ask how much power the study would have if the true selected response
+    rate were 80%, even if the observed selected response rate is different.
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    threshold:
+        Threshold used to define the response-enriched subgroup.
+
+        If a float is provided:
+            selected if score_col >= threshold
+
+        If a tuple is provided:
+            selected if low <= score_col < high
+
+    model:
+        Model name or sequence of model names to analyze. If None, all models
+        present in df are analyzed.
+
+    score_col:
+        Patient-level prediction column used for thresholding.
+
+    split:
+        Split to analyze, such as "test" or "external".
+
+    variants:
+        Prediction/calibration variant to analyze, such as "beta".
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary response outcome column. y=1 is interpreted as responder.
+
+    label_col:
+        Optional human-readable label column.
+
+    meta_cols:
+        Metadata columns to retain in summaries.
+
+    confidence:
+        Confidence level for precision-based planning.
+
+    precision:
+        Desired half-width for selected response-rate precision.
+
+    ceil_n:
+        Whether to round required sample sizes up.
+
+    compute_power:
+        If True, add power-based planning columns to planning_summary.
+
+    power_alpha:
+        Type I error rate for the power calculation.
+
+    power_alternative:
+        Test direction for power calculation. Usually "larger" for enrichment.
+
+    power_endpoint:
+        Endpoint type for power analysis. Currently only "binary" is supported.
+
+    power_method:
+        Method used for binary endpoint power.
+
+        "binomial" uses the binomial distribution.
+        "normal" uses a normal approximation.
+
+    power_assumed_enriched_rate:
+        Optional assumed selected response rate for power planning.
+        If None, uses observed selected response rate.
+
+    power_benchmark_rate:
+        Optional benchmark response rate for power planning.
+        If None, uses observed baseline response rate.
+
+    power_selected_n:
+        Optional selected sample size for power planning.
+        If None, uses observed n_selected.
+
+    Returns
+    -------
+    Dict[str, Dict[str, Any]]
+        Dictionary keyed by model name.
+
+        Each model block contains:
+          - pocket_summary
+          - operating_summary
+          - planning_summary
+          - df_hi
+          - df_all
+    """
+
+    # ------------------------------------------------------------------
+    # Step 1. Run the generic threshold-based enrichment pipeline
+    # ------------------------------------------------------------------
+    # This function already performs the core enrichment work:
+    #
+    #   - filters the analysis population by split / model / variant
+    #   - applies the probability threshold
+    #   - creates df_hi, the selected subgroup
+    #   - creates df_all, the full eligible denominator population
+    #   - computes pocket_summary
+    #   - computes operating_summary
+    #   - computes precision-based planning_summary
+    #
+    # Because this wrapper is intended to live inside post_analysis.py,
+    # call enrichment_pipeline_by_model(...) directly.
+    # Do not call post.enrichment_pipeline_by_model(...).
+    # ------------------------------------------------------------------
+    out = enrichment_pipeline_by_model(
+        df=df,
+        threshold=threshold,
+        model=model,
+        score_col=score_col,
+        split=split,
+        variants=variants,
+        grouping_keys=grouping_keys,
+        enforce_unique=enforce_unique,
+        drop_subject_ids=drop_subject_ids,
+        subject_col=subject_col,
+        y_col=y_col,
+        label_col=label_col,
+        meta_cols=meta_cols,
+        confidence=confidence,
+        precision=precision,
+        ceil_n=ceil_n,
+        compute_power=compute_power,
+        power_alpha=power_alpha,
+        power_alternative=power_alternative,
+        power_endpoint=power_endpoint,
+        power_method=power_method,
+        power_assumed_enriched_rate=power_assumed_enriched_rate,
+        power_benchmark_rate=power_benchmark_rate,
+        power_selected_n=power_selected_n,
+    )
+
+
+    # ------------------------------------------------------------------
+    # Step 2. Rename summaries into prognostic treatment-response language
+    # ------------------------------------------------------------------
+    # After the generic calculations are complete, rename the summary
+    # columns so the notebook outputs are directly interpretable as
+    # prognostic enrichment for treatment response.
+    #
+    # The subject-level dataframes df_hi and df_all are not renamed here.
+    # ------------------------------------------------------------------
+    for model_name, block in out.items():
+        block["pocket_summary"] = rename_enrichment_columns_for_response(
+            block["pocket_summary"]
+        )
+
+        block["operating_summary"] = rename_enrichment_columns_for_response(
+            block["operating_summary"]
+        )
+
+        block["planning_summary"] = rename_planning_columns_for_response(
+            block["planning_summary"]
+        )
+
+    return out
+
+
+
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------
 # synthetic data generation for prospective enrichment workflow
