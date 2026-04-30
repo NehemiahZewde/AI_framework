@@ -28,7 +28,6 @@ This creates practical questions:
 - Can patients be grouped into clinically meaningful low-, medium-, and high-likelihood strata?
 - Can enrichment or stratification make a future trial more focused, efficient, and decision-ready?
 
----
 
 ## The Solution
 
@@ -46,7 +45,6 @@ The framework helps teams:
 
 In practice, this helps teams assess whether enrichment or stratification could improve trial efficiency by focusing enrollment, increasing the expected response or event rate, reducing uninformative screening or enrollment, and supporting faster go/no-go decisions.
 
----
 
 ## Patient Selection Framework
 
@@ -60,8 +58,6 @@ The same patient-level score can support both **enrichment** and **stratificatio
 | Diagnostic | Who likely has the disease or diagnostic target? | `P(disease given patient features)` | Select patients above a diagnostic-likelihood threshold | Group patients into diagnostic-likelihood strata | Supported |
 | Prognostic | Who likely experiences the future outcome of interest? | `P(outcome given patient features)` | Select patients above an outcome-probability threshold | Group patients into outcome-likelihood strata | Supported |
 | Treatment-benefit / treatment-effect | Who likely benefits more from treatment than control or no treatment? | Estimated treatment benefit | Select patients above a treatment-benefit threshold | Group patients into treatment-benefit strata | Future work |
-
----
 
 ## What the Framework Produces
 
@@ -77,8 +73,6 @@ Typical outputs include:
 - sample-size and power estimates for validation
 - patient-level uncertainty and stability summaries
 
----
-
 ## Use Cases
 
 This framework is designed for clinical and translational teams working with retrospective or early-stage clinical-trial data.
@@ -91,8 +85,6 @@ Example use cases include:
 - biomarker or feature-panel evaluation
 - screening and recruitment planning
 - prospective validation planning
-
----
 
 ## Technical Foundation
 
