@@ -131,13 +131,6 @@ git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
 pip install -e .
 ````
-
----
-
-## Quickstart
-
-> Coming next: a minimal end-to-end example (data → train → report) runnable in a few commands.
-
 ---
 
 ## Project layout
