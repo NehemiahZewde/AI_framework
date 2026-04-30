@@ -14,19 +14,15 @@ It is designed for the reality of clinical-trial data: datasets may be small, he
 
 Clinical trials are expensive, time-consuming, and often affected by heterogeneous patient response. When patients vary widely in disease biology, progression, or likelihood of response, broad enrollment can dilute treatment effects, increase sample-size requirements, and make trial results harder to interpret.
 
-Clinical-trial datasets often contain useful patient-level signal, but translating that signal into trial-design decisions is difficult.
+Clinical-trial datasets may contain useful patient-level signal, but the challenge is determining whether that signal is strong enough, stable enough, and practical enough to support future trial decisions.
 
-Key challenges include:
+This framework is designed around three core challenges:
 
-- Clinical outcomes can vary substantially across patients, making response, progression, or diagnostic status difficult to predict.
-- Patient-level signals may exist, but limited sample size can make it hard to know whether a subgroup pattern is reliable.
-- A model may rank patients well, but the practical value depends on whether the subgroup is enriched, recruitable, and efficient to screen.
+- **Heterogeneity:** patients may differ substantially in response, progression, diagnostic status, or event risk.
+- **Limited evidence:** clinical-trial datasets are often small, making subgroup patterns difficult to trust without careful validation.
+- **Decision translation:** a model may rank patients well, but the value depends on whether the subgroup is enriched, recruitable, and efficient to screen.
 
-This creates practical questions:
-
-- Can patient features identify individuals or subgroups more likely to respond, progress, or experience the target outcome?
-- Can patients be grouped into clinically meaningful low-, medium-, and high-likelihood strata?
-- Can enrichment or stratification make a future trial more focused, efficient, and decision-ready?
+The central question is whether patient-level predictions can help make a future trial more focused, efficient, and decision-ready.
 
 
 ## The Solution
