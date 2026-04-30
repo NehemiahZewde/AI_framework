@@ -10,7 +10,6 @@ This framework is designed for the reality of clinical-trial data: datasets may 
 ---
 
 ## The Challenge
-
 Clinical-trial datasets often contain valuable patient-level signal, but translating that signal into trial-design decisions is difficult.
 
 Key challenges include:
@@ -28,7 +27,6 @@ This creates practical questions:
 ---
 
 ## The Solution
-
 This framework helps clinical teams evaluate whether patient-level features can support more efficient clinical-trial design.
 
 It uses machine learning to generate patient-level risk or response scores, then translates those scores into practical enrichment and stratification strategies.
