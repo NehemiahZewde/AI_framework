@@ -9,7 +9,6 @@ It is designed for the reality of clinical-trial data: datasets may be small, he
 <img width="1568" height="814" alt="image" src="https://github.com/user-attachments/assets/ba2dc360-c5d4-49ca-a84a-feb4c2a20b50" />
 <p align="center"><em>Modality- and disease-area-agnostic workflow for translating clinical data into patient enrichment and stratification strategies.</em></p>
 
----
 
 ## The Challenge
 
