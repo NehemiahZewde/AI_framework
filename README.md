@@ -4,7 +4,7 @@ A standardized, leakage-safe, end-to-end modeling framework for clinical data:
 **data preparation → model training → calibration → evaluation → interpretation**.
 
 > Modality-agnostic (tabular, time-series, imaging-derived features, multimodal).  
-> Includes an EEG module as an example implementation.
+
 
 <img width="1797" height="880" alt="image" src="https://github.com/user-attachments/assets/534cfa21-109f-4e3e-993a-0a7b6844aced" />
 <img width="1777" height="868" alt="image" src="https://github.com/user-attachments/assets/1f8f9afb-b818-4f63-8d5e-a88de7a222ea" />
