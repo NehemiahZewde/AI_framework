@@ -7,25 +7,19 @@ A patient-level machine learning framework for translating clinical-trial data i
 
 ## The Challenge
 
-Clinical-trial datasets are often small, heterogeneous, noisy, and expensive to collect. Even when useful signals exist, clinical development teams still need to decide whether those signals can support patient selection, subgroup analysis, enrichment, stratification, or future trial design.
+Clinical-trial datasets are often small, heterogeneous, noisy, and expensive to collect. Even when patient-level features contain useful signal, clinical teams still need to determine whether that signal is stable, actionable, and useful for future trial design.
 
-Common challenges include:
+Key challenges include:
 
-- Patient response and disease progression can be heterogeneous across a trial population.
-- Clinical or patient-level features may contain signal, but the signal may be weak, unstable, or difficult to translate into action.
-- Small sample sizes can make it difficult to know whether an observed subgroup pattern is reliable.
-- A model may rank patients well, but the practical value depends on whether the selected subgroup is large enough and sufficiently enriched.
-- Trial teams need to understand screening burden, sample-size implications, and the potential cost-efficiency of a patient-selection strategy.
-- A patient-selection rule must be interpretable enough to support prospective validation or future study planning.
+- Clinical outcomes can vary substantially across patients, making response, progression, or diagnostic status difficult to predict.
+- Patient-level signals may exist, but small sample sizes can make it hard to know whether a subgroup pattern is reliable.
+- A model may rank patients well, but the practical value depends on whether the subgroup is enriched, recruitable, and efficient to screen.
 
-Key questions include:
+This creates practical questions:
 
-- Can patient features identify individuals more likely to respond, progress, or experience the target outcome?
-- Is there a subgroup that is sufficiently enriched to justify prospective validation?
-- Can patients be stratified into clinically meaningful low-, medium-, and high-likelihood groups?
-- How many patients would need to be screened to enroll the target subgroup?
-- Could enrichment or stratification improve trial efficiency by reducing unnecessary enrollment, focusing resources, or increasing the expected event/response rate?
-- Is the signal stable enough to support future study planning?
+- Can patient features identify individuals or subgroups more likely to respond, progress, or experience the target outcome?
+- Can patients be grouped into clinically meaningful low-, medium-, and high-likelihood strata?
+- Is the signal strong and stable enough to support enrichment, stratification, or future validation?
 
 ## The Solution
 
