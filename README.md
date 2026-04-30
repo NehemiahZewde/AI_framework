@@ -101,13 +101,11 @@ Key technical features include:
 - sample-size and power calculations
 - modality-agnostic inputs, including tabular, biomarker, time-series, imaging-derived, and multimodal features
 
----
 
 ## Requirements
 
 - Python 3.9+
 
----
 
 ## Installation
 
@@ -122,7 +120,6 @@ git clone https://github.com/NehemiahZewde/AI_framework.git
 cd AI_framework
 pip install -e .
 ````
----
 
 ## Project layout
 
