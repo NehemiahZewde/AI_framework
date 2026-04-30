@@ -63,15 +63,12 @@ The same patient-level score can support both **enrichment** and **stratificatio
 
 Typical outputs include:
 
-- calibrated patient-level risk, diagnostic, or response scores
-- ranked patient screening views
-- enrichment threshold summaries
-- low / medium / high probability strata
-- subgroup response, event, or diagnostic-positive rates
-- enrichment factors relative to the full study population
-- screening burden and number needed to screen
-- sample-size and power estimates for validation
+- calibrated patient-level scores and ranked screening views
+- enrichment and stratification summaries, including subgroup rates and enrichment factors
+- screening burden, number needed to screen, sample-size, and power estimates
 - patient-level uncertainty and stability summaries
+
+---
 
 ## Use Cases
 
@@ -79,12 +76,10 @@ This framework is designed for clinical and translational teams working with ret
 
 Example use cases include:
 
-- diagnostic case-enrichment analysis
-- prognostic response-enrichment assessment
-- patient stratification for subgroup analysis
+- enrichment feasibility analysis for diagnostic or prognostic endpoints
+- patient stratification for subgroup analysis and trial planning
 - biomarker or feature-panel evaluation
-- screening and recruitment planning
-- prospective validation planning
+- screening, recruitment, and prospective validation planning
 
 ## Technical Foundation
 
