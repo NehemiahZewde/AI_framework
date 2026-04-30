@@ -49,20 +49,6 @@ In practice, this helps teams assess whether enrichment or stratification could 
 
 ---
 
-## Why It Matters for Trial Design
-
-Patient selection can directly affect clinical-trial efficiency. If a trial enrolls many patients who are unlikely to respond or unlikely to experience the target outcome, the study may require more participants, more sites, more time, and higher cost to reach a clear decision.
-
-This framework is designed to help teams evaluate whether data-driven enrichment or stratification can:
-
-- increase the expected response, event, or diagnostic-positive rate in a target subgroup
-- reduce screening and enrollment inefficiency
-- support smaller or more focused validation studies
-- improve subgroup planning across disease areas
-- generate evidence for prospective enrichment or stratified trial designs
-
----
-
 ## Patient Selection Framework
 
 The same patient-level score can support both **enrichment** and **stratification**.
