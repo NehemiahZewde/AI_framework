@@ -14,15 +14,9 @@ It is designed for the reality of clinical-trial data: datasets may be small, he
 
 Clinical trials are expensive, time-consuming, and often affected by heterogeneous patient response. When patients vary widely in disease biology, progression, or likelihood of response, broad enrollment can dilute treatment effects, increase sample-size requirements, and make trial results harder to interpret.
 
-Clinical-trial datasets may contain useful patient-level signal, but the challenge is determining whether that signal is strong enough, stable enough, and practical enough to support future trial decisions.
+At the same time, clinical-trial datasets are often small, noisy, and difficult to reuse for future study design. Even when patient-level features contain useful signal, it can be difficult to determine whether that signal is stable enough and actionable enough to support patient selection.
 
-This framework is designed around three core challenges:
-
-- **Heterogeneity:** patients may differ substantially in response, progression, diagnostic status, or event risk.
-- **Limited evidence:** clinical-trial datasets are often small, making subgroup patterns difficult to trust without careful validation.
-- **Decision translation:** a model may rank patients well, but the value depends on whether the subgroup is enriched, recruitable, and efficient to screen.
-
-The central question is whether patient-level predictions can help make a future trial more focused, efficient, and decision-ready.
+The practical challenge is not only whether a model can predict an outcome, but whether patient-level predictions can help identify enriched subgroups, define meaningful patient strata, reduce screening inefficiency, and support more focused clinical-trial decisions.
 
 
 ## The Solution
