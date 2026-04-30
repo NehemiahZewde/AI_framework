@@ -1,8 +1,10 @@
 # Clinical ML for Patient Enrichment and Stratification
 
-A patient-level machine learning framework for translating clinical-trial data into enrichment, stratification, and prospective screening strategies.
+A patient-level machine learning framework for improving clinical-trial design through enrichment, stratification, and prospective screening.
 
-This framework is designed for the reality of clinical-trial data: datasets may be small, heterogeneous, noisy, and expensive to collect, but teams still need to make decisions about patient selection, subgroup analysis, and future study design.
+This framework helps clinical and translational teams evaluate whether patient-level data can be used to identify higher-yield subgroups, define clinically meaningful strata, and support more efficient study planning across disease areas.
+
+It is designed for the reality of clinical-trial data: datasets may be small, heterogeneous, noisy, and expensive to collect, but teams still need to make high-impact decisions about enrollment, subgroup analysis, validation, and future trial design.
 
 <img width="1568" height="814" alt="image" src="https://github.com/user-attachments/assets/ba2dc360-c5d4-49ca-a84a-feb4c2a20b50" />
 <p align="center"><em>Modality- and disease-area-agnostic workflow for translating clinical data into patient enrichment and stratification strategies.</em></p>
@@ -10,7 +12,10 @@ This framework is designed for the reality of clinical-trial data: datasets may 
 ---
 
 ## The Challenge
-Clinical-trial datasets often contain valuable patient-level signal, but translating that signal into trial-design decisions is difficult.
+
+Clinical trials are expensive, time-consuming, and often affected by heterogeneous patient response. When patients vary widely in disease biology, progression, or likelihood of response, broad enrollment can dilute treatment effects, increase sample-size requirements, and make trial results harder to interpret.
+
+Clinical-trial datasets often contain useful patient-level signal, but translating that signal into trial-design decisions is difficult.
 
 Key challenges include:
 
@@ -22,24 +27,39 @@ This creates practical questions:
 
 - Can patient features identify individuals or subgroups more likely to respond, progress, or experience the target outcome?
 - Can patients be grouped into clinically meaningful low-, medium-, and high-likelihood strata?
-- Is the signal strong and stable enough to support enrichment, stratification, or future validation?
+- Can enrichment or stratification make a future trial more focused, efficient, and decision-ready?
 
 ---
 
 ## The Solution
-This framework helps clinical teams evaluate whether patient-level features can support more efficient clinical-trial design.
 
-It uses machine learning to generate patient-level risk or response scores, then translates those scores into practical enrichment and stratification strategies.
+This framework helps clinical teams translate patient-level data into enrichment and stratification strategies that can support more efficient clinical-trial design.
+
+It uses machine learning to generate patient-level risk, diagnostic, or response scores, then converts those scores into decision-oriented trial-planning outputs.
 
 The framework helps teams:
 
-- identify higher-yield patient subgroups
-- define probability-based patient strata
+- identify higher-yield patient subgroups for focused enrollment
+- define probability-based strata for subgroup analysis and trial planning
 - estimate screening burden, sample size, and power
 - evaluate whether a patient-selection rule is stable enough for validation
-- translate retrospective signals into future trial-planning decisions
+- translate retrospective signals into prospective study-design decisions
 
-In practice, this helps answer whether enrichment or stratification is feasible, which subgroup or stratum to prioritize, and whether the signal is strong enough to justify further validation.
+In practice, this helps teams assess whether enrichment or stratification could improve trial efficiency by focusing enrollment, increasing the expected response or event rate, reducing uninformative screening or enrollment, and supporting faster go/no-go decisions.
+
+---
+
+## Why It Matters for Trial Design
+
+Patient selection can directly affect clinical-trial efficiency. If a trial enrolls many patients who are unlikely to respond or unlikely to experience the target outcome, the study may require more participants, more sites, more time, and higher cost to reach a clear decision.
+
+This framework is designed to help teams evaluate whether data-driven enrichment or stratification can:
+
+- increase the expected response, event, or diagnostic-positive rate in a target subgroup
+- reduce screening and enrollment inefficiency
+- support smaller or more focused validation studies
+- improve subgroup planning across disease areas
+- generate evidence for prospective enrichment or stratified trial designs
 
 ---
 
@@ -89,6 +109,23 @@ Example use cases include:
 
 ---
 
+## Technical Foundation
+
+The framework is built around clinical-trial data realities: limited sample size, heterogeneous patients, repeated measurements, patient-level grouping, calibration needs, and validation leakage risk.
+
+Key technical features include:
+
+- patient-level and group-aware validation
+- nested cross-validation support
+- calibrated probability estimation
+- repeated prediction pooling to patient-level summaries
+- diagnostic and prognostic enrichment analysis
+- probability-based patient stratification
+- sample-size and power calculations
+- modality-agnostic inputs, including tabular, biomarker, time-series, imaging-derived, and multimodal features
+
+---
+
 ## Requirements
 
 - Python 3.9+
@@ -101,6 +138,7 @@ Example use cases include:
 
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
+
 ### Option 2: Clone and install
 ```bash
 git clone https://github.com/NehemiahZewde/AI_framework.git
