@@ -68,12 +68,3 @@ pip install -e .
 * `tutorial/` — end-to-end examples
 
 ---
-
-## Roadmap (near-term)
-
-* Minimal CLI + config-driven runs
-* Example datasets and reproducible tutorial notebooks
-* Report artifacts (metrics tables, calibration curves, interpretation outputs)
-* Additional modality examples (tabular clinical + imaging-derived features)
-
----
