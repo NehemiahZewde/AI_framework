@@ -2,6 +2,9 @@
 
 A patient-level machine learning framework for translating clinical-trial data into enrichment, stratification, and prospective screening strategies.
 
+<img width="1568" height="814" alt="image" src="https://github.com/user-attachments/assets/ba2dc360-c5d4-49ca-a84a-feb4c2a20b50" />
+<p align="center"><em>Modality- and disease-area-agnostic workflow for translating clinical data into patient enrichment and stratification strategies.</em></p>
+
 ## The Challenge
 
 Clinical-trial datasets are often small, heterogeneous, noisy, and expensive to collect. Despite these limitations, clinical development teams still need to make decisions about patient selection, subgroup analysis, enrichment, and future trial design.
@@ -16,7 +19,7 @@ Key questions often remain unanswered:
 - How many patients would need to be screened to enroll the target subgroup?
 - Is the signal stable enough to support future study planning?
 
-<img width="1565" height="811" alt="image" src="https://github.com/user-attachments/assets/55dac252-9a3d-47d0-80cf-c1933ab71a96" />
+
 
 ## The Solution
 
