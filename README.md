@@ -23,18 +23,13 @@ The practical challenge is not only whether a model can predict an outcome, but 
 
 This framework helps clinical teams translate patient-level data into enrichment and stratification strategies that can support more efficient clinical-trial design.
 
-It uses machine learning to generate patient-level risk, diagnostic, or response scores, then converts those scores into decision-oriented trial-planning outputs.
-
-The framework helps teams:
+It uses machine learning to generate patient-level risk, diagnostic, or response scores, then converts those scores into trial-planning outputs that help teams:
 
 - identify higher-yield patient subgroups for focused enrollment
 - define probability-based strata for subgroup analysis and trial planning
-- estimate screening burden, sample size, and power
-- evaluate whether a patient-selection rule is stable enough for validation
-- translate retrospective signals into prospective study-design decisions
+- estimate screening burden, sample size, power, and validation feasibility
 
 In practice, this helps teams assess whether enrichment or stratification could improve trial efficiency by focusing enrollment, increasing the expected response or event rate, reducing uninformative screening or enrollment, and supporting faster go/no-go decisions.
-
 
 ## Patient Selection Framework
 
