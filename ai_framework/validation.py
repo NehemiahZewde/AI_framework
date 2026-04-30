@@ -2221,7 +2221,6 @@ def barplot_balanced_accuracy_from_agg(
 
 
 
-
 def plot_screening_predictions(
     df_pred: pd.DataFrame,
     *,
@@ -2229,12 +2228,32 @@ def plot_screening_predictions(
     calibration: str = "beta",
     center_col: str = "p_mean",
     std_col: str = "p_std",
-    cutoff: float = 0.70,
+
+    # ------------------------------------------------------------------
+    # Enrichment / stratification controls
+    # ------------------------------------------------------------------
+    cutoff: float | None = 0.70,
+    strata: Sequence[tuple[str, float, float]] | None = None,
+
     reference_order_model: str | None = None,
     method_alias: Mapping[str, str] | None = None,
     model_colors: Sequence[str] = ("#4C97E8", "#EC6868", "#55A868", "#8172B2"),
+
+    # Enrichment colors, used when exactly one model is plotted and cutoff is provided
     selected_color: str = "#4C97E8",
     below_threshold_color: str = "#EC6868",
+
+    # Stratification colors, used when exactly one model is plotted and strata are provided
+    strata_colors: Mapping[str, str] | None = None,
+    default_strata_colors: Sequence[str] = (
+        "#EC6868",  # low / first stratum
+        "#F2C94C",  # medium / second stratum
+        "#4C97E8",  # high / third stratum
+        "#55A868",
+        "#8172B2",
+        "#CC79A7",
+    ),
+
     ribbon_color_single_model: str = "#ADAAAA",
     ylim: tuple[float, float] = (0.0, 1.0),
     shade_alpha: float = 0.16,
@@ -2244,9 +2263,18 @@ def plot_screening_predictions(
     markevery: int = 1,
     figsize: tuple[float, float] = (12, 6),
     font_size: int = 12,
+
+    # Enrichment cutoff-line style
     cutoff_color: str = "#222222",
     cutoff_ls: str = "--",
     cutoff_lw: float = 1.5,
+
+    # Stratification boundary-line style
+    show_strata_boundaries: bool = True,
+    strata_boundary_color: str = "#222222",
+    strata_boundary_ls: str = "--",
+    strata_boundary_lw: float = 1.2,
+
     positive_rule: str = "gt",
     title_prefix: str = "Ranked screening risk",
     line_zorder: int = 3,
@@ -2257,78 +2285,123 @@ def plot_screening_predictions(
     """
     Plot ranked screening probabilities using a shared patient order.
 
+    This function supports three plotting modes:
+
+    1. Plain ranked probability plot
+       - cutoff=None
+       - strata=None
+
+    2. Enrichment mode
+       - cutoff is provided
+       - strata=None
+       - patients are colored as selected vs below threshold in single-model mode
+
+    3. Stratification mode
+       - strata is provided
+       - cutoff must be None
+       - patients are assigned to named probability strata such as Low / Medium / High
+
     Behavior
     --------
     - Patients are ordered once using `reference_order_model`.
-    - That same patient order is then reused for all plotted models.
-    - If multiple models are plotted, each model gets its own color.
-    - If exactly one model is plotted, the single ranked curve is split into
-      two threshold-defined color segments:
-        * selected for enrichment
-        * below threshold
-      and the uncertainty ribbon uses a neutral color.
+    - That same patient order is reused for all plotted models.
+    - If multiple models are plotted, color encodes model identity.
+    - If exactly one model is plotted:
+        * enrichment mode colors points by selected vs below threshold
+        * stratification mode colors points by stratum
+    - The uncertainty ribbon uses a neutral color in single-model mode.
 
     Parameters
     ----------
-    df_pred : pd.DataFrame
+    df_pred:
         Patient-level prediction summary dataframe. Must contain:
         ["model", "calibration", "idx", center_col, std_col].
 
-    models : Sequence[str]
+    models:
         Model names to plot.
 
-    calibration : str, default="beta"
+    calibration:
         Calibration variant to filter on.
 
-    center_col : str, default="p_mean"
+    center_col:
         Prediction summary column used for sorting patients and plotting the
         ranked screening curve.
 
-    std_col : str, default="p_std"
+    std_col:
         Standard deviation column used for the shaded uncertainty ribbon.
 
-    cutoff : float, default=0.70
+    cutoff:
         Enrichment threshold.
 
-    reference_order_model : str | None, default=None
+        If provided and `strata=None`, the plot is in enrichment mode.
+
+        In enrichment mode:
+            - "gt": selected if center_col > cutoff
+            - "ge": selected if center_col >= cutoff
+
+    strata:
+        Optional sequence of named probability intervals.
+
+        Each stratum should be:
+            (stratum_name, lower_bound, upper_bound)
+
+        The interval is interpreted as:
+            lower_bound <= center_col < upper_bound
+
+        Example:
+            [
+                ("Low", 0.00, 0.30),
+                ("Medium", 0.30, 0.70),
+                ("High", 0.70, 1.00),
+            ]
+
+        If provided, the plot is in stratification mode and `cutoff` must be None.
+
+    reference_order_model:
         Model used to define the shared patient order. Patients are sorted by
         descending `center_col` from this model, and that same order is reused
         for all plotted models. If None, the first model in `models` is used.
 
-    method_alias : Mapping[str, str] | None, default=None
+    method_alias:
         Optional display-name mapping for plot labels.
 
-    model_colors : Sequence[str]
+    model_colors:
         Colors used for model lines when plotting multiple models.
 
-    selected_color : str, default="#4C97E8"
-        Line color for points above threshold when plotting a single model.
+    selected_color:
+        Line color for points above threshold when plotting a single model in
+        enrichment mode.
 
-    below_threshold_color : str, default="#EC6868"
-        Line color for points at/below threshold when plotting a single model.
+    below_threshold_color:
+        Line color for points below threshold when plotting a single model in
+        enrichment mode.
 
-    ribbon_color_single_model : str, default="#BFBFBF"
+    strata_colors:
+        Optional mapping from stratum name to color in single-model
+        stratification mode.
+
+    default_strata_colors:
+        Fallback colors used when strata_colors is not provided.
+
+    ribbon_color_single_model:
         Neutral ribbon color used in single-model mode so the uncertainty band
-        does not visually imply membership in the selected group.
+        does not visually imply membership in a selected group or stratum.
 
-    ylim : tuple[float, float], default=(0.0, 1.0)
+    ylim:
         Y-axis range.
 
-    shade_alpha : float, default=0.16
+    shade_alpha:
         Transparency of the shaded ±1 SD ribbon.
 
-    positive_rule : str, default="gt"
-        Rule used to define selected patients:
+    positive_rule:
+        Rule used to define selected patients in enrichment mode:
           - "gt": selected if center_col > cutoff
           - "ge": selected if center_col >= cutoff
 
-    title_prefix : str, default="Ranked screening risk"
+    title_prefix:
         Plot title.
 
-    line_zorder, ribbon_zorder, cutoff_zorder : int
-        Z-order controls for line, ribbon, and cutoff line.
-
-    return_ranked : bool, default=True
+    return_ranked:
         If True, return ranked/ordered dataframes per model.
 
     Returns
@@ -2353,6 +2426,67 @@ def plot_screening_predictions(
     if reference_order_model is None:
         reference_order_model = str(models[0])
 
+    # ------------------------------------------------------------------
+    # Determine plotting mode
+    # ------------------------------------------------------------------
+    if strata is not None and cutoff is not None:
+        raise ValueError(
+            "Provide either cutoff or strata, not both. "
+            "Use cutoff for enrichment mode and strata for stratification mode."
+        )
+
+    if strata is not None:
+        plot_mode = "stratification"
+    elif cutoff is not None:
+        plot_mode = "enrichment"
+    else:
+        plot_mode = "plain"
+
+    # ------------------------------------------------------------------
+    # Validate and normalize strata, if provided
+    # ------------------------------------------------------------------
+    strata_list: list[tuple[str, float, float]] = []
+
+    if strata is not None:
+        if len(list(strata)) == 0:
+            raise ValueError("strata must contain at least one stratum.")
+
+        for s in list(strata):
+            if len(s) != 3:
+                raise ValueError(
+                    "Each stratum must be a tuple: "
+                    "(stratum_name, lower_bound, upper_bound)."
+                )
+
+            name, low, high = s
+            low = float(low)
+            high = float(high)
+
+            if low >= high:
+                raise ValueError(
+                    f"Invalid stratum {name!r}: lower bound ({low}) "
+                    f"must be < upper bound ({high})."
+                )
+
+            strata_list.append((str(name), low, high))
+
+        # Prevent accidental overlap. Gaps are allowed.
+        sorted_strata = sorted(strata_list, key=lambda x: (x[1], x[2]))
+        for i in range(1, len(sorted_strata)):
+            prev_name, prev_low, prev_high = sorted_strata[i - 1]
+            curr_name, curr_low, curr_high = sorted_strata[i]
+
+            if curr_low < prev_high:
+                raise ValueError(
+                    "Overlapping strata detected: "
+                    f"{prev_name!r} ({prev_low}, {prev_high}) overlaps with "
+                    f"{curr_name!r} ({curr_low}, {curr_high}). "
+                    "Use non-overlapping intervals."
+                )
+
+    # ------------------------------------------------------------------
+    # Helper functions
+    # ------------------------------------------------------------------
     def _pretty_prediction_name(col: str) -> str:
         """Convert internal column names into reader-friendly phrases."""
         mapping = {
@@ -2364,7 +2498,42 @@ def plot_screening_predictions(
         }
         return mapping.get(col, col.replace("_", " "))
 
-    # Build the reference ordering once.
+    def _assign_stratum(value: float) -> tuple[str | None, float | None, float | None]:
+        """
+        Assign a probability value to a named stratum.
+
+        Strata use:
+            low <= value < high
+
+        The last stratum is treated as closed on the upper bound if high == 1.0
+        so that a value of exactly 1.0 is included.
+        """
+        if pd.isna(value):
+            return None, None, None
+
+        for i, (name, low, high) in enumerate(strata_list):
+            is_last = i == len(strata_list) - 1
+
+            if low <= value < high:
+                return name, low, high
+
+            if is_last and value == high:
+                return name, low, high
+
+        return None, None, None
+
+    def _get_strata_color_map() -> dict[str, str]:
+        if strata_colors is not None:
+            return {str(k): v for k, v in strata_colors.items()}
+
+        return {
+            name: default_strata_colors[i % len(default_strata_colors)]
+            for i, (name, _, _) in enumerate(strata_list)
+        }
+
+    # ------------------------------------------------------------------
+    # Build the reference ordering once
+    # ------------------------------------------------------------------
     ref = df_pred.copy()
     ref = ref[
         (ref["model"].astype(str) == str(reference_order_model))
@@ -2430,12 +2599,23 @@ def plot_screening_predictions(
         d["patient_rank"] = d["idx"].map(reference_rank_map)
         d = d.sort_values("patient_rank", ascending=True).reset_index(drop=True)
 
-        if positive_rule == "gt":
-            selected_mask = d[center_col] > cutoff
-        else:
-            selected_mask = d[center_col] >= cutoff
+        if plot_mode == "enrichment":
+            assert cutoff is not None
+            if positive_rule == "gt":
+                selected_mask = d[center_col] > cutoff
+            else:
+                selected_mask = d[center_col] >= cutoff
 
-        d["selected_for_enrichment"] = selected_mask
+            d["selected_for_enrichment"] = selected_mask
+
+        elif plot_mode == "stratification":
+            assignments = d[center_col].apply(_assign_stratum)
+            d["stratum"] = assignments.apply(lambda x: x[0])
+            d["stratum_low"] = assignments.apply(lambda x: x[1])
+            d["stratum_high"] = assignments.apply(lambda x: x[2])
+
+            d["in_defined_stratum"] = d["stratum"].notna()
+
         ranked_results[str(model_name)] = d.copy()
 
         display_name = method_alias.get(str(model_name), str(model_name))
@@ -2447,18 +2627,21 @@ def plot_screening_predictions(
         )
 
     single_model_mode = len(plot_data) == 1
+    strata_color_map = _get_strata_color_map() if plot_mode == "stratification" else {}
 
+    # ------------------------------------------------------------------
+    # Plot curves
+    # ------------------------------------------------------------------
     for i, (model_name, display_name, d) in enumerate(plot_data):
         x = d["patient_rank"].to_numpy(dtype=int)
         y = d[center_col].to_numpy(dtype=float)
         s = d[std_col].fillna(0.0).to_numpy(dtype=float)
-        selected_mask = d["selected_for_enrichment"].to_numpy(dtype=bool)
 
         lo = np.clip(y - s, ylim[0], ylim[1])
         hi = np.clip(y + s, ylim[0], ylim[1])
 
         # Use a neutral ribbon for the single-model case so the uncertainty band
-        # is visually separate from the threshold-based line colors.
+        # is visually separate from threshold or stratum colors.
         ribbon_color = (
             ribbon_color_single_model
             if single_model_mode
@@ -2475,13 +2658,15 @@ def plot_screening_predictions(
             label="±1 SD" if (single_model_mode and i == 0) else None,
         )
 
-        n_selected = int(selected_mask.sum())
         n_total = int(len(d))
 
-        if single_model_mode:
-            # Single-model mode:
-            # Plot the same ranked patient sequence in two color segments based
-            # on whether each patient is above or below the enrichment cutoff.
+        # --------------------------------------------------------------
+        # Single-model enrichment mode:
+        # color by selected vs below threshold
+        # --------------------------------------------------------------
+        if single_model_mode and plot_mode == "enrichment":
+            selected_mask = d["selected_for_enrichment"].to_numpy(dtype=bool)
+
             x_sel = x[selected_mask]
             y_sel = y[selected_mask]
 
@@ -2513,10 +2698,69 @@ def plot_screening_predictions(
                     label=f"Below threshold (n={len(x_not)})",
                     zorder=line_zorder,
                 )
+
+        # --------------------------------------------------------------
+        # Single-model stratification mode:
+        # color by stratum
+        # --------------------------------------------------------------
+        elif single_model_mode and plot_mode == "stratification":
+            for stratum_name, low, high in strata_list:
+                mask = d["stratum"].astype(str) == str(stratum_name)
+                x_s = x[mask.to_numpy()]
+                y_s = y[mask.to_numpy()]
+
+                if len(x_s) == 0:
+                    continue
+
+                color = strata_color_map.get(
+                    str(stratum_name),
+                    default_strata_colors[0],
+                )
+
+                ax.plot(
+                    x_s,
+                    y_s,
+                    color=color,
+                    linewidth=linewidth,
+                    marker=marker,
+                    markersize=markersize,
+                    markevery=markevery,
+                    label=f"{stratum_name} ({low:.2f}–{high:.2f}, n={len(x_s)})",
+                    zorder=line_zorder,
+                )
+
+            # If any patients do not fall into user-defined strata, show them
+            # in gray rather than silently hiding them.
+            if "in_defined_stratum" in d.columns:
+                mask_unassigned = ~d["in_defined_stratum"].to_numpy(dtype=bool)
+                if mask_unassigned.any():
+                    ax.plot(
+                        x[mask_unassigned],
+                        y[mask_unassigned],
+                        color="#808080",
+                        linewidth=linewidth,
+                        marker=marker,
+                        markersize=markersize,
+                        markevery=markevery,
+                        label=f"Unassigned (n={int(mask_unassigned.sum())})",
+                        zorder=line_zorder,
+                    )
+
+        # --------------------------------------------------------------
+        # Multi-model mode:
+        # color by model identity
+        # --------------------------------------------------------------
         else:
-            # Multi-model mode:
-            # Each model gets a distinct color, since color now encodes method.
             line_color = model_colors[i % len(model_colors)]
+
+            if plot_mode == "enrichment":
+                n_selected = int(d["selected_for_enrichment"].sum())
+                label = f"{display_name} (selected {n_selected}/{n_total})"
+            elif plot_mode == "stratification":
+                label = f"{display_name}"
+            else:
+                label = f"{display_name}"
+
             ax.plot(
                 x,
                 y,
@@ -2525,35 +2769,71 @@ def plot_screening_predictions(
                 marker=marker,
                 markersize=markersize,
                 markevery=markevery,
-                label=f"{display_name} (selected {n_selected}/{n_total})",
+                label=label,
                 zorder=line_zorder,
             )
 
-    ax.axhline(
-        y=cutoff,
-        color=cutoff_color,
-        linestyle=cutoff_ls,
-        linewidth=cutoff_lw,
-        label=f"Cutoff = {cutoff:.2f}",
-        zorder=cutoff_zorder,
-    )
+    # ------------------------------------------------------------------
+    # Add enrichment cutoff line or stratification boundary lines
+    # ------------------------------------------------------------------
+    if plot_mode == "enrichment":
+        assert cutoff is not None
+        ax.axhline(
+            y=cutoff,
+            color=cutoff_color,
+            linestyle=cutoff_ls,
+            linewidth=cutoff_lw,
+            label=f"Cutoff = {cutoff:.2f}",
+            zorder=cutoff_zorder,
+        )
 
+    elif plot_mode == "stratification" and show_strata_boundaries:
+        # Draw unique internal boundaries only.
+        # Example strata:
+        #   Low    0.00–0.30
+        #   Medium 0.30–0.70
+        #   High   0.70–1.00
+        # Internal boundaries are 0.30 and 0.70.
+        boundaries = sorted(
+            {
+                high
+                for _, _, high in strata_list[:-1]
+            }
+        )
+
+        for b in boundaries:
+            ax.axhline(
+                y=float(b),
+                color=strata_boundary_color,
+                linestyle=strata_boundary_ls,
+                linewidth=strata_boundary_lw,
+                label=f"Boundary = {b:.2f}",
+                zorder=cutoff_zorder,
+            )
+
+    # ------------------------------------------------------------------
+    # Axis labels and title
+    # ------------------------------------------------------------------
     ref_display_name = method_alias.get(
-        str(reference_order_model), str(reference_order_model)
+        str(reference_order_model),
+        str(reference_order_model),
     )
     center_col_label = _pretty_prediction_name(center_col)
 
     ax.set_ylim(*ylim)
+
     ax.set_xlabel(
         f"Patients (ordered by descending {center_col_label} from {ref_display_name})",
         fontsize=font_size,
         fontweight="bold",
     )
+
     ax.set_ylabel(
         "Predicted probability",
         fontsize=font_size,
         fontweight="bold",
     )
+
     ax.set_title(
         title_prefix,
         fontsize=font_size + 2,
@@ -2574,5 +2854,7 @@ def plot_screening_predictions(
 
     if return_ranked:
         return ranked_results
+
     return None
+
 

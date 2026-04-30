@@ -8,12 +8,13 @@ from typing import Any, Dict, Optional, Tuple, Union, Sequence, List, Mapping, L
 import math
 from statistics import NormalDist
 from scipy.stats import binom, binomtest
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 Threshold = Union[float, Tuple[float, float]]
+Stratum = Tuple[str, float, float]
 
 
-
-Threshold = Union[float, Tuple[float, float]]
 
 def preprocess_by_threshold(
     df: pd.DataFrame,
@@ -2377,6 +2378,1132 @@ def prognostic_enrichment_pipeline_by_model(
 
 
 
+
+
+
+
+
+
+
+# ------------------------------------------------------------------------------------------------------------------------------------------------------
+# Stratification workflow
+# ------------------------------------------------------------------------------------------------------------------------------------------------------
+
+DIAGNOSTIC_STRATIFICATION_RENAME_MAP: Dict[str, str] = {
+    # Full-population counts
+    "n_pos_total": "n_diagnostic_positive_total",
+    "n_neg_total": "n_diagnostic_negative_total",
+
+    # Stratum counts
+    "n_pos_stratum": "n_diagnostic_positive_stratum",
+    "n_neg_stratum": "n_diagnostic_negative_stratum",
+
+    # Stratum rates
+    "baseline_positive_rate": "baseline_diagnostic_positive_rate",
+    "stratum_positive_rate": "stratum_diagnostic_positive_rate",
+    "stratum_negative_rate": "stratum_diagnostic_negative_rate",
+    "stratum_enrichment_factor": "diagnostic_enrichment_factor",
+}
+
+def rename_stratification_columns_for_diagnostic(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename generic stratification columns into diagnostic-stratification terminology.
+
+    Generic stratification assumes:
+
+        y = 1 -> positive class
+        y = 0 -> negative class
+
+    For diagnostic stratification, this is interpreted as:
+
+        y = 1 -> diagnostic positive / disease case
+        y = 0 -> diagnostic negative / control
+
+    Parameters
+    ----------
+    df:
+        Output from stratification_summary_by_model(...).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of df with diagnostic-specific column names.
+    """
+    return df.rename(columns=DIAGNOSTIC_STRATIFICATION_RENAME_MAP).copy()
+
+
+PROGNOSTIC_STRATIFICATION_RENAME_MAP: Dict[str, str] = {
+    # Full-population counts
+    "n_pos_total": "n_responders_total",
+    "n_neg_total": "n_nonresponders_total",
+
+    # Stratum counts
+    "n_pos_stratum": "n_responders_stratum",
+    "n_neg_stratum": "n_nonresponders_stratum",
+
+    # Stratum rates
+    "baseline_positive_rate": "baseline_response_rate",
+    "stratum_positive_rate": "stratum_response_rate",
+    "stratum_negative_rate": "stratum_nonresponse_rate",
+    "stratum_enrichment_factor": "response_enrichment_factor",
+}
+
+
+def rename_stratification_columns_for_prognostic(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename generic stratification columns into prognostic-response terminology.
+
+    Generic stratification assumes:
+
+        y = 1 -> positive class
+        y = 0 -> negative class
+
+    For prognostic stratification for treatment response, this is interpreted as:
+
+        y = 1 -> responder
+        y = 0 -> non-responder
+
+    Parameters
+    ----------
+    df:
+        Output from stratification_summary_by_model(...).
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of df with prognostic response-specific column names.
+    """
+    return df.rename(columns=PROGNOSTIC_STRATIFICATION_RENAME_MAP).copy()
+
+
+def stratification_summary_by_model(
+    df: pd.DataFrame,
+    strata: Sequence[Stratum],
+    *,
+    model: Optional[Union[str, Sequence[str]]] = None,
+    score_col: str = "p_mean",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[List[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build a patient-stratification summary table for one or more models.
+
+    This function divides the screened population into score-based strata,
+    such as low / medium / high probability groups, and summarizes the outcome
+    composition within each stratum.
+
+    The function is generic. It does not assume diagnostic or prognostic
+    interpretation. It only assumes that y=1 is the positive class and y=0 is
+    the negative class.
+
+    Examples
+    --------
+    Diagnostic stratification:
+        score_col = predicted probability of disease
+        y = 1     = disease case
+        y = 0     = control
+
+    Prognostic stratification:
+        score_col = predicted probability of response
+        y = 1     = responder
+        y = 0     = non-responder
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    strata:
+        Sequence of named score intervals.
+
+        Each stratum should be a tuple:
+            (stratum_name, score_low, score_high)
+
+        The interval is interpreted as:
+            score_low <= score_col < score_high
+
+        Example:
+            [
+                ("low", 0.00, 0.30),
+                ("medium", 0.30, 0.70),
+                ("high", 0.70, 1.00),
+            ]
+
+    model:
+        Model name or sequence of model names to summarize.
+        If None, all models in df are summarized.
+
+    score_col:
+        Patient-level score used for stratification.
+
+    split:
+        Split to analyze, such as "test" or "external".
+        If None, no split filtering is applied.
+
+    variants:
+        Prediction/calibration variant to analyze, such as "beta".
+        If None, all variants are included.
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+        If None, the same default grouping keys as `preprocess_by_threshold`
+        are used.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude from the analysis.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary outcome column. y=1 is interpreted as the positive class.
+
+    label_col:
+        Optional human-readable label column.
+
+    meta_cols:
+        Metadata columns to retain in the output.
+        If None, defaults to ["model", "variant", "split"] when present.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per model / variant / split / stratum, with columns including:
+
+            - stratum
+            - score_low
+            - score_high
+            - n_total
+            - n_stratum
+            - pct_total
+            - n_pos_stratum
+            - n_neg_stratum
+            - stratum_positive_rate
+            - baseline_positive_rate
+            - stratum_enrichment_factor
+
+    Notes
+    -----
+    This is a stratification summary, not an enrichment-selection summary.
+
+    Enrichment usually asks:
+        "What happens if we select patients above one threshold?"
+
+    Stratification asks:
+        "How does the population composition change across multiple score bands?"
+    """
+    if "model" not in df.columns:
+        raise KeyError("df must contain a 'model' column.")
+
+    if score_col not in df.columns:
+        raise KeyError(f"df must contain score_col={score_col!r}.")
+
+    if y_col not in df.columns:
+        raise KeyError(f"df must contain y_col={y_col!r}.")
+
+    if subject_col not in df.columns:
+        raise KeyError(f"df must contain subject_col={subject_col!r}.")
+
+    if meta_cols is None:
+        meta_cols = [c for c in ["model", "variant", "split"] if c in df.columns]
+
+    # -------------------------
+    # Resolve models
+    # -------------------------
+    if model is None:
+        model_list = sorted(df["model"].dropna().astype(str).unique().tolist())
+    elif isinstance(model, str):
+        model_list = [model]
+    else:
+        model_list = [str(m) for m in model]
+
+    if len(model_list) == 0:
+        raise ValueError("No models selected.")
+
+    # -------------------------
+    # Validate strata
+    # -------------------------
+    if strata is None or len(list(strata)) == 0:
+        raise ValueError("strata must contain at least one stratum.")
+
+    strata_list: List[Stratum] = []
+    for s in strata:
+        if len(s) != 3:
+            raise ValueError(
+                "Each stratum must be a tuple: (stratum_name, score_low, score_high)."
+            )
+
+        name, low, high = s
+        low = float(low)
+        high = float(high)
+
+        if low > high:
+            raise ValueError(
+                f"Invalid stratum {name!r}: score_low ({low}) > score_high ({high})."
+            )
+
+        strata_list.append((str(name), low, high))
+
+    rows: List[Dict[str, Any]] = []
+
+    # -------------------------
+    # Loop over models
+    # -------------------------
+    for m in model_list:
+        # Full eligible population for this model before stratum filtering.
+        # This defines the denominator for pct_total and baseline_positive_rate.
+        df_all = preprocess_by_threshold(
+            df=df,
+            threshold=(0.0, 1.0),
+            score_col=score_col,
+            split=split,
+            models=m,
+            variants=variants,
+            grouping_keys=grouping_keys,
+            enforce_unique=enforce_unique,
+            drop_subject_ids=drop_subject_ids,
+            subject_col=subject_col,
+        )
+
+        if df_all.empty:
+            continue
+
+        y_all = pd.to_numeric(df_all[y_col], errors="coerce").dropna().astype(int)
+        n_total = int(len(y_all))
+        n_pos_total = int((y_all == 1).sum())
+        n_neg_total = int((y_all == 0).sum())
+        baseline_positive_rate = (
+            n_pos_total / n_total if n_total > 0 else float("nan")
+        )
+
+        # Metadata for the full analysis context.
+        context_meta: Dict[str, Any] = {}
+        for c in meta_cols:
+            if c in df_all.columns:
+                vals = df_all[c].dropna().unique()
+                context_meta[c] = vals[0] if len(vals) == 1 else list(vals)
+
+        # Optional label names inferred from the full population.
+        pos_label = "pos"
+        neg_label = "neg"
+        if label_col in df_all.columns:
+            label_map = _infer_label_map(df_all, y_col=y_col, label_col=label_col)
+            pos_label = label_map.get(1, "pos")
+            neg_label = label_map.get(0, "neg")
+
+        # -------------------------
+        # Loop over strata
+        # -------------------------
+        #for stratum_name, score_low, score_high in strata_list:
+        for stratum_idx, (stratum_name, score_low, score_high) in enumerate(
+            strata_list,
+            start=1,
+        ):
+            df_s = preprocess_by_threshold(
+                df=df,
+                threshold=(score_low, score_high),
+                score_col=score_col,
+                split=split,
+                models=m,
+                variants=variants,
+                grouping_keys=grouping_keys,
+                enforce_unique=enforce_unique,
+                drop_subject_ids=drop_subject_ids,
+                subject_col=subject_col,
+            )
+
+            y_s = pd.to_numeric(df_s[y_col], errors="coerce").dropna().astype(int)
+
+            n_stratum = int(len(y_s))
+            n_pos_stratum = int((y_s == 1).sum()) if n_stratum > 0 else 0
+            n_neg_stratum = int((y_s == 0).sum()) if n_stratum > 0 else 0
+
+            stratum_positive_rate = (
+                n_pos_stratum / n_stratum if n_stratum > 0 else float("nan")
+            )
+
+            stratum_negative_rate = (
+                n_neg_stratum / n_stratum if n_stratum > 0 else float("nan")
+            )
+
+            pct_total = n_stratum / n_total if n_total > 0 else float("nan")
+
+            stratum_enrichment_factor = (
+                stratum_positive_rate / baseline_positive_rate
+                if baseline_positive_rate and baseline_positive_rate > 0
+                else float("nan")
+            )
+            row = {
+                **context_meta,
+                "score_col": score_col,
+                "stratum_order": stratum_idx,
+                "stratum": stratum_name,
+                "score_low": score_low,
+                "score_high": score_high,
+                "pos_label": pos_label,
+                "neg_label": neg_label,
+                "n_total": n_total,
+                "n_pos_total": n_pos_total,
+                "n_neg_total": n_neg_total,
+                "baseline_positive_rate": baseline_positive_rate,
+                "n_stratum": n_stratum,
+                "pct_total": pct_total,
+                "n_pos_stratum": n_pos_stratum,
+                "n_neg_stratum": n_neg_stratum,
+                "stratum_positive_rate": stratum_positive_rate,
+                "stratum_negative_rate": stratum_negative_rate,
+                "stratum_enrichment_factor": stratum_enrichment_factor,
+            }
+    
+
+            rows.append(row)
+
+    if len(rows) == 0:
+        raise ValueError(
+            "No stratification rows were produced. Check model, split, variants, and strata."
+        )
+
+    return pd.DataFrame(rows)
+
+
+def diagnostic_stratification_summary_by_model(
+    df: pd.DataFrame,
+    strata: Sequence[Stratum],
+    *,
+    model: Optional[Union[str, Sequence[str]]] = None,
+    score_col: str = "p_mean",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[List[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build a diagnostic patient-stratification summary table for one or more models.
+
+    This function is a diagnostic-specific wrapper around the generic
+    `stratification_summary_by_model(...)`.
+
+    Interpretation
+    --------------
+    This wrapper is intended for diagnostic stratification, where the binary
+    outcome is interpreted as:
+
+        y = 1 -> diagnostic positive class / disease case
+        y = 0 -> diagnostic negative class / control
+
+    The score column, usually `p_mean`, is interpreted as a patient-level
+    predicted probability of belonging to the diagnostic positive class.
+
+    The function divides patients into user-defined score strata, such as:
+
+        low diagnostic probability
+        medium diagnostic probability
+        high diagnostic probability
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    strata:
+        Sequence of named score intervals.
+
+        Each stratum should be a tuple:
+
+            (stratum_name, score_low, score_high)
+
+        The interval is interpreted as:
+
+            score_low <= score_col < score_high
+
+        Any number of non-overlapping strata is allowed.
+
+    model:
+        Model name or sequence of model names to summarize.
+        If None, all models in df are summarized.
+
+    score_col:
+        Patient-level predicted probability column used for stratification.
+
+    split:
+        Split to analyze, such as "test" or "external".
+        If None, no split filtering is applied.
+
+    variants:
+        Prediction/calibration variant to analyze, such as "beta".
+        If None, all variants are included.
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude from the analysis.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary diagnostic outcome column. y=1 is interpreted as the diagnostic
+        positive class.
+
+    label_col:
+        Optional human-readable diagnostic label column.
+
+    meta_cols:
+        Metadata columns to retain in the output.
+
+    Returns
+    -------
+    pd.DataFrame
+        Diagnostic stratification summary table with diagnostic-specific column
+        names, including:
+
+            - baseline_diagnostic_positive_rate
+            - stratum_diagnostic_positive_rate
+            - stratum_diagnostic_negative_rate
+            - diagnostic_enrichment_factor
+            - n_diagnostic_positive_stratum
+            - n_diagnostic_negative_stratum
+
+    Notes
+    -----
+    This function does not change the underlying calculations. It calls the
+    generic stratification function and renames columns into diagnostic
+    terminology.
+    """
+    out = stratification_summary_by_model(
+        df=df,
+        strata=strata,
+        model=model,
+        score_col=score_col,
+        split=split,
+        variants=variants,
+        grouping_keys=grouping_keys,
+        enforce_unique=enforce_unique,
+        drop_subject_ids=drop_subject_ids,
+        subject_col=subject_col,
+        y_col=y_col,
+        label_col=label_col,
+        meta_cols=meta_cols,
+    )
+
+    return rename_stratification_columns_for_diagnostic(out)
+
+
+def prognostic_stratification_summary_by_model(
+    df: pd.DataFrame,
+    strata: Sequence[Stratum],
+    *,
+    model: Optional[Union[str, Sequence[str]]] = None,
+    score_col: str = "p_mean",
+    split: Optional[str] = "test",
+    variants: Optional[Union[str, Sequence[str]]] = None,
+    grouping_keys: Optional[List[str]] = None,
+    enforce_unique: bool = True,
+    drop_subject_ids: Optional[Sequence[str]] = None,
+    subject_col: str = "subject_id",
+    y_col: str = "y",
+    label_col: str = "group_label",
+    meta_cols: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build a prognostic patient-stratification summary table for treatment response.
+
+    This function is a prognostic-specific wrapper around the generic
+    `stratification_summary_by_model(...)`.
+
+    Interpretation
+    --------------
+    This wrapper is intended for prognostic stratification for treatment response,
+    where the binary outcome is interpreted as:
+
+        y = 1 -> responder
+        y = 0 -> non-responder
+
+    The score column, usually `p_mean`, is interpreted as a patient-level
+    predicted probability of response.
+
+    The function divides patients into user-defined score strata, such as:
+
+        low likelihood of response
+        medium likelihood of response
+        high likelihood of response
+
+    This is prognostic stratification, not predictive treatment-effect
+    stratification. It asks:
+
+        "How does observed response rate vary across predicted-response strata?"
+
+    It does not ask:
+
+        "How does treatment benefit versus control vary across strata?"
+
+    Parameters
+    ----------
+    df:
+        Patient-level prediction dataframe.
+
+    strata:
+        Sequence of named score intervals.
+
+        Each stratum should be a tuple:
+
+            (stratum_name, score_low, score_high)
+
+        The interval is interpreted as:
+
+            score_low <= score_col < score_high
+
+        Any number of non-overlapping strata is allowed.
+
+    model:
+        Model name or sequence of model names to summarize.
+        If None, all models in df are summarized.
+
+    score_col:
+        Patient-level predicted probability of response used for stratification.
+
+    split:
+        Split to analyze, such as "test" or "external".
+        If None, no split filtering is applied.
+
+    variants:
+        Prediction/calibration variant to analyze, such as "beta".
+        If None, all variants are included.
+
+    grouping_keys:
+        Columns defining an evaluation context for uniqueness checks.
+
+    enforce_unique:
+        If True, enforce one row per subject per evaluation context.
+
+    drop_subject_ids:
+        Optional subject IDs to exclude from the analysis.
+
+    subject_col:
+        Subject identifier column.
+
+    y_col:
+        Binary response outcome column. y=1 is interpreted as responder.
+
+    label_col:
+        Optional human-readable response/non-response label column.
+
+    meta_cols:
+        Metadata columns to retain in the output.
+
+    Returns
+    -------
+    pd.DataFrame
+        Prognostic response-stratification summary table with response-specific
+        column names, including:
+
+            - baseline_response_rate
+            - stratum_response_rate
+            - stratum_nonresponse_rate
+            - response_enrichment_factor
+            - n_responders_stratum
+            - n_nonresponders_stratum
+
+    Notes
+    -----
+    This function does not change the underlying calculations. It calls the
+    generic stratification function and renames columns into treatment-response
+    terminology.
+    """
+    out = stratification_summary_by_model(
+        df=df,
+        strata=strata,
+        model=model,
+        score_col=score_col,
+        split=split,
+        variants=variants,
+        grouping_keys=grouping_keys,
+        enforce_unique=enforce_unique,
+        drop_subject_ids=drop_subject_ids,
+        subject_col=subject_col,
+        y_col=y_col,
+        label_col=label_col,
+        meta_cols=meta_cols,
+    )
+
+    return rename_stratification_columns_for_prognostic(out)
+
+
+def plot_stratification_summary_panels(
+    strat_df: pd.DataFrame,
+    *,
+    mode: Literal["prognostic", "diagnostic", "generic"] = "prognostic",
+    model_names: Optional[str | Sequence[str]] = None,
+    variant: Optional[str | Sequence[str]] = None,
+    split: Optional[str] = None,
+    plots: Sequence[Literal["size", "rate", "enrichment"]] = ("size", "rate", "enrichment"),
+    size_y: Literal["n_stratum", "pct_total"] = "n_stratum",
+    figsize: tuple[float, float] = (9.0, 4.5),
+    font_size: float = 12.0,
+    legend_loc: str = "best",
+    x_tick_rotation: int = 0,
+    model_alias: Optional[Mapping[str, str]] = None,
+    model_palette: Optional[Mapping[str, str]] = None,
+    show_baseline: bool = True,
+    baseline_color: str = "#222222",
+    baseline_lw: float = 1.5,
+    baseline_ls: str = "--",
+    annotate_bars: bool = True,
+    annotate_decimals: int = 3,
+    annotate_font_size: Optional[float] = None,
+    annotate_offset: float = 0.015,
+    size_ylim: Optional[tuple[float, float]] = None,
+    rate_ylim: Optional[tuple[float, float]] = None,
+    enrichment_ylim: Optional[tuple[float, float]] = None,
+) -> None:
+    """
+    Plot patient-stratification summary panels.
+
+    This function is designed for outputs from:
+
+        - stratification_summary_by_model(...)
+        - diagnostic_stratification_summary_by_model(...)
+        - prognostic_stratification_summary_by_model(...)
+
+    It produces separate grouped bar charts for:
+
+        1. Stratum size / feasibility
+        2. Stratum positive or response rate
+        3. Stratum enrichment factor
+
+    Parameters
+    ----------
+    strat_df:
+        Stratification summary dataframe.
+
+    mode:
+        Controls default column names and plot labels.
+
+        "prognostic":
+            Expects response-specific columns, such as:
+                - stratum_response_rate
+                - baseline_response_rate
+                - response_enrichment_factor
+
+        "diagnostic":
+            Expects diagnostic-specific columns, such as:
+                - stratum_diagnostic_positive_rate
+                - baseline_diagnostic_positive_rate
+                - diagnostic_enrichment_factor
+
+        "generic":
+            Expects generic columns, such as:
+                - stratum_positive_rate
+                - baseline_positive_rate
+                - stratum_enrichment_factor
+
+    model_names:
+        Model name or sequence of model names to plot.
+        If None, all models are included.
+
+    variant:
+        Optional variant or sequence of variants to include, such as "beta".
+
+    split:
+        Optional split to include, such as "test".
+
+    plots:
+        Which plots to produce. Options:
+            - "size"
+            - "rate"
+            - "enrichment"
+
+    size_y:
+        Y-axis for the size / feasibility plot.
+
+        "n_stratum":
+            Plot number of patients in each stratum.
+
+        "pct_total":
+            Plot fraction of total patients in each stratum.
+
+    figsize:
+        Figure size for each plot.
+
+    font_size:
+        Base font size.
+
+    legend_loc:
+        Legend location.
+
+    x_tick_rotation:
+        Rotation for x-axis tick labels.
+
+    model_alias:
+        Optional mapping from raw model names to display labels.
+
+    model_palette:
+        Optional mapping from display model names to colors.
+
+    show_baseline:
+        If True:
+            - rate plot shows baseline positive/response rate
+            - enrichment plot shows baseline enrichment factor = 1.0
+
+    baseline_color:
+        Baseline line color.
+
+    baseline_lw:
+        Baseline line width.
+
+    baseline_ls:
+        Baseline line style.
+
+    annotate_bars:
+        If True, annotate bars with numeric values.
+
+    annotate_decimals:
+        Number of decimals for bar annotations.
+
+    annotate_font_size:
+        Font size for annotations. If None, uses font_size - 3 with minimum 8.
+
+    annotate_offset:
+        Vertical offset for bar annotations.
+
+    size_ylim, rate_ylim, enrichment_ylim:
+        Optional y-axis limits for each plot.
+
+    Returns
+    -------
+    None
+        Displays plots.
+    """
+
+    # -------------------------
+    # Mode-specific columns
+    # -------------------------
+    if mode == "prognostic":
+        rate_col = "stratum_response_rate"
+        baseline_rate_col = "baseline_response_rate"
+        enrichment_col = "response_enrichment_factor"
+        rate_ylabel = "Response rate"
+        rate_title = "Response rate by stratum"
+        baseline_rate_label = "Baseline response rate"
+        enrichment_ylabel = "Response enrichment factor"
+        enrichment_title = "Response enrichment factor by stratum"
+
+    elif mode == "diagnostic":
+        rate_col = "stratum_diagnostic_positive_rate"
+        baseline_rate_col = "baseline_diagnostic_positive_rate"
+        enrichment_col = "diagnostic_enrichment_factor"
+        rate_ylabel = "Diagnostic-positive rate"
+        rate_title = "Diagnostic-positive rate by stratum"
+        baseline_rate_label = "Baseline diagnostic-positive rate"
+        enrichment_ylabel = "Diagnostic enrichment factor"
+        enrichment_title = "Diagnostic enrichment factor by stratum"
+
+    elif mode == "generic":
+        rate_col = "stratum_positive_rate"
+        baseline_rate_col = "baseline_positive_rate"
+        enrichment_col = "stratum_enrichment_factor"
+        rate_ylabel = "Positive-class rate"
+        rate_title = "Positive-class rate by stratum"
+        baseline_rate_label = "Baseline positive-class rate"
+        enrichment_ylabel = "Enrichment factor"
+        enrichment_title = "Enrichment factor by stratum"
+
+    else:
+        raise ValueError("mode must be 'prognostic', 'diagnostic', or 'generic'.")
+
+    # -------------------------
+    # Required columns
+    # -------------------------
+    required_cols = {
+        "model",
+        "stratum",
+        "stratum_order",
+        "n_stratum",
+        "pct_total",
+        rate_col,
+        baseline_rate_col,
+        enrichment_col,
+    }
+
+    if variant is not None:
+        required_cols.add("variant")
+    if split is not None:
+        required_cols.add("split")
+
+    missing = required_cols - set(strat_df.columns)
+    if missing:
+        raise KeyError(f"strat_df missing required columns: {sorted(missing)}")
+
+    if size_y not in {"n_stratum", "pct_total"}:
+        raise ValueError("size_y must be 'n_stratum' or 'pct_total'.")
+
+    # -------------------------
+    # Filter data
+    # -------------------------
+    d = strat_df.copy()
+
+    if model_names is None:
+        raw_models = d["model"].dropna().astype(str).unique().tolist()
+        model_names_list = list(raw_models)
+    elif isinstance(model_names, str):
+        model_names_list = [model_names]
+    else:
+        model_names_list = [str(m) for m in model_names]
+
+    d = d[d["model"].astype(str).isin(model_names_list)].copy()
+
+    if d.empty:
+        raise ValueError("No rows remain after model filtering.")
+
+    if variant is not None:
+        if isinstance(variant, str):
+            variants_list = [variant]
+        else:
+            variants_list = [str(v) for v in variant]
+        d = d[d["variant"].astype(str).isin(variants_list)].copy()
+
+    if split is not None:
+        d = d[d["split"].astype(str) == str(split)].copy()
+
+    if d.empty:
+        raise ValueError("No rows remain after variant/split filtering.")
+
+    # -------------------------
+    # Display labels
+    # -------------------------
+    if model_alias is None:
+        model_alias = {}
+
+    d["model_display"] = d["model"].astype(str).map(lambda x: model_alias.get(x, x))
+
+    model_order_raw = [m for m in model_names_list if m in set(d["model"].astype(str))]
+    model_order = [model_alias.get(m, m) for m in model_order_raw]
+
+    if len(set(model_order)) != len(model_order):
+        dupes = (
+            pd.Series(model_order)
+            [pd.Series(model_order).duplicated(keep=False)]
+            .unique()
+            .tolist()
+        )
+        raise ValueError(
+            f"model_alias causes duplicate model labels {dupes}. "
+            "Make aliases unique or omit aliasing for colliding model names."
+        )
+
+    # Preserve user-defined stratum order from stratum_order.
+    stratum_order_df = (
+        d[["stratum", "stratum_order"]]
+        .drop_duplicates()
+        .sort_values("stratum_order")
+    )
+    stratum_order = stratum_order_df["stratum"].astype(str).tolist()
+
+    d["stratum"] = pd.Categorical(
+        d["stratum"].astype(str),
+        categories=stratum_order,
+        ordered=True,
+    )
+
+    # Palette should use display model labels.
+    if model_palette is not None:
+        missing_palette = [m for m in model_order if m not in model_palette]
+        if missing_palette:
+            raise ValueError(
+                f"model_palette missing colors for display model labels: {missing_palette}"
+            )
+
+    sns.set(style="whitegrid")
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+
+    def _format_value(v: float, y_col: str) -> str:
+        if y_col == "n_stratum":
+            return f"{v:.0f}"
+        return f"{v:.{annotate_decimals}f}"
+
+    def _annotate(ax, *, y_col: str, ylim: Optional[tuple[float, float]]) -> None:
+        if not annotate_bars:
+            return
+
+        ann_fs = (
+            annotate_font_size
+            if annotate_font_size is not None
+            else max(8, float(font_size) - 3)
+        )
+
+        max_y = 0.0
+        for container in ax.containers:
+            for bar in container:
+                height = bar.get_height()
+                if pd.isna(height):
+                    continue
+
+                max_y = max(max_y, float(height))
+                x = bar.get_x() + bar.get_width() / 2.0
+                y = float(height) + annotate_offset
+
+                ax.text(
+                    x,
+                    y,
+                    _format_value(float(height), y_col),
+                    ha="center",
+                    va="bottom",
+                    fontsize=ann_fs,
+                    fontweight="bold",
+                )
+
+        if ylim is None:
+            y0, y1 = ax.get_ylim()
+            ax.set_ylim(y0, max(y1, max_y + annotate_offset + 0.05))
+
+    def _style_axes(
+        ax,
+        *,
+        xlabel: str,
+        ylabel: str,
+        title: str,
+        ylim: Optional[tuple[float, float]],
+    ) -> None:
+        ax.set_xlabel(xlabel, fontsize=font_size, fontweight="bold")
+        ax.set_ylabel(ylabel, fontsize=font_size, fontweight="bold")
+        ax.set_title(title, fontsize=font_size + 2, fontweight="bold")
+
+        ax.tick_params(axis="both", labelsize=font_size)
+        ax.tick_params(axis="x", rotation=x_tick_rotation)
+
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_fontweight("bold")
+
+        if ylim is not None:
+            ax.set_ylim(*ylim)
+
+        ax.legend(
+            title="",
+            loc=legend_loc,
+            prop={"size": font_size, "weight": "bold"},
+        )
+
+    def _plot_bar(
+        *,
+        y_col: str,
+        ylabel: str,
+        title: str,
+        ylim: Optional[tuple[float, float]],
+        baseline_value: Optional[float] = None,
+        baseline_label: Optional[str] = None,
+    ) -> None:
+        plt.figure(figsize=figsize)
+
+        ax = sns.barplot(
+            data=d,
+            x="stratum",
+            y=y_col,
+            hue="model_display",
+            order=stratum_order,
+            hue_order=model_order,
+            palette=model_palette,
+            estimator=np.mean,
+            errorbar=None,
+            saturation=1,
+        )
+
+        if show_baseline and baseline_value is not None:
+            ax.axhline(
+                float(baseline_value),
+                color=baseline_color,
+                linewidth=baseline_lw,
+                linestyle=baseline_ls,
+                label=baseline_label,
+            )
+
+        _style_axes(
+            ax,
+            xlabel="Stratum",
+            ylabel=ylabel,
+            title=title,
+            ylim=ylim,
+        )
+
+        _annotate(ax, y_col=y_col, ylim=ylim)
+
+        plt.tight_layout()
+        plt.show()
+
+    # -------------------------
+    # 1. Stratum size / feasibility
+    # -------------------------
+    if "size" in plots:
+        if size_y == "n_stratum":
+            size_ylabel = "Number of patients"
+            size_title = "Stratum size"
+        else:
+            size_ylabel = "Fraction of total population"
+            size_title = "Stratum size"
+
+        _plot_bar(
+            y_col=size_y,
+            ylabel=size_ylabel,
+            title=size_title,
+            ylim=size_ylim,
+            baseline_value=None,
+            baseline_label=None,
+        )
+
+    # -------------------------
+    # 2. Positive / response rate by stratum
+    # -------------------------
+    if "rate" in plots:
+        # Usually one baseline value after model/variant/split filtering.
+        baseline_vals = d[baseline_rate_col].dropna().unique()
+        baseline_value = float(baseline_vals[0]) if len(baseline_vals) > 0 else None
+
+        _plot_bar(
+            y_col=rate_col,
+            ylabel=rate_ylabel,
+            title=rate_title,
+            ylim=rate_ylim,
+            baseline_value=baseline_value,
+            baseline_label=(
+                f"{baseline_rate_label} = {baseline_value:.3f}"
+                if baseline_value is not None
+                else None
+            ),
+        )
+
+    # -------------------------
+    # 3. Enrichment factor by stratum
+    # -------------------------
+    if "enrichment" in plots:
+        _plot_bar(
+            y_col=enrichment_col,
+            ylabel=enrichment_ylabel,
+            title=enrichment_title,
+            ylim=enrichment_ylim,
+            baseline_value=1.0,
+            baseline_label="No enrichment = 1.000",
+        )
 
 # ------------------------------------------------------------------------------------------------------------------------------------------------------
 # synthetic data generation for prospective enrichment workflow

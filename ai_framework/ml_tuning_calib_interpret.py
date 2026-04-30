@@ -8506,6 +8506,7 @@ def pooled_patient_risk_summary(
 
     return out
 
+
 # def pooled_patient_risk_summary(
 #     df_long: pd.DataFrame,
 #     *,
