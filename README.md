@@ -15,9 +15,11 @@ Key questions often remain unanswered:
 - Can patients be stratified into clinically meaningful low-, medium-, and high-likelihood groups?
 - How many patients would need to be screened to enroll the target subgroup?
 - Is the signal stable enough to support future study planning?
-- 
-<img width="1797" height="880" alt="image" src="https://github.com/user-attachments/assets/534cfa21-109f-4e3e-993a-0a7b6844aced" />
-<img width="1777" height="868" alt="image" src="https://github.com/user-attachments/assets/1f8f9afb-b818-4f63-8d5e-a88de7a222ea" />
+
+<img width="1569" height="807" alt="image" src="https://github.com/user-attachments/assets/ca94b0c4-a219-4fab-b87e-4db76ae6d5bb" />
+
+# <img width="1797" height="880" alt="image" src="https://github.com/user-attachments/assets/534cfa21-109f-4e3e-993a-0a7b6844aced" />
+# <img width="1777" height="868" alt="image" src="https://github.com/user-attachments/assets/1f8f9afb-b818-4f63-8d5e-a88de7a222ea" />
 
 ## The Solution
 
