@@ -1,64 +1,96 @@
-# AI Framework for Clinical ML
+# Clinical ML for Patient Enrichment and Stratification
 
-A standardized, leakage-safe, end-to-end modeling framework for clinical data:
-**data preparation → model training → calibration → evaluation → interpretation**.
+A patient-level machine learning framework for improving clinical-trial design through enrichment, stratification, and prospective screening.
 
-> Modality-agnostic (tabular, time-series, imaging-derived features, multimodal).  
-> Includes an EEG module as an example implementation.
+This framework helps clinical and translational teams evaluate whether patient-level data can be used to identify higher-yield subgroups, define clinically meaningful strata, and support more efficient study planning across disease areas.
 
-<img width="1797" height="880" alt="image" src="https://github.com/user-attachments/assets/534cfa21-109f-4e3e-993a-0a7b6844aced" />
-<img width="1777" height="868" alt="image" src="https://github.com/user-attachments/assets/1f8f9afb-b818-4f63-8d5e-a88de7a222ea" />
+It is designed for the reality of clinical-trial data: datasets may be small, heterogeneous, noisy, and expensive to collect, but teams still need to make high-impact decisions about enrollment, subgroup analysis, validation, and future trial design.
+
+<img width="1568" height="814" alt="image" src="https://github.com/user-attachments/assets/ba2dc360-c5d4-49ca-a84a-feb4c2a20b50" />
+<p align="center"><em>Modality- and disease-area-agnostic workflow for translating clinical data into patient enrichment and stratification strategies.</em></p>
+
+
+## The Challenge
+
+Clinical trials are expensive, time-consuming, and often affected by heterogeneous patient response. When patients vary widely in disease biology, progression, or likelihood of response, broad enrollment can dilute treatment effects, increase sample-size requirements, and make trial results harder to interpret.
+
+At the same time, clinical-trial datasets are often small, noisy, and difficult to reuse for future study design. Even when patient-level features contain useful signal, it can be difficult to determine whether that signal is stable enough and actionable enough to support patient selection.
+
+The practical challenge is not only whether a model can predict an outcome, but whether patient-level predictions can help identify enriched subgroups, define meaningful patient strata, reduce screening inefficiency, and support more focused clinical-trial decisions.
+
+
+## The Solution
+
+This framework helps clinical teams translate patient-level data into enrichment and stratification strategies that can support more efficient clinical-trial design.
+
+It uses machine learning to generate patient-level risk, diagnostic, or response scores, then converts those scores into trial-planning outputs that help teams:
+
+- identify higher-yield patient subgroups for focused enrollment
+- define probability-based strata for subgroup analysis and trial planning
+- estimate screening burden, sample size, power, and validation feasibility
+
+In practice, this helps teams assess whether enrichment or stratification could improve trial efficiency by focusing enrollment, increasing the expected response or event rate, reducing uninformative screening or enrollment, and supporting faster go/no-go decisions.
+
+## Patient Selection Framework
+
+The same patient-level score can support both **enrichment** and **stratification**.
+
+- **Enrichment** applies a fixed threshold to select a subgroup.
+- **Stratification** divides patients into ordered probability groups, such as low, medium, and high likelihood groups.
+
+| Patient selection framework | Core question | Score used | Enrichment use | Stratification use | Status |
+|---|---|---|---|---|---|
+| Diagnostic | Who likely has the disease or diagnostic target? | `P(disease given patient features)` | Select patients above a diagnostic-likelihood threshold | Group patients into diagnostic-likelihood strata | Supported |
+| Prognostic | Who likely experiences the future outcome of interest? | `P(outcome given patient features)` | Select patients above an outcome-probability threshold | Group patients into outcome-likelihood strata | Supported |
+| Treatment-benefit / treatment-effect | Who likely benefits more from treatment than control or no treatment? | Estimated treatment benefit | Select patients above a treatment-benefit threshold | Group patients into treatment-benefit strata | Future work |
+
+## What the Framework Produces
+
+Typical outputs include:
+
+- calibrated patient-level scores and ranked screening views
+- enrichment and stratification summaries, including subgroup rates and enrichment factors
+- screening burden, number needed to screen, sample-size, and power estimates
+- patient-level uncertainty and stability summaries
 
 ---
 
-## The problem this framework addresses
-Clinical ML often fails to translate to real-world use because:
-- data is noisy and shifts across sites and time
-- labels can be uncertain and cohort definitions can change results
-- evaluation choices can introduce leakage and inflate performance
-- models can be hard to interpret and hard to connect to workflow-safe outcomes
+## Use Cases
 
-This framework aims to make clinical ML **reliable, comparable, and reproducible**.
+This framework is designed for clinical and translational teams working with retrospective or early-stage clinical-trial data.
 
----
+Example use cases include:
 
-## What you get
-- A repeatable pipeline scaffold for clinical ML projects
-- Leakage-safe validation patterns (patient-/group-aware splitting; nested CV support)
-- Standard metrics **and** calibration-focused evaluation
-- Interpretation hooks for biomarker discovery / feature insights
-- Clear outputs to support real deployment goals (e.g., cohort enrichment / stratification)
+- enrichment feasibility analysis for diagnostic or prognostic endpoints
+- patient stratification for subgroup analysis and trial planning
+- biomarker or feature-panel evaluation
+- screening, recruitment, and prospective validation planning
 
----
+## Technical Foundation
 
-## Use cases
-Designed for workflows such as:
-- Decision support for diagnosis
-- Biomarker discovery and prioritization
-- Patient enrichment (identify high-confidence subsets)
-- Patient stratification
+The framework is built around clinical-trial data realities: limited sample size, heterogeneous patients, repeated measurements, patient-level grouping, calibration needs, and validation leakage risk.
 
-Applicable across disease areas and modalities (examples include neurology, immunology, respiratory, ophthalmology).
+Key technical features include:
 
----
+- patient-level and group-aware validation
+- nested cross-validation support
+- calibrated probability estimation
+- repeated prediction pooling to patient-level summaries
+- diagnostic and prognostic enrichment analysis
+- probability-based patient stratification
+- sample-size and power calculations
+- modality-agnostic inputs, including tabular, biomarker, time-series, imaging-derived, and multimodal features
 
-## Key features
-- **Leakage-safe validation**: patient-level / group-aware splits; nested CV where appropriate
-- **Standardized evaluation**: AUROC, AUPRC, plus calibration-aware performance
-- **Calibration support**: optional post-hoc calibration for trustworthy probabilities
-- **Interpretability hooks**: feature importance / effect-style tools
-- **Extensible design**: add new modalities, feature pipelines, models, and reports
-
----
 
 ## Requirements
+
 - Python 3.9+
 
----
 
 ## Installation
 
 ### Option 1: Install directly from GitHub
+
 ```bash
 pip install git+https://github.com/NehemiahZewde/AI_framework.git
 ````
@@ -69,26 +101,9 @@ cd AI_framework
 pip install -e .
 ````
 
----
-
-## Quickstart
-
-> Coming next: a minimal end-to-end example (data → train → report) runnable in a few commands.
-
----
-
 ## Project layout
 
 * `ai_framework/` — core pipeline building blocks (data prep, training, evaluation, calibration, reporting)
 * `tutorial/` — end-to-end examples
-
----
-
-## Roadmap (near-term)
-
-* Minimal CLI + config-driven runs
-* Example datasets and reproducible tutorial notebooks
-* Report artifacts (metrics tables, calibration curves, interpretation outputs)
-* Additional modality examples (tabular clinical + imaging-derived features)
 
 ---
