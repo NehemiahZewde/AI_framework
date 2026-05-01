@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.inspection import permutation_importance
-from sklearn.model_selection import StratifiedKFold, KFold
+from sklearn.model_selection import StratifiedKFold, KFold, StratifiedShuffleSplit, ShuffleSplit
 from tqdm.auto import tqdm
 from copy import deepcopy
 from sklearn.datasets import make_classification, make_regression
@@ -96,6 +96,87 @@ def sample_one_row_per_group(
 
     return X_sub, y_sub, groups_sub, chosen_indices
 
+def _sample_rows_for_ranking(
+    y: np.ndarray,
+    *,
+    task_type: str,
+    train_fraction: float,
+    stratify: bool,
+    n_splits: int,
+    random_state: Optional[int],
+    max_attempts: int = 100,
+) -> np.ndarray:
+    """
+    Sample a temporary row subset for one feature-subset ranking run.
+
+    The returned rows are the only rows used for CV + permutation importance
+    in that run. The unused rows are discarded for that run and are not used
+    as a validation/test set.
+
+    For classification, stratified sampling is used when stratify=True.
+    The helper retries until the sampled y supports the requested CV n_splits.
+    """
+    y = np.asarray(y)
+
+    if y.ndim != 1:
+        raise ValueError(f"y must be 1D; got shape {y.shape}.")
+
+    if not (0.0 < train_fraction <= 1.0):
+        raise ValueError(
+            f"train_fraction must be in (0, 1]; got {train_fraction}."
+        )
+
+    n_samples = len(y)
+    all_indices = np.arange(n_samples)
+
+    if train_fraction == 1.0:
+        _validate_cv_targets(
+            y,
+            n_splits,
+            task_type=task_type,
+            context="_sample_rows_for_ranking full sample",
+        )
+        return all_indices
+
+    if n_samples < 2:
+        raise ValueError("Need at least 2 samples for row subsampling.")
+
+    rng = np.random.default_rng(random_state)
+
+    for attempt in range(max_attempts):
+        seed = int(rng.integers(0, 1_000_000))
+
+        if task_type == "classification" and stratify:
+            splitter = StratifiedShuffleSplit(
+                n_splits=1,
+                train_size=train_fraction,
+                random_state=seed,
+            )
+            split_iter = splitter.split(all_indices.reshape(-1, 1), y)
+        else:
+            splitter = ShuffleSplit(
+                n_splits=1,
+                train_size=train_fraction,
+                random_state=seed,
+            )
+            split_iter = splitter.split(all_indices.reshape(-1, 1), y)
+
+        train_idx, _unused_idx = next(split_iter)
+        y_sub = y[train_idx]
+
+        try:
+            _validate_cv_targets(
+                y_sub,
+                n_splits,
+                task_type=task_type,
+                context="_sample_rows_for_ranking row subsample",
+            )
+            return np.sort(train_idx)
+        except ValueError:
+            if attempt == max_attempts - 1:
+                raise
+
+    raise RuntimeError("Failed to sample valid ranking rows.")
 
 # ============================================================
 # Shared validation helpers
@@ -211,7 +292,6 @@ def prepare_training_bundle(
     out[feature_name_key] = [feature_names[i] for i in idxs]
 
     return out
-
 
 
 def _validate_X_y(
@@ -1261,7 +1341,6 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
             out[k] = deepcopy(v)
     return out
 
-
 def single_dataset_permutation_ranking(
     X: np.ndarray,
     y: np.ndarray,
@@ -1276,22 +1355,68 @@ def single_dataset_permutation_ranking(
     """
     Run balanced permutation-based feature ranking on one fixed dataset.
 
-    This function performs ranking on a single, already-defined dataset and does
-    not do any group resampling. It evaluates each model in `cfg["models"]`
-    independently by repeatedly sampling balanced feature subsets, fitting the
-    model under cross-validation, and computing permutation importance on the
-    validation folds.
+    This function ranks features for one fixed input dataset. It does not do any
+    group resampling. Each model in `cfg["models"]` is evaluated independently.
 
-    For each subset size:
-    - features are sampled repeatedly with a balancing scheme so under-sampled
-      features are prioritized
-    - permutation importance is computed within each CV fold
-    - per-feature summaries are computed:
-        - mean_rank
-        - mean_normalized_rank
-        - mean_importance
-        - times_sampled
-        - n_observations
+    The ranking procedure repeatedly samples feature subsets, fits the model
+    under cross-validation, computes permutation importance on validation folds,
+    and aggregates feature-level ranking summaries across many sampled subsets.
+
+    Core loop
+    ---------
+    For each model and each requested subset size:
+
+    1) Repeatedly sample a balanced subset of feature columns.
+       For example, if `subset_sizes = [10]`, each ranking run selects 10
+       feature columns.
+
+    2) If row subsampling is disabled:
+       - use all rows for that feature-subset run
+       - run CV on all rows
+       - compute permutation importance on each CV validation fold
+
+    3) If row subsampling is enabled:
+       - split rows into temporary train rows and unused rows
+       - keep only the temporary train rows
+       - discard the unused rows for that run
+       - run CV only inside the temporary train rows
+       - compute permutation importance on each CV validation fold
+
+       The unused rows are not used as a test set or validation set. They are
+       simply excluded from that feature-subset run.
+
+    Example with row_subsampling enabled
+    ------------------------------------
+    If `subset_sizes = [10]`, each run behaves like:
+
+        Round 1:
+            pick 10 feature columns
+            split rows into temporary train / unused
+            use only temporary train rows
+            run CV + permutation importance inside temporary train rows
+
+        Round 2:
+            pick 10 feature columns
+            split rows into temporary train / unused
+            use only temporary train rows
+            run CV + permutation importance inside temporary train rows
+
+        Round 3:
+            pick 10 feature columns
+            split rows into temporary train / unused
+            use only temporary train rows
+            run CV + permutation importance inside temporary train rows
+
+    The feature subset size controls only the number of columns selected. It does
+    not control the number of rows. Row count is controlled separately by
+    `row_subsampling["train_fraction"]`.
+
+    For each subset size, per-feature summaries are computed:
+    - mean_rank
+    - mean_normalized_rank
+    - mean_importance
+    - times_sampled
+    - n_observations
 
     Final per-feature rankings across subset sizes are then aggregated using
     weighted averaging, where the weight for each subset size is the number of
@@ -1301,10 +1426,13 @@ def single_dataset_permutation_ranking(
     ----------
     X : np.ndarray of shape (n_samples, n_features)
         Feature matrix for the dataset to rank.
+
     y : np.ndarray of shape (n_samples,)
         Target vector.
+
     feature_names : Sequence[str]
         Names of the columns in `X`. Must match `X.shape[1]` and be unique.
+
     cfg : Dict[str, Any]
         Ranking configuration. Expected keys include:
         {
@@ -1314,22 +1442,33 @@ def single_dataset_permutation_ranking(
                 ...
             },
             "scoring": "roc_auc",                     # sklearn scoring string or callable used in permutation_importance
-            "subset_sizes": [5, 10],                 # feature subset sizes evaluated during ranking
-            "n_splits": 5,                           # number of CV folds used in the selected splitter
-            "n_repeats": 10,                         # number of feature permutations per fold inside permutation_importance
-            "target_feature_appearances": 20,        # target number of times each feature should appear across sampled subsets
-            "random_state": 42,                      # base random seed for reproducibility
-            "ranking_metric": "auto",                # final ranking rule: auto, mean_normalized_rank, or mean_importance
+            "subset_sizes": [5, 10],                  # feature subset sizes evaluated during ranking
+            "n_splits": 5,                            # number of CV folds used in the selected splitter
+            "n_repeats": 10,                          # number of feature permutations per fold inside permutation_importance
+            "target_feature_appearances": 20,         # target number of times each feature should appear across sampled subsets
+            "random_state": 42,                       # base random seed for reproducibility
+            "ranking_metric": "auto",                 # final ranking rule: auto, mean_normalized_rank, or mean_importance
+
+            # optional row subsampling controls
+            "row_subsampling": {
+                "enabled": False,                     # if True, sample rows before CV for each feature-subset run
+                "train_fraction": 1.0,                # fraction of rows kept for ranking in each run
+                "stratify": True,                     # if classification, preserve class balance when sampling rows
+            },
         }
+
     seed_offset : int, default=0
         Offset added to the base random state so repeated outer calls can remain
         reproducible while still varying randomness.
+
     stage_name : Optional[str], default=None
         Human-readable stage name from the outer pipeline, used only for tqdm
         progress display.
+
     stage_index : Optional[int], default=None
         Zero-based stage index from the outer pipeline, used only for tqdm
         progress display.
+
     n_stages : Optional[int], default=None
         Total number of stages in the outer pipeline, used only for tqdm
         progress display.
@@ -1345,20 +1484,43 @@ def single_dataset_permutation_ranking(
         - mean_importance_across_sizes
         - n_subset_sizes_used
         - total_n_observations_across_sizes
+        - row_subsampling_enabled
+        - row_subsample_train_fraction
+        - row_subsample_stratify
 
     detailed_results_by_model : Dict[str, Dict[int, pd.DataFrame]]
         Mapping from model name to per-subset-size ranking summaries.
         The inner dictionary maps:
             subset_size -> pd.DataFrame
-        where each DataFrame contains per-feature summaries for that subset size.
+
+        Each detailed DataFrame contains per-feature summaries for that subset
+        size, such as:
+        - feature
+        - subset_size
+        - times_sampled
+        - n_observations
+        - mean_rank
+        - mean_normalized_rank
+        - mean_importance
+        - row_subsampling_enabled
+        - row_subsample_train_fraction
+        - row_subsample_stratify
 
     Notes
     -----
     - This function does not perform feature selection directly; it produces
       rankings only.
+    - Feature subset sampling selects columns only.
+    - Row subsampling selects rows only.
+    - If row_subsampling["enabled"] is True, row subsampling is repeated fresh
+      for every feature-subset run.
+    - The unused rows from row subsampling are discarded for that run and are not
+      used for evaluation.
+    - CV and permutation importance are performed only on the rows kept for that
+      run.
     - If `ranking_metric == "auto"`, the final ranking uses:
         - "mean_importance" when all subset sizes are 1
-        - "mean_normalized_rank" otherwise
+        - "mean_normalized_rank" otherwise.
     - `subset_sizes` are validated against the current number of features in `X`.
     """
     # ============================================================
@@ -1395,6 +1557,33 @@ def single_dataset_permutation_ranking(
     ranking_metric = _validate_ranking_metric(cfg.get("ranking_metric", "auto"))
     stage_name = str(cfg.get("name", "feature_ranking"))
 
+    # ------------------------------------------------------------
+    # Optional row subsampling controls
+    # ------------------------------------------------------------
+    # These settings control whether each feature-subset run first samples a
+    # temporary row-training subset. If enabled, the unused rows from that split
+    # are discarded for the run and are not used as a test set.
+    row_subsampling_cfg = dict(cfg.get("row_subsampling", {}))
+    row_subsampling_enabled = bool(row_subsampling_cfg.get("enabled", False))
+    row_subsample_train_fraction = float(
+        row_subsampling_cfg.get("train_fraction", 1.0)
+    )
+    row_subsample_stratify = bool(
+        row_subsampling_cfg.get("stratify", True)
+    )
+
+    # Validate the requested row-training fraction before any ranking work starts.
+    if not (0.0 < row_subsample_train_fraction <= 1.0):
+        raise ValueError(
+            "row_subsampling['train_fraction'] must be in (0, 1]. "
+            f"Got {row_subsample_train_fraction}."
+        )
+
+    # If row subsampling is disabled, force the fraction to 1.0 so downstream
+    # outputs and records have a consistent value.
+    if not row_subsampling_enabled:
+        row_subsample_train_fraction = 1.0
+
     # ============================================================
     # 2. Input validation and setup
     # ============================================================
@@ -1422,8 +1611,11 @@ def single_dataset_permutation_ranking(
         valid_subset_sizes,
     )
 
-    # Validate that the target vector can support the requested number of CV
+    # Validate that the full target vector can support the requested number of CV
     # folds for the chosen task type.
+    #
+    # If row subsampling is enabled, each sampled row-training subset is also
+    # validated inside the run loop before CV is performed.
     _validate_cv_targets(
         y,
         n_splits,
@@ -1447,13 +1639,16 @@ def single_dataset_permutation_ranking(
     # Rank features independently for each model template in the registry.
     for model_name, model_template in model_dict.items():
 
-        # Seed a per-model RNG that drives feature-subset shuffling and
-        # permutation-importance randomness.
+        # Seed a per-model RNG that drives feature-subset shuffling, row
+        # subsampling, and permutation-importance randomness.
         rng = np.random.RandomState(random_state + seed_offset)
 
         # Choose the cross-validation splitter based on task type:
         # - StratifiedKFold for classification
         # - KFold for regression
+        #
+        # If row subsampling is enabled, this same CV splitter is applied inside
+        # the temporary row-training subset for each feature-subset run.
         if task_type == "classification":
             cv = StratifiedKFold(
                 n_splits=n_splits,
@@ -1473,7 +1668,6 @@ def single_dataset_permutation_ranking(
         # Collect per-feature summaries across subset sizes so a final
         # cross-subset-size ranking can be built after all subset sizes are done.
         overall_records: DefaultDict[Hashable, List[Dict[str, float]]] = defaultdict(list)
-
 
         # Create a progress bar over subset sizes so the outer bar reflects the
         # ranking plan for the current stage configuration.
@@ -1505,7 +1699,7 @@ def single_dataset_permutation_ranking(
             # Progress bar over repeated subset-sampling runs for this model and
             # subset size.
             run_progress_desc = f"{model_name} | subset={subset_size}"
-            
+
             run_progress = tqdm(
                 range(n_runs),
                 total=n_runs,
@@ -1517,9 +1711,12 @@ def single_dataset_permutation_ranking(
             # Repeat balanced subset sampling enough times to build a stable
             # feature-level ranking summary.
             for _ in run_progress:
-                run_progress.set_postfix(cv_folds=n_splits)
-
-                # Start from a shuffled copy of all feature names so ties in
+                run_progress.set_postfix(
+                    cv_folds=n_splits,
+                    row_subsample="on" if row_subsampling_enabled else "off",
+                    row_fraction=row_subsample_train_fraction,
+                )
+                                # Start from a shuffled copy of all feature names so ties in
                 # sample counts are broken randomly but reproducibly.
                 shuffled_feature_names: List[Hashable] = feature_names_list.copy()
                 rng.shuffle(shuffled_feature_names)
@@ -1538,10 +1735,56 @@ def single_dataset_permutation_ranking(
                     feature_counts[feature] += 1
 
                 # Slice the DataFrame down to the currently selected features.
-                X_subset: pd.DataFrame = X_df[selected_features]
+                # This controls the feature/column subset only.
+                X_subset_full: pd.DataFrame = X_df[selected_features]
 
-                # Create the train/validation splits for this sampled subset.
-                split_iter = cv.split(X_subset, y)
+                # ------------------------------------------------------------
+                # Optional row subsampling for this feature-subset run
+                # ------------------------------------------------------------
+                # If enabled, create a fresh train/unused row split for this
+                # specific run. Only the train rows are kept for CV and
+                # permutation importance. The unused rows are discarded and are
+                # not used as a test set.
+                #
+                # This means each run does:
+                #   1) select feature columns
+                #   2) select temporary training rows
+                #   3) run CV + permutation importance inside those rows only
+                #
+                # Feature subset size controls columns only and is independent of
+                # how many rows are sampled.
+                if row_subsampling_enabled:
+                    row_idx = _sample_rows_for_ranking(
+                        y=y,
+                        task_type=task_type,
+                        train_fraction=row_subsample_train_fraction,
+                        stratify=row_subsample_stratify,
+                        n_splits=n_splits,
+                        random_state=int(rng.randint(0, 1_000_000)),
+                    )
+
+                    X_subset: pd.DataFrame = X_subset_full.iloc[row_idx]
+                    y_for_cv = y[row_idx]
+
+                else:
+                    # Preserve the original behavior when row subsampling is off:
+                    # run CV over the full row set for this selected feature subset.
+                    X_subset = X_subset_full
+                    y_for_cv = y
+
+                # Validate that the actual target vector used in this run can
+                # support the requested CV scheme. This is especially important
+                # when row subsampling is enabled for small datasets.
+                _validate_cv_targets(
+                    y_for_cv,
+                    n_splits,
+                    task_type=task_type,
+                    context="single_dataset_permutation_ranking row-selected CV",
+                )
+
+                # Create the train/validation splits for this sampled feature
+                # subset using only the selected rows for this run.
+                split_iter = cv.split(X_subset, y_for_cv)
 
                 # Evaluate permutation importance on each validation fold.
                 for train_idx, valid_idx in split_iter:
@@ -1549,9 +1792,11 @@ def single_dataset_permutation_ranking(
                     X_train: pd.DataFrame = X_subset.iloc[train_idx]
                     X_valid: pd.DataFrame = X_subset.iloc[valid_idx]
 
-                    # Slice the aligned targets for this fold.
-                    y_train = y[train_idx]
-                    y_valid = y[valid_idx]
+                    # Slice the aligned targets for this fold. These targets are
+                    # aligned to `X_subset`, not necessarily the original full X
+                    # when row subsampling is enabled.
+                    y_train = y_for_cv[train_idx]
+                    y_valid = y_for_cv[valid_idx]
 
                     # Clone the model template so every fold/run starts from a
                     # fresh unfitted estimator.
@@ -1640,6 +1885,9 @@ def single_dataset_permutation_ranking(
                         "mean_rank": mean_rank,
                         "mean_normalized_rank": mean_normalized_rank,
                         "mean_importance": mean_importance,
+                        "row_subsampling_enabled": row_subsampling_enabled,
+                        "row_subsample_train_fraction": row_subsample_train_fraction,
+                        "row_subsample_stratify": row_subsample_stratify,
                     }
                 )
 
@@ -1708,6 +1956,9 @@ def single_dataset_permutation_ranking(
                     "mean_importance_across_sizes": weighted_mean_importance,
                     "n_subset_sizes_used": len(records),
                     "total_n_observations_across_sizes": int(weights.sum()),
+                    "row_subsampling_enabled": row_subsampling_enabled,
+                    "row_subsample_train_fraction": row_subsample_train_fraction,
+                    "row_subsample_stratify": row_subsample_stratify,
                 }
             )
 
@@ -1744,7 +1995,492 @@ def single_dataset_permutation_ranking(
     # Return both the final model-level ranking tables and the more detailed
     # subset-size-specific summaries.
     return final_ranking_by_model, detailed_results_by_model
-    
+
+
+# def single_dataset_permutation_ranking(
+#     X: np.ndarray,
+#     y: np.ndarray,
+#     feature_names: Sequence[str],
+#     cfg: Dict[str, Any],
+#     *,
+#     seed_offset: int = 0,
+#     stage_name: Optional[str] = None,
+#     stage_index: Optional[int] = None,
+#     n_stages: Optional[int] = None,
+# ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[int, pd.DataFrame]]]:
+#     """
+#     Run balanced permutation-based feature ranking on one fixed dataset.
+
+#     This function performs ranking on a single, already-defined dataset and does
+#     not do any group resampling. It evaluates each model in `cfg["models"]`
+#     independently by repeatedly sampling balanced feature subsets, fitting the
+#     model under cross-validation, and computing permutation importance on the
+#     validation folds.
+
+#     For each subset size:
+#     - features are sampled repeatedly with a balancing scheme so under-sampled
+#       features are prioritized
+#     - permutation importance is computed within each CV fold
+#     - per-feature summaries are computed:
+#         - mean_rank
+#         - mean_normalized_rank
+#         - mean_importance
+#         - times_sampled
+#         - n_observations
+
+#     Final per-feature rankings across subset sizes are then aggregated using
+#     weighted averaging, where the weight for each subset size is the number of
+#     observations contributing to that feature's summary at that subset size.
+
+#     Parameters
+#     ----------
+#     X : np.ndarray of shape (n_samples, n_features)
+#         Feature matrix for the dataset to rank.
+#     y : np.ndarray of shape (n_samples,)
+#         Target vector.
+#     feature_names : Sequence[str]
+#         Names of the columns in `X`. Must match `X.shape[1]` and be unique.
+#     cfg : Dict[str, Any]
+#         Ranking configuration. Expected keys include:
+#         {
+#             "task_type": "classification",            # "classification" or "regression"
+#             "models": {
+#                 "model_name": estimator,
+#                 ...
+#             },
+#             "scoring": "roc_auc",                     # sklearn scoring string or callable used in permutation_importance
+#             "subset_sizes": [5, 10],                 # feature subset sizes evaluated during ranking
+#             "n_splits": 5,                           # number of CV folds used in the selected splitter
+#             "n_repeats": 10,                         # number of feature permutations per fold inside permutation_importance
+#             "target_feature_appearances": 20,        # target number of times each feature should appear across sampled subsets
+#             "random_state": 42,                      # base random seed for reproducibility
+#             "ranking_metric": "auto",                # final ranking rule: auto, mean_normalized_rank, or mean_importance
+#         }
+#     seed_offset : int, default=0
+#         Offset added to the base random state so repeated outer calls can remain
+#         reproducible while still varying randomness.
+#     stage_name : Optional[str], default=None
+#         Human-readable stage name from the outer pipeline, used only for tqdm
+#         progress display.
+#     stage_index : Optional[int], default=None
+#         Zero-based stage index from the outer pipeline, used only for tqdm
+#         progress display.
+#     n_stages : Optional[int], default=None
+#         Total number of stages in the outer pipeline, used only for tqdm
+#         progress display.
+
+#     Returns
+#     -------
+#     final_ranking_by_model : Dict[str, pd.DataFrame]
+#         Mapping from model name to a final ranking table. Each table contains one
+#         row per feature and includes weighted summary metrics across subset sizes,
+#         such as:
+#         - feature
+#         - mean_normalized_rank_across_sizes
+#         - mean_importance_across_sizes
+#         - n_subset_sizes_used
+#         - total_n_observations_across_sizes
+
+#     detailed_results_by_model : Dict[str, Dict[int, pd.DataFrame]]
+#         Mapping from model name to per-subset-size ranking summaries.
+#         The inner dictionary maps:
+#             subset_size -> pd.DataFrame
+#         where each DataFrame contains per-feature summaries for that subset size.
+
+#     Notes
+#     -----
+#     - This function does not perform feature selection directly; it produces
+#       rankings only.
+#     - If `ranking_metric == "auto"`, the final ranking uses:
+#         - "mean_importance" when all subset sizes are 1
+#         - "mean_normalized_rank" otherwise
+#     - `subset_sizes` are validated against the current number of features in `X`.
+#     """
+#     # ============================================================
+#     # 1. Read config
+#     # ============================================================
+#     # Read and validate the model registry that will be evaluated on this fixed
+#     # dataset. Each model is ranked independently.
+#     model_dict = cfg.get("models", None)
+#     if model_dict is None:
+#         raise KeyError("cfg must contain a 'models' key.")
+#     model_dict = _validate_models_dict(model_dict)
+
+#     # Read the task type so cross-validation and default scoring can be matched
+#     # to either classification or regression behavior.
+#     task_type = _validate_task_type(cfg.get("task_type", "classification"))
+
+#     # Choose a sensible default scoring rule based on task type, while still
+#     # allowing the caller to override it with any valid sklearn scorer.
+#     default_scoring_by_task = {
+#         "classification": "roc_auc",
+#         "regression": "neg_mean_squared_error",
+#     }
+#     scoring = _validate_scoring(
+#         cfg.get("scoring", default_scoring_by_task[task_type])
+#     )
+
+#     # Read the remaining ranking controls that govern subset sampling, CV,
+#     # permutation importance repetition, and final sorting behavior.
+#     subset_sizes = cfg.get("subset_sizes", [10, 15, 20])
+#     n_splits = int(cfg.get("n_splits", 5))
+#     n_repeats = int(cfg.get("n_repeats", 10))
+#     target_feature_appearances = int(cfg.get("target_feature_appearances", 20))
+#     random_state = int(cfg.get("random_state", 42))
+#     ranking_metric = _validate_ranking_metric(cfg.get("ranking_metric", "auto"))
+#     stage_name = str(cfg.get("name", "feature_ranking"))
+
+#     # ============================================================
+#     # 2. Input validation and setup
+#     # ============================================================
+#     # Validate the supervised-learning inputs and record the shape of the fixed
+#     # dataset being ranked.
+#     X, y = _validate_X_y(X, y)
+#     n_samples, n_features = X.shape
+
+#     # Validate feature names against the columns of `X` and require uniqueness so
+#     # all downstream feature lookups by name remain unambiguous.
+#     feature_names_list = _validate_feature_names(
+#         feature_names,
+#         n_features,
+#         require_unique=True,
+#     )
+
+#     # Validate and normalize the subset sizes requested for ranking on the
+#     # current dataset.
+#     valid_subset_sizes = _validate_subset_sizes(subset_sizes, n_features)
+
+#     # Resolve the effective ranking metric once up front so the final ranking
+#     # tables can be sorted consistently after all aggregation is complete.
+#     effective_ranking_metric = _resolve_effective_ranking_metric(
+#         ranking_metric,
+#         valid_subset_sizes,
+#     )
+
+#     # Validate that the target vector can support the requested number of CV
+#     # folds for the chosen task type.
+#     _validate_cv_targets(
+#         y,
+#         n_splits,
+#         task_type=task_type,
+#         context="single_dataset_permutation_ranking",
+#     )
+
+#     # Materialize the feature matrix as a DataFrame so feature subsets can be
+#     # selected by name while preserving readable column labels.
+#     X_df = pd.DataFrame(X, columns=feature_names_list)
+
+#     # ============================================================
+#     # 3. Run per model
+#     # ============================================================
+#     # Initialize the two top-level outputs:
+#     # - a final aggregated ranking table per model
+#     # - a detailed per-subset-size summary per model
+#     final_ranking_by_model: Dict[str, pd.DataFrame] = {}
+#     detailed_results_by_model: Dict[str, Dict[int, pd.DataFrame]] = {}
+
+#     # Rank features independently for each model template in the registry.
+#     for model_name, model_template in model_dict.items():
+
+#         # Seed a per-model RNG that drives feature-subset shuffling and
+#         # permutation-importance randomness.
+#         rng = np.random.RandomState(random_state + seed_offset)
+
+#         # Choose the cross-validation splitter based on task type:
+#         # - StratifiedKFold for classification
+#         # - KFold for regression
+#         if task_type == "classification":
+#             cv = StratifiedKFold(
+#                 n_splits=n_splits,
+#                 shuffle=True,
+#                 random_state=random_state + seed_offset,
+#             )
+#         else:
+#             cv = KFold(
+#                 n_splits=n_splits,
+#                 shuffle=True,
+#                 random_state=random_state + seed_offset,
+#             )
+
+#         # Store the subset-size-specific summary tables for this model.
+#         detailed_results: Dict[int, pd.DataFrame] = {}
+
+#         # Collect per-feature summaries across subset sizes so a final
+#         # cross-subset-size ranking can be built after all subset sizes are done.
+#         overall_records: DefaultDict[Hashable, List[Dict[str, float]]] = defaultdict(list)
+
+
+#         # Create a progress bar over subset sizes so the outer bar reflects the
+#         # ranking plan for the current stage configuration.
+#         subset_progress = tqdm(
+#             valid_subset_sizes,
+#             total=len(valid_subset_sizes),
+#             desc=f"Feature selection stage={stage_name} | model={model_name}",
+#             unit="subset",
+#             leave=False,
+#         )
+
+#         # Evaluate the model separately at each requested subset size.
+#         for subset_size in subset_progress:
+#             # Compute how many subset-sampling runs are needed so, on average,
+#             # each feature appears roughly `target_feature_appearances` times.
+#             n_runs: int = ceil((target_feature_appearances * n_features) / subset_size)
+
+#             # Track how many times each feature has been sampled at this subset
+#             # size so under-sampled features can be prioritized.
+#             feature_counts: Dict[Hashable, int] = {
+#                 feature: 0 for feature in feature_names_list
+#             }
+
+#             # Collect per-feature metric observations across runs and CV folds.
+#             feature_rank_records: DefaultDict[Hashable, List[float]] = defaultdict(list)
+#             feature_norm_rank_records: DefaultDict[Hashable, List[float]] = defaultdict(list)
+#             feature_importance_records: DefaultDict[Hashable, List[float]] = defaultdict(list)
+
+#             # Progress bar over repeated subset-sampling runs for this model and
+#             # subset size.
+#             run_progress_desc = f"{model_name} | subset={subset_size}"
+            
+#             run_progress = tqdm(
+#                 range(n_runs),
+#                 total=n_runs,
+#                 desc=run_progress_desc,
+#                 unit="run",
+#                 leave=False,
+#             )
+
+#             # Repeat balanced subset sampling enough times to build a stable
+#             # feature-level ranking summary.
+#             for _ in run_progress:
+#                 run_progress.set_postfix(cv_folds=n_splits)
+
+#                 # Start from a shuffled copy of all feature names so ties in
+#                 # sample counts are broken randomly but reproducibly.
+#                 shuffled_feature_names: List[Hashable] = feature_names_list.copy()
+#                 rng.shuffle(shuffled_feature_names)
+
+#                 # Sort features by how often they have already been sampled so
+#                 # less frequently used features are prioritized.
+#                 shuffled_feature_names.sort(
+#                     key=lambda feature: feature_counts[feature]
+#                 )
+
+#                 # Take the first `subset_size` features after balancing.
+#                 selected_features: List[Hashable] = shuffled_feature_names[:subset_size]
+
+#                 # Update sampling counts for the features used in this run.
+#                 for feature in selected_features:
+#                     feature_counts[feature] += 1
+
+#                 # Slice the DataFrame down to the currently selected features.
+#                 X_subset: pd.DataFrame = X_df[selected_features]
+
+#                 # Create the train/validation splits for this sampled subset.
+#                 split_iter = cv.split(X_subset, y)
+
+#                 # Evaluate permutation importance on each validation fold.
+#                 for train_idx, valid_idx in split_iter:
+#                     # Build the train and validation matrices for this fold.
+#                     X_train: pd.DataFrame = X_subset.iloc[train_idx]
+#                     X_valid: pd.DataFrame = X_subset.iloc[valid_idx]
+
+#                     # Slice the aligned targets for this fold.
+#                     y_train = y[train_idx]
+#                     y_valid = y[valid_idx]
+
+#                     # Clone the model template so every fold/run starts from a
+#                     # fresh unfitted estimator.
+#                     fitted_model = clone(model_template)
+#                     fitted_model.fit(X_train, y_train)
+
+#                     # Compute permutation importance on the held-out validation
+#                     # fold using the requested scoring rule.
+#                     permutation_result = permutation_importance(
+#                         fitted_model,
+#                         X_valid,
+#                         y_valid,
+#                         scoring=scoring,
+#                         n_repeats=n_repeats,
+#                         random_state=rng.randint(0, 1_000_000),
+#                         n_jobs=-1,
+#                     )
+
+#                     # Convert the mean importances into a Series indexed by
+#                     # selected feature name for easier downstream lookup.
+#                     feature_importances = pd.Series(
+#                         permutation_result.importances_mean,
+#                         index=selected_features,
+#                     )
+
+#                     # Rank features within the current sampled subset from most
+#                     # important to least important.
+#                     feature_ranks = feature_importances.rank(
+#                         ascending=False,
+#                         method="average",
+#                     )
+
+#                     # Normalize ranks onto a 0-to-1-like scale where 1 is best,
+#                     # so results from different subset sizes remain comparable.
+#                     if subset_size == 1:
+#                         normalized_feature_ranks = pd.Series(
+#                             data=1.0,
+#                             index=selected_features,
+#                             dtype=float,
+#                         )
+#                     else:
+#                         normalized_feature_ranks = 1 - (
+#                             (feature_ranks - 1) / (subset_size - 1)
+#                         )
+
+#                     # Append this fold's observations to the per-feature record
+#                     # collections for later aggregation.
+#                     for feature in selected_features:
+#                         feature_importance_records[feature].append(
+#                             float(feature_importances[feature])
+#                         )
+#                         feature_rank_records[feature].append(
+#                             float(feature_ranks[feature])
+#                         )
+#                         feature_norm_rank_records[feature].append(
+#                             float(normalized_feature_ranks[feature])
+#                         )
+
+#             # Build the summary table for this subset size after all runs/folds
+#             # have been accumulated.
+#             subset_summary_rows: List[Dict[str, Any]] = []
+
+#             # Compute one aggregated row per feature that was observed at this
+#             # subset size.
+#             for feature in feature_names_list:
+#                 if not feature_importance_records[feature]:
+#                     continue
+
+#                 # The number of recorded fold-level observations contributing to
+#                 # this feature's metrics at this subset size.
+#                 n_observations = len(feature_importance_records[feature])
+
+#                 # Average the raw rank, normalized rank, and importance across
+#                 # all observations for this feature.
+#                 mean_rank = float(np.mean(feature_rank_records[feature]))
+#                 mean_normalized_rank = float(np.mean(feature_norm_rank_records[feature]))
+#                 mean_importance = float(np.mean(feature_importance_records[feature]))
+
+#                 # Append the per-feature summary row for this subset size.
+#                 subset_summary_rows.append(
+#                     {
+#                         "feature": feature,
+#                         "subset_size": subset_size,
+#                         "times_sampled": feature_counts[feature],
+#                         "n_observations": n_observations,
+#                         "mean_rank": mean_rank,
+#                         "mean_normalized_rank": mean_normalized_rank,
+#                         "mean_importance": mean_importance,
+#                     }
+#                 )
+
+#                 # Also append a compact record used later to aggregate rankings
+#                 # across subset sizes.
+#                 overall_records[feature].append(
+#                     {
+#                         "subset_size": float(subset_size),
+#                         "mean_normalized_rank": mean_normalized_rank,
+#                         "mean_importance": mean_importance,
+#                         "n_observations": float(n_observations),
+#                     }
+#                 )
+
+#             # Convert the subset-size summary rows into a DataFrame.
+#             subset_summary_df = pd.DataFrame(subset_summary_rows)
+
+#             # Sort the subset-size summary from strongest to weakest features.
+#             subset_summary_df = subset_summary_df.sort_values(
+#                 by=["mean_normalized_rank", "mean_importance"],
+#                 ascending=[False, False],
+#             ).reset_index(drop=True)
+
+#             # Store the sorted summary table under this subset size.
+#             detailed_results[subset_size] = subset_summary_df
+
+#         # Build the final cross-subset-size ranking table for this model.
+#         final_rows: List[Dict[str, Any]] = []
+
+#         # Collapse each feature's subset-size-specific records into one final row.
+#         for feature, records in overall_records.items():
+#             # Weight subset-size contributions by the number of observations
+#             # supporting each subset-size summary.
+#             weights = np.array(
+#                 [record["n_observations"] for record in records],
+#                 dtype=float,
+#             )
+
+#             # Guard against invalid weighting inputs before computing averages.
+#             if np.any(weights < 0):
+#                 raise ValueError(f"Negative n_observations encountered for feature '{feature}'.")
+#             if np.all(weights == 0):
+#                 raise ValueError(f"All n_observations are zero for feature '{feature}'.")
+
+#             # Compute the weighted average normalized rank across subset sizes.
+#             weighted_mean_normalized_rank = float(
+#                 np.average(
+#                     [record["mean_normalized_rank"] for record in records],
+#                     weights=weights,
+#                 )
+#             )
+
+#             # Compute the weighted average importance across subset sizes.
+#             weighted_mean_importance = float(
+#                 np.average(
+#                     [record["mean_importance"] for record in records],
+#                     weights=weights,
+#                 )
+#             )
+
+#             # Append the final aggregated ranking row for this feature.
+#             final_rows.append(
+#                 {
+#                     "feature": feature,
+#                     "mean_normalized_rank_across_sizes": weighted_mean_normalized_rank,
+#                     "mean_importance_across_sizes": weighted_mean_importance,
+#                     "n_subset_sizes_used": len(records),
+#                     "total_n_observations_across_sizes": int(weights.sum()),
+#                 }
+#             )
+
+#         # Convert the aggregated rows into the final ranking DataFrame.
+#         final_ranking = pd.DataFrame(final_rows)
+
+#         # Sort the final ranking according to the resolved ranking rule.
+#         if effective_ranking_metric == "mean_normalized_rank":
+#             final_ranking = final_ranking.sort_values(
+#                 by=[
+#                     "mean_normalized_rank_across_sizes",
+#                     "mean_importance_across_sizes",
+#                 ],
+#                 ascending=[False, False],
+#             ).reset_index(drop=True)
+#         elif effective_ranking_metric == "mean_importance":
+#             final_ranking = final_ranking.sort_values(
+#                 by=[
+#                     "mean_importance_across_sizes",
+#                     "mean_normalized_rank_across_sizes",
+#                 ],
+#                 ascending=[False, False],
+#             ).reset_index(drop=True)
+#         else:
+#             raise ValueError(
+#                 f"Unsupported effective_ranking_metric: {effective_ranking_metric}"
+#             )
+
+#         # Store the final ranking table and the detailed subset-size summaries
+#         # for this model.
+#         final_ranking_by_model[model_name] = final_ranking
+#         detailed_results_by_model[model_name] = detailed_results
+
+#     # Return both the final model-level ranking tables and the more detailed
+#     # subset-size-specific summaries.
+#     return final_ranking_by_model, detailed_results_by_model
+
+
 def balanced_permutation_rank_select_stage(
     X: np.ndarray,
     y: np.ndarray,
@@ -1871,6 +2607,21 @@ def balanced_permutation_rank_select_stage(
     random_state = int(cfg.get("random_state", 42))
     top_k = cfg.get("top_k", None)
 
+    # Read optional row-subsampling settings. These are primarily consumed inside
+    # single_dataset_permutation_ranking(...), but we read them here so the stage
+    # output can record whether row subsampling was active.
+    row_subsampling_cfg = dict(cfg.get("row_subsampling", {}))
+    row_subsampling_enabled = bool(row_subsampling_cfg.get("enabled", False))
+    row_subsample_train_fraction = float(
+        row_subsampling_cfg.get("train_fraction", 1.0)
+    )
+    row_subsample_stratify = bool(
+        row_subsampling_cfg.get("stratify", True)
+    )
+
+    if not row_subsampling_enabled:
+        row_subsample_train_fraction = 1.0
+
     # `top_k` is required because this engine always performs both ranking and
     # selection within the current stage.
     if top_k is None:
@@ -1956,6 +2707,48 @@ def balanced_permutation_rank_select_stage(
         # canonical final-ranking schema.
         normalized_final_ranking_by_model: Dict[str, pd.DataFrame] = {}
 
+        # # Normalize each model's final ranking table independently.
+        # for model_name, df_rank in final_ranking_by_model.items():
+        #     # Rename legacy summary columns into the canonical output names used
+        #     # by this engine and by the group-mode aggregation path.
+        #     df_norm = df_rank.rename(
+        #         columns={
+        #             "mean_normalized_rank_across_sizes": "mean_normalized_rank",
+        #             "mean_importance_across_sizes": "mean_importance",
+        #             "total_n_observations_across_sizes": "total_n_observations",
+        #         }
+        #     ).copy()
+
+        #     # Non-group mode always corresponds to exactly one ranking run, so
+        #     # annotate that explicitly when the column is absent.
+        #     if "group_iterations_used" not in df_norm.columns:
+        #         df_norm["group_iterations_used"] = 1
+
+        #     # Preserve optional row-subsampling metadata if the detailed table returned it.
+        #     if "row_subsampling_enabled" not in df_norm.columns:
+        #         df_norm["row_subsampling_enabled"] = row_subsampling_enabled
+        #     if "row_subsample_train_fraction" not in df_norm.columns:
+        #         df_norm["row_subsample_train_fraction"] = row_subsample_train_fraction
+        #     if "row_subsample_stratify" not in df_norm.columns:
+        #         df_norm["row_subsample_stratify"] = row_subsample_stratify
+
+
+        #     # Keep only the canonical final-ranking columns and present them in a
+        #     # fixed order for downstream consumers.
+        #     df_norm = df_norm[
+        #         [
+        #             "feature",
+        #             "mean_normalized_rank",
+        #             "mean_importance",
+        #             "n_subset_sizes_used",
+        #             "total_n_observations",
+        #             "group_iterations_used",
+        #         ]
+        #     ].reset_index(drop=True)
+
+        #     # Store the normalized final ranking table for this model.
+        #     normalized_final_ranking_by_model[model_name] = df_norm
+
         # Normalize each model's final ranking table independently.
         for model_name, df_rank in final_ranking_by_model.items():
             # Rename legacy summary columns into the canonical output names used
@@ -1973,6 +2766,14 @@ def balanced_permutation_rank_select_stage(
             if "group_iterations_used" not in df_norm.columns:
                 df_norm["group_iterations_used"] = 1
 
+            # Preserve optional row-subsampling metadata if the ranking table returned it.
+            if "row_subsampling_enabled" not in df_norm.columns:
+                df_norm["row_subsampling_enabled"] = row_subsampling_enabled
+            if "row_subsample_train_fraction" not in df_norm.columns:
+                df_norm["row_subsample_train_fraction"] = row_subsample_train_fraction
+            if "row_subsample_stratify" not in df_norm.columns:
+                df_norm["row_subsample_stratify"] = row_subsample_stratify
+
             # Keep only the canonical final-ranking columns and present them in a
             # fixed order for downstream consumers.
             df_norm = df_norm[
@@ -1983,6 +2784,9 @@ def balanced_permutation_rank_select_stage(
                     "n_subset_sizes_used",
                     "total_n_observations",
                     "group_iterations_used",
+                    "row_subsampling_enabled",
+                    "row_subsample_train_fraction",
+                    "row_subsample_stratify",
                 ]
             ].reset_index(drop=True)
 
@@ -2007,6 +2811,30 @@ def balanced_permutation_rank_select_stage(
                 if "group_iterations_used" not in df_norm.columns:
                     df_norm["group_iterations_used"] = 1
 
+                # # Keep only the canonical detailed-result columns in a consistent
+                # # order across models and subset sizes.
+                # df_norm = df_norm[
+                #     [
+                #         "feature",
+                #         "subset_size",
+                #         "times_sampled",
+                #         "n_observations",
+                #         "mean_rank",
+                #         "mean_normalized_rank",
+                #         "mean_importance",
+                #         "group_iterations_used",
+                #     ]
+                # ].reset_index(drop=True)
+
+
+                # Preserve optional row-subsampling metadata if the detailed table returned it.
+                if "row_subsampling_enabled" not in df_norm.columns:
+                    df_norm["row_subsampling_enabled"] = row_subsampling_enabled
+                if "row_subsample_train_fraction" not in df_norm.columns:
+                    df_norm["row_subsample_train_fraction"] = row_subsample_train_fraction
+                if "row_subsample_stratify" not in df_norm.columns:
+                    df_norm["row_subsample_stratify"] = row_subsample_stratify
+
                 # Keep only the canonical detailed-result columns in a consistent
                 # order across models and subset sizes.
                 df_norm = df_norm[
@@ -2019,6 +2847,9 @@ def balanced_permutation_rank_select_stage(
                         "mean_normalized_rank",
                         "mean_importance",
                         "group_iterations_used",
+                        "row_subsampling_enabled",
+                        "row_subsample_train_fraction",
+                        "row_subsample_stratify",
                     ]
                 ].reset_index(drop=True)
 
@@ -2196,21 +3027,40 @@ def balanced_permutation_rank_select_stage(
 
                 # Compute the aggregated final-ranking metrics for this feature.
                 final_rows.append(
-                    {
-                        "feature": feat,
-                        "mean_normalized_rank": float(
-                            np.average(vals["mean_normalized_rank"], weights=weights)
-                        ),
-                        "mean_importance": float(
-                            np.average(vals["mean_importance"], weights=weights)
-                        ),
-                        "n_subset_sizes_used": float(
-                            np.average(vals["n_subset_sizes_used"], weights=weights)
-                        ),
-                        "total_n_observations": int(weights.sum()),
-                        "group_iterations_used": len(vals["mean_normalized_rank"]),
-                    }
+                {
+                    "feature": feat,
+                    "mean_normalized_rank": float(
+                        np.average(vals["mean_normalized_rank"], weights=weights)
+                    ),
+                    "mean_importance": float(
+                        np.average(vals["mean_importance"], weights=weights)
+                    ),
+                    "n_subset_sizes_used": float(
+                        np.average(vals["n_subset_sizes_used"], weights=weights)
+                    ),
+                    "total_n_observations": int(weights.sum()),
+                    "group_iterations_used": len(vals["mean_normalized_rank"]),
+                    "row_subsampling_enabled": row_subsampling_enabled,
+                    "row_subsample_train_fraction": row_subsample_train_fraction,
+                    "row_subsample_stratify": row_subsample_stratify,
+                 }
                 )
+                # final_rows.append(
+                #     {
+                #         "feature": feat,
+                #         "mean_normalized_rank": float(
+                #             np.average(vals["mean_normalized_rank"], weights=weights)
+                #         ),
+                #         "mean_importance": float(
+                #             np.average(vals["mean_importance"], weights=weights)
+                #         ),
+                #         "n_subset_sizes_used": float(
+                #             np.average(vals["n_subset_sizes_used"], weights=weights)
+                #         ),
+                #         "total_n_observations": int(weights.sum()),
+                #         "group_iterations_used": len(vals["mean_normalized_rank"]),
+                #     }
+                # )
 
             # Convert the aggregated rows into a final-ranking DataFrame.
             final_df = pd.DataFrame(final_rows)
@@ -2291,6 +3141,18 @@ def balanced_permutation_rank_select_stage(
                 # Collapse each feature's detailed values into one aggregated row
                 # for this subset size.
                 for feat, vals in feature_records.items():
+                    # agg_rows.append(
+                    #     {
+                    #         "feature": feat,
+                    #         "subset_size": subset_size,
+                    #         "times_sampled": float(np.mean(vals["times_sampled"])),
+                    #         "n_observations": float(np.mean(vals["n_observations"])),
+                    #         "mean_rank": float(np.mean(vals["mean_rank"])),
+                    #         "mean_normalized_rank": float(np.mean(vals["mean_normalized_rank"])),
+                    #         "mean_importance": float(np.mean(vals["mean_importance"])),
+                    #         "group_iterations_used": len(vals["mean_rank"]),
+                    #     }
+                    # )
                     agg_rows.append(
                         {
                             "feature": feat,
@@ -2301,9 +3163,11 @@ def balanced_permutation_rank_select_stage(
                             "mean_normalized_rank": float(np.mean(vals["mean_normalized_rank"])),
                             "mean_importance": float(np.mean(vals["mean_importance"])),
                             "group_iterations_used": len(vals["mean_rank"]),
+                            "row_subsampling_enabled": row_subsampling_enabled,
+                            "row_subsample_train_fraction": row_subsample_train_fraction,
+                            "row_subsample_stratify": row_subsample_stratify,
                         }
                     )
-
                 # Convert the aggregated rows into a detailed DataFrame and sort
                 # it from strongest to weakest features.
                 agg_df = pd.DataFrame(agg_rows).sort_values(
@@ -2568,12 +3432,44 @@ def balanced_permutation_rank_select_pipeline(
 
             # Record a complete snapshot of this stage so the caller can inspect
             # rankings, selected features, and the exact config that was used.
+            # stage_out = {
+            #     "stage": stage_name,
+            #     "top_k": int(stage_cfg["top_k"]),
+            #     "n_features_in": int(X_current.shape[1]),
+            #     "n_features_out": int(X_next.shape[1]),
+            #     "cfg_used": deepcopy(stage_cfg),
+            #     "final_ranking": ranking_model_out,
+            #     "detailed_results": detail_model_out,
+            #     "selected_feature_names": names_next,
+            #     "selected_feature_indices": np.asarray(selected_idx_original, dtype=int).copy(),
+            #     "selected_feature_indices_local": selected_idx_local.copy(),
+            #     "X_selected": X_next,
+            # }
+
+            row_subsampling_cfg = dict(stage_cfg.get("row_subsampling", {}))
+            row_subsampling_enabled = bool(row_subsampling_cfg.get("enabled", False))
+            row_subsample_train_fraction = float(
+                row_subsampling_cfg.get("train_fraction", 1.0)
+            )
+            row_subsample_stratify = bool(
+                row_subsampling_cfg.get("stratify", True)
+            )
+
+            if not row_subsampling_enabled:
+                row_subsample_train_fraction = 1.0
+
             stage_out = {
                 "stage": stage_name,
                 "top_k": int(stage_cfg["top_k"]),
                 "n_features_in": int(X_current.shape[1]),
                 "n_features_out": int(X_next.shape[1]),
                 "cfg_used": deepcopy(stage_cfg),
+
+                # Record row-subsampling metadata at the stage level for easier inspection.
+                "row_subsampling_enabled": row_subsampling_enabled,
+                "row_subsample_train_fraction": row_subsample_train_fraction,
+                "row_subsample_stratify": row_subsample_stratify,
+
                 "final_ranking": ranking_model_out,
                 "detailed_results": detail_model_out,
                 "selected_feature_names": names_next,
@@ -2581,7 +3477,6 @@ def balanced_permutation_rank_select_pipeline(
                 "selected_feature_indices_local": selected_idx_local.copy(),
                 "X_selected": X_next,
             }
-
             history.append(stage_out)
             by_stage[stage_name] = stage_out
 
@@ -3117,7 +4012,6 @@ def make_synthetic_feature_selection_dataset(
 # ---------------------------------------------------------------------
 # Nested cross-validation feature selection 
 # ---------------------------------------------------------------------
-
 from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold, cross_validate
 from sklearn.model_selection._split import BaseCrossValidator  # for typing
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Type, Mapping
