@@ -1,0 +1,2186 @@
+PREPARE TRAIN/VALIDATION BUNDLES — DETAILED HUMAN-READABLE TEST REPORT
+============================================================================
+Generated: 2026-07-21 13:45:26 Pacific Daylight Time
+Project root: C:\Users\NehemiahZewde\Desktop\Neumarker\AI_framework
+Python test/report file: C:\Users\NehemiahZewde\Desktop\Neumarker\AI_framework\tests\run_prepare_train_validation_bundles_tests_and_report.py
+Pytest exit code: 0
+
+OVERALL STATUS: PASS
+Every documented test passed and no known gaps remain.
+
+SUMMARY
+-------
+PASS: 42
+KNOWN GAP: 0
+UNEXPECTED FAILURE: 0
+EXECUTION ERROR: 0
+UNEXPECTED PASS: 0
+SKIPPED: 0
+NOT RUN: 0
+
+HOW TO REVIEW EACH TEST
+-----------------------
+Each test below explicitly shows:
+1. What was tested.
+2. Why it matters.
+3. The controlled inputs used by the test.
+4. The expected behavior.
+5. The actual output observed during this run.
+6. The test status and its plain-language interpretation.
+
+VERSION 1 SCOPE
+---------------
+This test contract covers binary classification only.
+Regression and multiclass support are deferred to Version 2.
+
+STATUS DEFINITIONS
+------------------
+PASS: Actual output matched the intended current behavior.
+KNOWN GAP: The test intentionally demonstrates an unfixed weakness.
+FAIL: A normal test produced an unexpected result.
+ERROR: The test could not complete.
+UNEXPECTED PASS: A known-gap test now passes and needs review.
+
+
+A. Core internal-split behavior
+===============================
+Checks the normal internal train/final-validation split used by the current Coimbra notebook workflow.
+
+TEST 01 — Internal stratified split builds the expected raw bundles
+-------------------------------------------------------------------
+Python test function: test_internal_stratified_split_builds_expected_raw_bundles
+
+What this test checks
+---------------------
+Verify that a 20% stratified validation split produces correctly sized raw train and validation bundles with float target labels.
+
+Why this test matters
+---------------------
+The train/final-validation split is the foundation for all later model evaluation. Incorrect sizes, labels, or flags would propagate through the entire framework.
+
+Controlled test inputs
+----------------------
+- rows: 20
+- features:
+  - patient_id
+  - age
+  - biomarker
+- original labels:
+  - 1
+  - 2
+- target mapping:
+  - 1: 0.0
+  - 2: 1.0
+- validation size: 0.2
+- random state: 42
+- stratify: Yes
+
+Expected behavior
+-----------------
+- train shape:
+  - 16
+  - 3
+- validation shape:
+  - 4
+  - 3
+- train class counts:
+  - 0.0: 8
+  - 1.0: 8
+- validation class counts:
+  - 0.0: 2
+  - 1.0: 2
+- target dtype: floating
+- bundles remain raw: Yes
+
+Actual observed output
+----------------------
+- validation bundle created: Yes
+- train shape:
+  - 16
+  - 3
+- validation shape:
+  - 4
+  - 3
+- train feature names:
+  - patient_id
+  - age
+  - biomarker
+- validation feature names:
+  - patient_id
+  - age
+  - biomarker
+- train target values:
+  - 0.0
+  - 1.0
+- validation target values:
+  - 0.0
+  - 1.0
+- train target dtype: float64
+- validation target dtype: float64
+- train class counts:
+  - 0.0: 8
+  - 1.0: 8
+- validation class counts:
+  - 0.0: 2
+  - 1.0: 2
+- validation mode: internal_split
+- train flags:
+  - is raw split: Yes
+  - is encoded: No
+  - is preprocessed: No
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The standard internal-split pathway produced correctly sized, stratified raw bundles with the intended float-label contract.
+
+TEST 02 — The internal split is reproducible with a fixed random seed
+---------------------------------------------------------------------
+Python test function: test_internal_split_is_reproducible
+
+What this test checks
+---------------------
+Run the same split twice and confirm that the train rows, validation rows, and targets are identical.
+
+Why this test matters
+---------------------
+Reproducibility is required for debugging, auditing, comparing model changes, and interpreting later performance differences.
+
+Controlled test inputs
+----------------------
+- rows: 20
+- validation size: 0.2
+- random state: 42
+- stratify: Yes
+- number of runs: 2
+
+Expected behavior
+-----------------
+- train features identical across runs: Yes
+- validation features identical across runs: Yes
+- train targets identical across runs: Yes
+- validation targets identical across runs: Yes
+
+Actual observed output
+----------------------
+- run 1 train patient ids:
+  - 118
+  - 110
+  - 101
+  - 109
+  - 103
+  - 107
+  - 117
+  - 100
+  - 116
+  - 119
+  - 115
+  - 104
+  - 111
+  - 108
+  - 102
+  - 114
+- run 2 train patient ids:
+  - 118
+  - 110
+  - 101
+  - 109
+  - 103
+  - 107
+  - 117
+  - 100
+  - 116
+  - 119
+  - 115
+  - 104
+  - 111
+  - 108
+  - 102
+  - 114
+- run 1 validation patient ids:
+  - 112
+  - 106
+  - 105
+  - 113
+- run 2 validation patient ids:
+  - 112
+  - 106
+  - 105
+  - 113
+- train rows identical: Yes
+- validation rows identical: Yes
+- train targets identical: Yes
+- validation targets identical: Yes
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Using the same random seed reproduced the exact same split and labels.
+
+TEST 03 — Feature rows remain aligned with their target labels after splitting
+------------------------------------------------------------------------------
+Python test function: test_split_preserves_feature_target_row_alignment
+
+What this test checks
+---------------------
+Verify every patient_id in both returned bundles still has the target label associated with that patient before the split.
+
+Why this test matters
+---------------------
+A row-label misalignment would train the model using outcomes from the wrong patients and could invalidate the full analysis while still producing apparently reasonable output.
+
+Controlled test inputs
+----------------------
+- unique row identifier: patient_id
+- rows: 20
+- target mapping:
+  - 1: 0.0
+  - 2: 1.0
+
+Expected behavior
+-----------------
+- mismatched patient target pairs: 0
+
+Actual observed output
+----------------------
+- checked patient target pairs: 20
+- mismatch count: 0
+- mismatches:
+  (none)
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+All split rows retained the correct patient-to-target relationship.
+
+TEST 04 — Train and validation rows are disjoint and include every input row
+----------------------------------------------------------------------------
+Python test function: test_train_and_validation_are_disjoint_and_exhaustive
+
+What this test checks
+---------------------
+Confirm no patient appears in both splits and no patient is lost or duplicated during splitting.
+
+Why this test matters
+---------------------
+Overlap causes data leakage, while missing or duplicated patients alter the intended sample and class distribution.
+
+Controlled test inputs
+----------------------
+- input patient ids: 100 through 119
+- rows: 20
+
+Expected behavior
+-----------------
+- train validation overlap count: 0
+- combined unique patient count: 20
+- missing patient count: 0
+
+Actual observed output
+----------------------
+- train unique patient count: 16
+- validation unique patient count: 4
+- overlap count: 0
+- overlapping patient ids:
+  (none)
+- combined unique patient count: 20
+- missing patient ids:
+  (none)
+- unexpected patient ids:
+  (none)
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The split created two non-overlapping sets whose union exactly matched the original participants.
+
+TEST 05 — The function does not modify caller-owned inputs
+----------------------------------------------------------
+Python test function: test_inputs_are_not_modified
+
+What this test checks
+---------------------
+Compare X, y, and nested dataset metadata before and after the function call.
+
+Why this test matters
+---------------------
+Unexpected in-place mutation can change later notebook cells, create hard-to-reproduce state, and make repeated analyses inconsistent.
+
+Controlled test inputs
+----------------------
+- X type: pandas DataFrame
+- y type: pandas Series
+- metadata contains nested dictionary: Yes
+
+Expected behavior
+-----------------
+- X unchanged: Yes
+- y unchanged: Yes
+- dataset metadata unchanged: Yes
+
+Actual observed output
+----------------------
+- X unchanged: Yes
+- y unchanged: Yes
+- dataset metadata unchanged: Yes
+- metadata after call:
+  - ml task: binary_classification
+  - nested:
+    - a: 1
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The preparation function left all caller-owned inputs unchanged.
+
+TEST 06 — A zero validation size intentionally creates train-only mode
+----------------------------------------------------------------------
+Python test function: test_train_only_mode_with_zero_validation_size
+
+What this test checks
+---------------------
+Confirm validation_size=0.0 keeps all rows in training and returns no validation bundle.
+
+Why this test matters
+---------------------
+Train-only operation should be explicit and should not accidentally discard rows or create an empty validation object.
+
+Controlled test inputs
+----------------------
+- rows: 20
+- validation size: 0.0
+
+Expected behavior
+-----------------
+- train rows: 20
+- validation bundle: None
+- validation mode: train_only
+
+Actual observed output
+----------------------
+- train shape:
+  - 20
+  - 3
+- train target length: 20
+- validation bundle created: No
+- validation mode: train_only
+- has validation: No
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The explicit train-only configuration retained every row and created no validation bundle.
+
+
+B. Provided external-validation behavior
+========================================
+Checks the branch where an external validation dataset is supplied instead of creating an internal split.
+
+TEST 07 — Provided validation uses shared features in training-column order
+---------------------------------------------------------------------------
+Python test function: test_provided_validation_uses_intersection_and_training_column_order
+
+What this test checks
+---------------------
+Verify that supplied validation data bypasses the internal split, keeps only shared raw columns, and reorders them to the training order.
+
+Why this test matters
+---------------------
+External validation must use an explicitly aligned feature contract. Different feature order would apply values to the wrong model columns.
+
+Controlled test inputs
+----------------------
+- training columns:
+  - age
+  - bmi
+  - train_only
+- validation columns:
+  - validation_only
+  - bmi
+  - age
+- provided validation rows: 2
+- split kwargs are present but should be ignored: Yes
+
+Expected behavior
+-----------------
+- shared columns:
+  - age
+  - bmi
+- train only columns dropped:
+  - train_only
+- validation only columns dropped:
+  - validation_only
+- internal split used: No
+- validation mode: provided_validation
+
+Actual observed output
+----------------------
+- train columns after alignment:
+  - age
+  - bmi
+- validation columns after alignment:
+  - age
+  - bmi
+- train shape:
+  - 6
+  - 2
+- validation shape:
+  - 2
+  - 2
+- validation age values:
+  - 70
+  - 75
+- validation bmi values:
+  - 27.0
+  - 28.0
+- alignment metadata:
+  - enabled: Yes
+  - requested policy: intersection
+  - effective policy: intersection
+  - mode: intersection
+  - exact feature set match: No
+  - n train features before: 3
+  - n validation features before: 3
+  - n common features: 2
+  - common features:
+    - age
+    - bmi
+  - n features retained: 2
+  - features retained:
+    - age
+    - bmi
+  - training features missing from validation:
+    - train_only
+  - validation only features:
+    - validation_only
+  - n train only features dropped: 1
+  - train only features dropped:
+    - train_only
+  - n validation only features dropped: 1
+  - validation only features dropped:
+    - validation_only
+  - validation reordered to match train: Yes
+- validation mode: provided_validation
+- internal split used: No
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The external validation branch aligned shared columns correctly and did not create an additional internal split.
+
+TEST 08 — Provided validation requires both features and targets
+----------------------------------------------------------------
+Python test function: test_provided_validation_requires_both_X_and_y
+
+What this test checks
+---------------------
+Check that supplying only validation X or only validation y raises an informative framework-level error.
+
+Why this test matters
+---------------------
+A supervised validation bundle cannot be evaluated without both inputs. Failing early prevents partially defined validation state.
+
+Controlled test inputs
+----------------------
+- scenario 1: validation y supplied without validation X
+- scenario 2: validation X supplied without validation y
+
+Expected behavior
+-----------------
+- scenario 1 error: validation target but no validation X
+- scenario 2 error: validation X but no validation target
+
+Actual observed output
+----------------------
+- missing validation X:
+  - exception raised: Yes
+  - exception type: ValueError
+  - exception message: validation_kwargs includes a validation target but no validation X. Provide validation_kwargs['X'].
+- missing validation y:
+  - exception raised: Yes
+  - exception type: ValueError
+  - exception message: validation_kwargs includes validation X but no validation target. Provide validation_kwargs['y'].
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Both incomplete validation configurations were rejected with clear errors.
+
+TEST 09 — Provided validation with no shared raw features is rejected
+---------------------------------------------------------------------
+Python test function: test_provided_validation_with_no_shared_features_raises
+
+What this test checks
+---------------------
+Confirm alignment fails when training and validation have no overlapping feature names.
+
+Why this test matters
+---------------------
+A model cannot be validated when there is no common feature space. Proceeding would create meaningless or empty inputs.
+
+Controlled test inputs
+----------------------
+- training columns:
+  - a
+  - b
+- validation columns:
+  - c
+  - d
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: No overlapping raw feature columns
+
+Actual observed output
+----------------------
+- exception raised: Yes
+- exception type: ValueError
+- exception message: No overlapping raw feature columns were found between training and provided validation data under validation_feature_policy='intersection'.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function correctly blocked validation when no common feature space existed.
+
+
+C. Input formats and error handling
+===================================
+Checks supported input forms and verifies that malformed inputs are rejected rather than silently converted.
+
+TEST 10 — A target label missing from the mapping is rejected
+-------------------------------------------------------------
+Python test function: test_unknown_target_label_raises
+
+What this test checks
+---------------------
+Insert label 3 while the mapping only defines labels 1 and 2 and confirm the function raises an error.
+
+Why this test matters
+---------------------
+Silently converting an unknown clinical outcome to missing or an unintended class would corrupt the target definition.
+
+Controlled test inputs
+----------------------
+- observed labels:
+  - 1
+  - 2
+  - 3
+- mapping keys:
+  - 1
+  - 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: target labels not present in mapping
+
+Actual observed output
+----------------------
+- observed labels:
+  - 1
+  - 2
+  - 3
+- mapping keys:
+  - 1
+  - 2
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Found target labels not present in mapping: [3]
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The target encoder refused to process a class that was not explicitly mapped.
+
+TEST 11 — Different X and y row counts are rejected
+---------------------------------------------------
+Python test function: test_X_y_row_count_mismatch_raises
+
+What this test checks
+---------------------
+Provide 20 feature rows and 19 target values and verify an early error.
+
+Why this test matters
+---------------------
+Every patient row requires exactly one target. A count mismatch makes row-level alignment undefined.
+
+Controlled test inputs
+----------------------
+- X rows: 20
+- y values: 19
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: different numbers of rows
+
+Actual observed output
+----------------------
+- X rows: 20
+- y values: 19
+- exception raised: Yes
+- exception type: ValueError
+- exception message: X and y have different numbers of rows: X has 20 rows, y has 19 rows.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function detected and rejected the unequal feature and target lengths.
+
+TEST 12 — NumPy feature matrices require explicit feature names
+---------------------------------------------------------------
+Python test function: test_numpy_X_requires_feature_names
+
+What this test checks
+---------------------
+Call the function with a NumPy X array and no feature_names argument.
+
+Why this test matters
+---------------------
+Unnamed array columns cannot be audited, aligned to validation data, or reliably interpreted downstream.
+
+Controlled test inputs
+----------------------
+- X type: NumPy array
+- feature names: None
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: feature_names must be provided
+
+Actual observed output
+----------------------
+- X shape:
+  - 20
+  - 3
+- feature names supplied: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: X: feature_names must be provided when X is not a pandas DataFrame.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function required explicit names before accepting an array feature matrix.
+
+TEST 13 — NumPy feature matrices use the supplied feature names
+---------------------------------------------------------------
+Python test function: test_numpy_X_uses_explicit_feature_names
+
+What this test checks
+---------------------
+Supply an array with three explicit feature names and confirm those names appear in the returned DataFrames and bundle metadata.
+
+Why this test matters
+---------------------
+Array inputs are only safe when the exact column identity and order are retained.
+
+Controlled test inputs
+----------------------
+- X type: NumPy array
+- feature names:
+  - patient_id
+  - age
+  - biomarker
+
+Expected behavior
+-----------------
+- returned feature names:
+  - patient_id
+  - age
+  - biomarker
+- returned dataframe column order matches: Yes
+
+Actual observed output
+----------------------
+- requested feature names:
+  - patient_id
+  - age
+  - biomarker
+- train feature names:
+  - patient_id
+  - age
+  - biomarker
+- train dataframe columns:
+  - patient_id
+  - age
+  - biomarker
+- validation dataframe columns:
+  - patient_id
+  - age
+  - biomarker
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The explicit array column names were preserved in the returned raw bundle.
+
+TEST 14 — A single-column target DataFrame is supported
+-------------------------------------------------------
+Python test function: test_single_column_target_dataframe_is_supported
+
+What this test checks
+---------------------
+Pass y as a one-column DataFrame and confirm it is resolved into a valid one-dimensional target.
+
+Why this test matters
+---------------------
+Clinical loaders may return targets as Series or one-column DataFrames; both forms should work when they represent one outcome.
+
+Controlled test inputs
+----------------------
+- y type: pandas DataFrame
+- y shape:
+  - 20
+  - 1
+
+Expected behavior
+-----------------
+- train target length: 16
+- validation target length: 4
+
+Actual observed output
+----------------------
+- input y shape:
+  - 20
+  - 1
+- train target shape:
+  - 16
+- validation target shape:
+  - 4
+- train target length: 16
+- validation target length: 4
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The one-column target table was safely converted to a one-dimensional target.
+
+TEST 15 — A multi-column target DataFrame is rejected
+-----------------------------------------------------
+Python test function: test_multi_column_target_dataframe_raises
+
+What this test checks
+---------------------
+Pass two target columns and verify the function refuses to guess how they should be combined.
+
+Why this test matters
+---------------------
+This workflow currently supports a single supervised target. Flattening or selecting one column silently would change the modeling task.
+
+Controlled test inputs
+----------------------
+- y type: pandas DataFrame
+- y shape:
+  - 20
+  - 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: single-column DataFrame
+
+Actual observed output
+----------------------
+- input y shape:
+  - 20
+  - 2
+- input y columns:
+  - target_a
+  - target_b
+- exception raised: Yes
+- exception type: ValueError
+- exception message: y must be 1D or a single-column DataFrame, but got shape (20, 2).
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function correctly rejected a genuinely multi-output target table.
+
+
+E. Version 1 binary-classification contract
+===========================================
+Defines the explicit Version 1 task boundary: one binary target mapped to 0.0 and 1.0. Regression and multiclass tasks are deferred to Version 2.
+
+TEST 16 — Version 1 rejects regression tasks explicitly
+-------------------------------------------------------
+Python test function: test_rejects_unsupported_regression_task_in_version_1
+
+What this test checks
+---------------------
+Provide dataset metadata declaring ml_task='regression' and require the preparation function to stop before splitting.
+
+Why this test matters
+---------------------
+A successful data split could falsely imply that the full framework supports regression. Version 1 should state its binary-classification boundary clearly and defer regression to Version 2.
+
+Controlled test inputs
+----------------------
+- rows: 30
+- ml task: regression
+- stratify: No
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: Version 1 supports binary classification only
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Version 1 supports binary classification only. Received dataset_metadata['ml_task']='regression'. Regression and multiclass support are deferred to Version 2.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now rejects regression immediately and communicates the Version 1 scope.
+
+
+D. Bundle and metadata integrity
+================================
+Checks that returned bundles, intermediate DataFrames, feature maps, and metadata agree with the actual data and do not share unsafe state.
+
+TEST 17 — feature_name_to_idx matches the actual DataFrame positions
+--------------------------------------------------------------------
+Python test function: test_feature_name_to_idx_matches_dataframe_column_positions
+
+What this test checks
+---------------------
+Rebuild the expected name-to-position dictionary from X_raw and compare it with both returned bundles.
+
+Why this test matters
+---------------------
+Downstream code may use this mapping to retrieve feature columns. Any mismatch would return the wrong values.
+
+Controlled test inputs
+----------------------
+- features:
+  - patient_id
+  - age
+  - biomarker
+
+Expected behavior
+-----------------
+- feature name to idx:
+  - patient id: 0
+  - age: 1
+  - biomarker: 2
+
+Actual observed output
+----------------------
+- bundles:
+  - train:
+    - dataframe columns:
+      - patient_id
+      - age
+      - biomarker
+    - expected mapping:
+      - patient id: 0
+      - age: 1
+      - biomarker: 2
+    - actual mapping:
+      - patient id: 0
+      - age: 1
+      - biomarker: 2
+    - mapping matches: Yes
+  - validation:
+    - dataframe columns:
+      - patient_id
+      - age
+      - biomarker
+    - expected mapping:
+      - patient id: 0
+      - age: 1
+      - biomarker: 2
+    - actual mapping:
+      - patient id: 0
+      - age: 1
+      - biomarker: 2
+    - mapping matches: Yes
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The bundle feature-index mappings matched the actual train and validation columns.
+
+TEST 18 — Returned intermediate DataFrames agree with the final bundles
+-----------------------------------------------------------------------
+Python test function: test_return_dataframes_exposes_consistent_intermediate_outputs
+
+What this test checks
+---------------------
+Enable return_dataframes and compare the stored intermediate train and validation objects with X_raw and y in the final bundles.
+
+Why this test matters
+---------------------
+Audit DataFrames are useful only if they represent the same rows and targets that are actually passed downstream.
+
+Controlled test inputs
+----------------------
+- return dataframes: Yes
+- validation size: 0.2
+
+Expected behavior
+-----------------
+- required intermediate keys present: Yes
+- X train df equals train bundle X raw: Yes
+- X validation df equals validation bundle X raw: Yes
+- stored targets equal bundle targets: Yes
+
+Actual observed output
+----------------------
+- required keys:
+  - X_train_df
+  - X_validation_df
+  - train_df
+  - train_full_df
+  - validation_df
+  - validation_full_df
+- keys present:
+  - X_train_df
+  - X_validation_df
+  - train_df
+  - train_full_df
+  - validation_df
+  - validation_full_df
+- missing keys:
+  (none)
+- X train matches bundle: Yes
+- X validation matches bundle: Yes
+- train targets match bundle: Yes
+- validation targets match bundle: Yes
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+All optional audit DataFrames matched the data stored in the returned bundles.
+
+TEST 19 — The progress log records completed and skipped preparation steps
+--------------------------------------------------------------------------
+Python test function: test_progress_log_records_completed_and_skipped_steps
+
+What this test checks
+---------------------
+Inspect prep_meta['progress_log'] after an internal split and confirm the expected steps are marked ok or skipped.
+
+Why this test matters
+---------------------
+The progress log is part of the audit trail. It should accurately describe what the pipeline did and did not execute.
+
+Controlled test inputs
+----------------------
+- provided validation: No
+- return progress log: Yes
+
+Expected behavior
+-----------------
+- resolve training inputs: ok
+- resolve provided validation inputs: skipped
+- align provided validation features: skipped
+- encode target labels: ok
+- create train validation dataframes: ok
+- build raw bundles and metadata: ok
+
+Actual observed output
+----------------------
+- progress log:
+  -
+    - step: Resolve training inputs
+    - status: ok
+    - detail: DataFrame shape=(20, 3)
+  -
+    - step: Resolve provided validation inputs
+    - status: skipped
+    - detail: validation_kwargs with X and y was not provided
+  -
+    - step: Align provided validation features
+    - status: skipped
+    - detail: provided validation data was not supplied
+  -
+    - step: Build raw modeling dataframe(s)
+    - status: ok
+    - detail: dict keys=['train_full_df_shape', 'validation_full_df_shape']
+  -
+    - step: Encode target labels
+    - status: ok
+    - detail: dict keys=['target_col', 'mapping', 'class_counts_before', 'class_counts_after', 'encoded_dtype', 'inplace']
+  -
+    - step: Create train/validation dataframes
+    - status: ok
+    - detail: dict keys=['validation_mode', 'has_validation', 'internal_split_used', 'provided_validation_used', 'validation_size', 'random_state', 'stratify', 'train_shape', 'validation_shape', 'train_class_counts', 'validation_class_counts']
+  -
+    - step: Separate features and target
+    - status: ok
+    - detail: DataFrame shape=(16, 3)
+  -
+    - step: Build raw bundles and metadata
+    - status: ok
+    - detail: bundle X_raw=(16, 3)
+- statuses by step:
+  - Resolve training inputs: ok
+  - Resolve provided validation inputs: skipped
+  - Align provided validation features: skipped
+  - Build raw modeling dataframe(s): ok
+  - Encode target labels: ok
+  - Create train/validation dataframes: ok
+  - Separate features and target: ok
+  - Build raw bundles and metadata: ok
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The preparation audit log accurately distinguished executed and skipped steps.
+
+
+F. Safety and configuration contracts
+=====================================
+Checks permanent safety and configuration safeguards enforced by the production function.
+
+TEST 20 — Reject a target_name that already exists as a feature column
+----------------------------------------------------------------------
+Python test function: test_rejects_target_name_collision_with_feature_column
+
+What this test checks
+---------------------
+Use a feature named 'target' while target_name='target' and require an early error.
+
+Why this test matters
+---------------------
+The current assignment can overwrite the original feature silently, changing the modeling data without warning.
+
+Controlled test inputs
+----------------------
+- feature columns:
+  - target
+  - feature
+- target name: target
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: target_name conflict or already exists
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: target_name='target' conflicts with an existing training feature column.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The production function now protects existing feature columns from target overwrite.
+
+TEST 21 — Reject duplicate feature names before building a bundle
+-----------------------------------------------------------------
+Python test function: test_rejects_duplicate_feature_names
+
+What this test checks
+---------------------
+Supply three array columns named ['a', 'a', 'b'] and require an early error.
+
+Why this test matters
+---------------------
+Duplicate names make feature_name_to_idx incomplete because a dictionary cannot represent two distinct columns under the same key.
+
+Controlled test inputs
+----------------------
+- X shape:
+  - 20
+  - 3
+- feature names:
+  - a
+  - a
+  - b
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: duplicate feature or duplicate column
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: X: duplicate feature names are not allowed after converting feature names to strings: ['a']
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function now prevents internally inconsistent feature mappings.
+
+TEST 22 — Reject a true two-dimensional multi-output target array
+-----------------------------------------------------------------
+Python test function: test_rejects_true_two_dimensional_target_array
+
+What this test checks
+---------------------
+Pass y with shape (10, 2) and require the function to reject it rather than flatten it.
+
+Why this test matters
+---------------------
+Flattening a multi-output target can accidentally create a one-dimensional vector of the right length while changing the scientific meaning of the task.
+
+Controlled test inputs
+----------------------
+- X rows: 20
+- y shape:
+  - 10
+  - 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: target must be 1D, one column, or not multi-output
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- input y shape:
+  - 10
+  - 2
+- exception raised: Yes
+- exception type: ValueError
+- exception message: y must be a 1D target vector or contain exactly one target column. Received shape (10, 2); multi-output targets are not supported.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function now distinguishes a single target from a multi-output target array.
+
+TEST 23 — Reject a negative validation size
+-------------------------------------------
+Python test function: test_rejects_negative_validation_size
+
+What this test checks
+---------------------
+Set validation_size=-0.20 and require a configuration error.
+
+Why this test matters
+---------------------
+A negative fraction is invalid. Treating it as train-only can hide a notebook typo and remove the intended final-validation set.
+
+Controlled test inputs
+----------------------
+- validation size: -0.2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- valid range: 0.0 <= validation_size < 1.0, or None by policy
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: validation_size must be greater than or equal to 0.0.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The split configuration now rejects impossible negative fractions.
+
+TEST 24 — Reject validation_size=1.0 with a clear framework message
+-------------------------------------------------------------------
+Python test function: test_rejects_validation_size_equal_to_one_with_framework_message
+
+What this test checks
+---------------------
+Set validation_size=1.0 and require the framework to validate it before sklearn runs.
+
+Why this test matters
+---------------------
+A full validation fraction leaves no training data. The user should receive a direct configuration explanation rather than a lower-level library error.
+
+Controlled test inputs
+----------------------
+- validation size: 1.0
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: validation_size must be less than 1
+
+Actual observed output
+----------------------
+- exception raised: Yes
+- exception type: ValueError
+- exception message: validation_size must be less than 1.0 so that training rows remain.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now validates the split range before delegating to sklearn.
+
+TEST 25 — Reject an unknown split configuration key
+---------------------------------------------------
+Python test function: test_rejects_unknown_split_configuration_key
+
+What this test checks
+---------------------
+Use the misspelled key validation_sze and require an explicit configuration error.
+
+Why this test matters
+---------------------
+Silently ignoring a typo causes the default validation fraction to be used while the notebook appears to request something else.
+
+Controlled test inputs
+----------------------
+- split kwargs:
+  - validation sze: 0.4
+  - random state: 42
+  - stratify: Yes
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: unknown or unsupported split key
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Unknown or unsupported split_kwargs keys: ['validation_sze']. Supported keys are: ['random_state', 'stratify', 'validation_size']
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now prevents silent fallback when a split option is misspelled.
+
+TEST 26 — Reject mismatched pandas X and y indices
+--------------------------------------------------
+Python test function: test_rejects_misaligned_pandas_indices
+
+What this test checks
+---------------------
+Provide X and y with equal lengths but different index order and require an error.
+
+Why this test matters
+---------------------
+For patient-level pandas data, equal length does not guarantee that each target is paired with the correct patient row.
+
+Controlled test inputs
+----------------------
+- X index:
+  - 100
+  - 101
+  - 102
+  - 103
+- y index:
+  - 103
+  - 100
+  - 101
+  - 102
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: indices must align or match
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- original X index:
+  - 100
+  - 101
+  - 102
+  - 103
+- original y index:
+  - 103
+  - 100
+  - 101
+  - 102
+- exception raised: Yes
+- exception type: ValueError
+- exception message: training data: pandas feature and target indices must match exactly and be in the same order to preserve row alignment.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function now protects patient-level alignment when pandas indices disagree.
+
+TEST 27 — Reject missing target values before splitting
+-------------------------------------------------------
+Python test function: test_rejects_missing_target_values_early
+
+What this test checks
+---------------------
+Insert one NaN target and require a clear framework-level error before sklearn is called.
+
+Why this test matters
+---------------------
+Supervised outcomes must be defined. Missing targets should be handled by an explicit loader policy or rejected with an auditable message.
+
+Controlled test inputs
+----------------------
+- rows: 20
+- missing target count: 1
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: missing target or target NaN
+
+Actual observed output
+----------------------
+- missing target count: 1
+- missing target positions:
+  - 3
+- exception raised: Yes
+- exception type: ValueError
+- exception message: y contains 1 missing target value(s) at position(s) [3]. Missing target values must be handled before preparing supervised bundles.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now catches undefined outcomes before attempting a split.
+
+
+E. Version 1 binary-classification contract
+===========================================
+Defines the explicit Version 1 task boundary: one binary target mapped to 0.0 and 1.0. Regression and multiclass tasks are deferred to Version 2.
+
+TEST 28 — Version 1 rejects targets with more than two original classes
+-----------------------------------------------------------------------
+Python test function: test_rejects_multiclass_target_in_version_1
+
+What this test checks
+---------------------
+Provide three observed target labels and require rejection even when a mapping collapses them into two numeric outputs.
+
+Why this test matters
+---------------------
+Version 1 is designed for a genuinely binary clinical outcome. Collapsing three source classes through a mapping can hide a different scientific task.
+
+Controlled test inputs
+----------------------
+- observed target labels:
+  - 1
+  - 2
+  - 3
+- target mapping:
+  - 1: 0.0
+  - 2: 1.0
+  - 3: 1.0
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: exactly two observed target classes
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Version 1 binary classification requires exactly two observed target classes in y. Observed 3: [1, 2, 3]. Both binary classes must be present.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now enforces a genuinely binary source target for Version 1.
+
+
+C. Input formats and error handling
+===================================
+Checks supported input forms and verifies that malformed inputs are rejected rather than silently converted.
+
+TEST 29 — Feature-name count must match the number of feature columns
+---------------------------------------------------------------------
+Python test function: test_feature_name_length_mismatch_raises
+
+What this test checks
+---------------------
+Provide a three-column NumPy matrix with only two feature names and require an error.
+
+Why this test matters
+---------------------
+Every feature column must have exactly one auditable identity. A count mismatch makes column interpretation and validation alignment unreliable.
+
+Controlled test inputs
+----------------------
+- X shape:
+  - 20
+  - 3
+- feature names count: 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: feature_names does not match
+
+Actual observed output
+----------------------
+- X shape:
+  - 20
+  - 3
+- feature names:
+  - a
+  - b
+- exception raised: Yes
+- exception type: ValueError
+- exception message: X: number of feature_names does not match number of columns. X has 3 columns, but feature_names has 2 entries.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function correctly rejected a feature-name list that did not match the matrix width.
+
+
+F. Safety and configuration contracts
+=====================================
+Checks permanent safety and configuration safeguards enforced by the production function.
+
+TEST 30 — Reject duplicate feature names created by string conversion
+---------------------------------------------------------------------
+Python test function: test_rejects_duplicate_feature_names_after_string_conversion
+
+What this test checks
+---------------------
+Use feature names 1 and '1', which become identical after normalization to strings, and require an early duplicate-name error.
+
+Why this test matters
+---------------------
+Duplicate checks must occur after standardization. Otherwise apparently different raw names can create the same bundle key and an inconsistent feature map.
+
+Controlled test inputs
+----------------------
+- X shape:
+  - 20
+  - 2
+- feature names:
+  - 1
+  - 1
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: duplicate feature
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: X: duplicate feature names are not allowed after converting feature names to strings: ['1']
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function now detects collisions introduced while standardizing feature names.
+
+
+C. Input formats and error handling
+===================================
+Checks supported input forms and verifies that malformed inputs are rejected rather than silently converted.
+
+TEST 31 — Matching non-default pandas indices preserve row-target alignment
+---------------------------------------------------------------------------
+Python test function: test_matching_nondefault_pandas_indices_are_supported
+
+What this test checks
+---------------------
+Provide X and y with the same non-default patient index and verify the resulting patient-target pairs remain correct.
+
+Why this test matters
+---------------------
+Clinical tables often retain patient-specific indices. Matching indices should be accepted while still preserving the correct row-to-outcome relationship.
+
+Controlled test inputs
+----------------------
+- shared index:
+  - 501
+  - 503
+  - 507
+  - 509
+  - 511
+  - 513
+  - 517
+  - 519
+
+Expected behavior
+-----------------
+- mismatched patient target pairs: 0
+- function succeeds: Yes
+
+Actual observed output
+----------------------
+- input X index:
+  - 501
+  - 503
+  - 507
+  - 509
+  - 511
+  - 513
+  - 517
+  - 519
+- input y index:
+  - 501
+  - 503
+  - 507
+  - 509
+  - 511
+  - 513
+  - 517
+  - 519
+- output indices are reset:
+  - train:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+  - validation:
+    - 0
+    - 1
+- mismatch count: 0
+- mismatches:
+  (none)
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Matching non-default pandas indices were accepted and row-target alignment was preserved.
+
+
+B. Provided external-validation behavior
+========================================
+Checks the branch where an external validation dataset is supplied instead of creating an internal split.
+
+TEST 32 — Provided validation X and y must have the same number of rows
+-----------------------------------------------------------------------
+Python test function: test_provided_validation_X_y_row_count_mismatch_raises
+
+What this test checks
+---------------------
+Provide three validation feature rows and two validation targets and require an early error.
+
+Why this test matters
+---------------------
+Every external-validation participant requires exactly one outcome. Unequal lengths make validation row alignment undefined.
+
+Controlled test inputs
+----------------------
+- validation X rows: 3
+- validation y values: 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: different numbers of rows
+
+Actual observed output
+----------------------
+- validation X rows: 3
+- validation y values: 2
+- exception raised: Yes
+- exception type: ValueError
+- exception message: validation_kwargs['X'] and validation_kwargs['y'] have different numbers of rows: X has 3 rows, y has 2 rows.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function rejected the externally supplied validation data before building a bundle.
+
+TEST 33 — Provided validation targets use the same mapping as training targets
+------------------------------------------------------------------------------
+Python test function: test_provided_validation_uses_same_target_mapping_as_training
+
+What this test checks
+---------------------
+Supply original labels 1 and 2 in both datasets and verify both bundles use the same 1->0.0 and 2->1.0 mapping.
+
+Why this test matters
+---------------------
+Training and external validation must share one target definition. Different encoding would reverse or distort performance interpretation.
+
+Controlled test inputs
+----------------------
+- target mapping:
+  - 1: 0.0
+  - 2: 1.0
+- provided validation: Yes
+
+Expected behavior
+-----------------
+- train target values:
+  - 0.0
+  - 1.0
+- validation target values:
+  - 0.0
+  - 1.0
+
+Actual observed output
+----------------------
+- train target values:
+  - 0.0
+  - 1.0
+- validation target values:
+  - 0.0
+  - 1.0
+- train mapping:
+  - 1: 0.0
+  - 2: 1.0
+- validation mapping:
+  - 1: 0.0
+  - 2: 1.0
+- validation targets in input order:
+  - 1.0
+  - 0.0
+  - 1.0
+  - 0.0
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Training and validation targets followed the same explicit binary mapping.
+
+TEST 34 — Unknown target labels in provided validation data are rejected
+------------------------------------------------------------------------
+Python test function: test_unknown_provided_validation_target_label_raises
+
+What this test checks
+---------------------
+Include label 3 only in the external validation target while the mapping defines 1 and 2.
+
+Why this test matters
+---------------------
+An unseen validation outcome must not become missing or be silently reinterpreted, because that would corrupt external performance evaluation.
+
+Controlled test inputs
+----------------------
+- training labels:
+  - 1
+  - 2
+- validation labels:
+  - 1
+  - 3
+- mapping keys:
+  - 1
+  - 2
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: target labels not present in mapping
+
+Actual observed output
+----------------------
+- training labels:
+  - 1
+  - 2
+- validation labels:
+  - 1
+  - 3
+- mapping keys:
+  - 1
+  - 2
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Found target labels not present in mapping: [3]
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function rejected a validation class that was absent from the approved mapping.
+
+
+F. Safety and configuration contracts
+=====================================
+Checks permanent safety and configuration safeguards enforced by the production function.
+
+TEST 35 — The stratify setting must be a real Boolean
+-----------------------------------------------------
+Python test function: test_rejects_nonboolean_stratify_setting
+
+What this test checks
+---------------------
+Pass the string 'False' instead of the Boolean False and require a configuration error.
+
+Why this test matters
+---------------------
+Python treats non-empty strings as True. Without type validation, a notebook can request stratify='False' but still perform stratification.
+
+Controlled test inputs
+----------------------
+- stratify: False
+- input type: str
+
+Expected behavior
+-----------------
+- error type: TypeError
+- error message contains: stratify must be a bool
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: TypeError
+- exception message: split_kwargs['stratify'] must be a bool. Received str: 'False'.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now prevents truthiness conversion from changing the intended split behavior.
+
+TEST 36 — Insufficient binary class counts produce a clear stratification error
+-------------------------------------------------------------------------------
+Python test function: test_too_small_class_for_stratification_raises_clear_framework_error
+
+What this test checks
+---------------------
+Use one positive patient and five negative patients with stratify=True and require an early framework explanation.
+
+Why this test matters
+---------------------
+A class represented by one patient cannot be distributed safely across train and validation. The framework should explain the class-count limitation before sklearn fails.
+
+Controlled test inputs
+----------------------
+- class counts:
+  - negative: 5
+  - positive: 1
+- stratify: Yes
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: insufficient class counts for stratification
+
+Actual observed output
+----------------------
+- class counts:
+  - 1: 5
+  - 2: 1
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Insufficient class counts for stratification: each binary class must contain at least 2 observations. Counts: {0.0: 5, 1.0: 1}
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now validates class counts and gives an actionable split message.
+
+
+E. Version 1 binary-classification contract
+===========================================
+Defines the explicit Version 1 task boundary: one binary target mapped to 0.0 and 1.0. Regression and multiclass tasks are deferred to Version 2.
+
+TEST 37 — Version 1 target mapping must encode classes as exactly 0.0 and 1.0
+-----------------------------------------------------------------------------
+Python test function: test_rejects_target_mapping_outputs_other_than_zero_and_one
+
+What this test checks
+---------------------
+Map the positive source class to 2.0 and require rejection.
+
+Why this test matters
+---------------------
+Downstream Version 1 metrics, probability interpretation, calibration, and threshold logic assume a negative class of 0.0 and a positive class of 1.0.
+
+Controlled test inputs
+----------------------
+- target mapping:
+  - 1: 0.0
+  - 2: 2.0
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: mapping values must be exactly 0.0 and 1.0
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Version 1 target mapping values must be exactly 0.0 and 1.0. Received values: [0.0, 2.0]
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The function now enforces the shared Version 1 binary target convention.
+
+TEST 38 — Internal stratified splitting requires both mapped binary classes
+---------------------------------------------------------------------------
+Python test function: test_internal_stratified_split_requires_both_binary_classes
+
+What this test checks
+---------------------
+Provide only the negative source label while the mapping defines both classes and require an early error.
+
+Why this test matters
+---------------------
+A one-class dataset cannot train or validate a meaningful binary classifier, even if the mapping dictionary lists a second class that is absent from the data.
+
+Controlled test inputs
+----------------------
+- observed source labels:
+  - 1
+- mapping:
+  - 1: 0.0
+  - 2: 1.0
+- stratify: Yes
+
+Expected behavior
+-----------------
+- error type: ValueError
+- error message contains: both binary classes must be present
+
+Actual observed output
+----------------------
+- function returned successfully: No
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Version 1 binary classification requires exactly two observed target classes in y. Observed 1: [1]. Both binary classes must be present.
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework now blocks a nominally binary task that contains only one observed class.
+
+
+D. Bundle and metadata integrity
+================================
+Checks that returned bundles, intermediate DataFrames, feature maps, and metadata agree with the actual data and do not share unsafe state.
+
+TEST 39 — Returned dataset metadata objects should not share mutable references
+-------------------------------------------------------------------------------
+Python test function: test_returned_dataset_metadata_objects_are_independent
+
+What this test checks
+---------------------
+Mutate nested metadata in the returned train bundle and verify the original input, validation bundle, and prep metadata remain unchanged.
+
+Why this test matters
+---------------------
+Shared mutable dictionaries allow one notebook step to change metadata everywhere, creating hidden state and making audit records unreliable.
+
+Controlled test inputs
+----------------------
+- metadata contains nested dictionary: Yes
+- mutation target: train_bundle
+
+Expected behavior
+-----------------
+- original metadata unchanged: Yes
+- validation metadata unchanged: Yes
+- prep metadata unchanged: Yes
+
+Actual observed output
+----------------------
+- original metadata after train mutation:
+  - ml task: binary_classification
+  - nested:
+    - clinical context: original
+- validation metadata after train mutation:
+  - ml task: binary_classification
+  - nested:
+    - clinical context: original
+- prep metadata after train mutation:
+  - ml task: binary_classification
+  - nested:
+    - clinical context: original
+- train metadata is original object: No
+- validation metadata is original object: No
+- prep metadata is original object: No
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Each returned object now owns an independent metadata copy.
+
+
+B. Provided external-validation behavior
+========================================
+Checks the branch where an external validation dataset is supplied instead of creating an internal split.
+
+TEST 40 — Strict validation policy is the default and reorders columns safely
+-----------------------------------------------------------------------------
+Python test function: test_strict_validation_policy_is_default_and_reorders_columns
+
+What this test checks
+---------------------
+Provide the same feature-name set in a different validation order and verify the default strict policy preserves every feature while reordering validation columns.
+
+Why this test matters
+---------------------
+External validation must use the exact training feature space. Column order can be corrected safely, but no feature should be silently removed.
+
+Controlled test inputs
+----------------------
+- training columns:
+  - age
+  - bmi
+  - biomarker
+- validation columns:
+  - biomarker
+  - age
+  - bmi
+- validation feature policy: strict (default)
+
+Expected behavior
+-----------------
+- train columns:
+  - age
+  - bmi
+  - biomarker
+- validation columns after alignment:
+  - age
+  - bmi
+  - biomarker
+- features dropped: 0
+- validation reordered: Yes
+
+Actual observed output
+----------------------
+- train columns:
+  - age
+  - bmi
+  - biomarker
+- validation columns:
+  - age
+  - bmi
+  - biomarker
+- requested policy: strict
+- effective policy: strict
+- exact feature set match: Yes
+- train features dropped: 0
+- validation features dropped: 0
+- validation reordered: Yes
+- prep policy: strict
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The default strict policy preserved the complete feature set and corrected only column order.
+
+TEST 41 — Strict validation policy rejects missing and extra feature names
+--------------------------------------------------------------------------
+Python test function: test_strict_validation_policy_rejects_missing_and_extra_features
+
+What this test checks
+---------------------
+Use one training-only feature and one validation-only feature and require a clear strict-policy error listing both differences.
+
+Why this test matters
+---------------------
+A model cannot be evaluated safely when validation substitutes or omits training features.
+
+Controlled test inputs
+----------------------
+- training columns:
+  - age
+  - bmi
+  - biomarker
+- validation columns:
+  - age
+  - bmi
+  - site
+- validation feature policy: strict
+
+Expected behavior
+-----------------
+- error type: ValueError
+- missing from validation:
+  - biomarker
+- validation only features:
+  - site
+
+Actual observed output
+----------------------
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Strict validation feature policy requires identical feature-name sets in training and validation. Missing from validation: ['biomarker']. Validation-only features: ['site'].
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+Strict alignment blocked a scientifically incompatible validation feature space.
+
+
+F. Safety and configuration contracts
+=====================================
+Checks permanent safety and configuration safeguards enforced by the production function.
+
+TEST 42 — Unknown validation feature policies are rejected
+----------------------------------------------------------
+Python test function: test_rejects_unknown_validation_feature_policy
+
+What this test checks
+---------------------
+Pass an unsupported validation_feature_policy value and require a direct configuration error.
+
+Why this test matters
+---------------------
+A misspelled policy must not silently fall back to strict or intersection behavior.
+
+Controlled test inputs
+----------------------
+- validation feature policy: automatic
+
+Expected behavior
+-----------------
+- error type: ValueError
+- supported values:
+  - intersection
+  - strict
+
+Actual observed output
+----------------------
+- exception raised: Yes
+- exception type: ValueError
+- exception message: Unknown validation_feature_policy='automatic'. Supported values are: ['intersection', 'strict']
+
+Status
+------
+PASS
+
+Interpretation
+--------------
+The framework rejected an unknown alignment policy before processing data.
+
+
+COVERAGE REASSESSMENT QUESTIONS
+===============================
+1. Does every important branch of prepare_train_validation_bundles have a test?
+2. Are the controlled inputs representative of clinical tabular datasets?
+3. Are there additional failure modes or metadata contracts we should test?
+4. Do the expected behaviors match the intended statistical and workflow design?
+5. Should any current behavior be changed before it becomes a permanent contract?
+
+NEXT STEP
+=========
+All documented checks are green. Proceed to broader integration testing or the next function.

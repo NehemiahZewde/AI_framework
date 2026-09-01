@@ -11,7 +11,6 @@ requires-python = ">=3.9"
 
 authors = [{ name = "Nehemiah Zewde" }]
 license = { file = "LICENSE" }
-license-files = ["LICENSE"]
 keywords = ["EEG", "EEG feature extraction", "machine-learning", "neuroscience"]
 
 classifiers = [

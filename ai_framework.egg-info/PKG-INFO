@@ -1,0 +1,217 @@
+Metadata-Version: 2.4
+Name: ai-framework
+Version: 1.0.0
+Summary: AI framework for EEG feature extraction and modeling
+Author: Nehemiah Zewde
+License: MIT License
+        
+        Copyright (c) 2026 NehemiahZewde
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: Homepage, https://github.com/<user>/<repo>
+Project-URL: Issues, https://github.com/<user>/<repo>/issues
+Keywords: EEG,EEG feature extraction,machine-learning,neuroscience
+Classifier: Intended Audience :: Science/Research
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Scientific/Engineering
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Operating System :: MacOS
+Classifier: Operating System :: POSIX
+Classifier: License :: OSI Approved :: MIT License
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: alembic>=1.17.2
+Requires-Dist: autoreject>=0.4.3
+Requires-Dist: bayesian-optimization>=3.2.0
+Requires-Dist: betacal>=1.1.0
+Requires-Dist: cloudpickle>=3.1.2
+Requires-Dist: colorlog>=6.10.1
+Requires-Dist: contourpy>=1.3.3
+Requires-Dist: cycler>=0.12.1
+Requires-Dist: docopt>=0.6.2
+Requires-Dist: et_xmlfile>=2.0.0
+Requires-Dist: feature_engine>=1.9.3
+Requires-Dist: filelock>=3.20.0
+Requires-Dist: fonttools>=4.61.1
+Requires-Dist: fsspec>=2025.10.0
+Requires-Dist: greenlet>=3.3.0
+Requires-Dist: h5io>=0.2.5
+Requires-Dist: h5py>=3.15.1
+Requires-Dist: infomeasure>=0.5.0
+Requires-Dist: joblib>=1.5.2
+Requires-Dist: kiwisolver>=1.4.9
+Requires-Dist: lazy_loader>=0.4
+Requires-Dist: llvmlite>=0.45.1
+Requires-Dist: Mako>=1.3.10
+Requires-Dist: matplotlib>=3.10.6
+Requires-Dist: missingno>=0.5.2
+Requires-Dist: mne>=1.10.2
+Requires-Dist: mne-features>=0.3
+Requires-Dist: mpmath>=1.3.0
+Requires-Dist: narwhals>=2.13.0
+Requires-Dist: networkx>=3.6
+Requires-Dist: neurokit2>=0.2.12
+Requires-Dist: numba>=0.62.1
+Requires-Dist: numpy>=2.3.5
+Requires-Dist: openpyxl>=3.1.5
+Requires-Dist: optuna>=4.6.0
+Requires-Dist: pandas>=2.3.3
+Requires-Dist: parameterized>=0.9.0
+Requires-Dist: patsy>=1.0.2
+Requires-Dist: phik>=0.12.5
+Requires-Dist: pillow>=12.0.0
+Requires-Dist: plotly>=6.5.0
+Requires-Dist: pooch>=1.8.2
+Requires-Dist: ptitprince>=0.3.1
+Requires-Dist: pycrostates>=0.6.1
+Requires-Dist: pymatreader>=1.1.0
+Requires-Dist: pyparsing>=3.2.5
+Requires-Dist: python-decouple>=3.8
+Requires-Dist: pytz>=2025.2
+Requires-Dist: PyWavelets>=1.9.0
+Requires-Dist: scikit-learn>=1.8.0
+Requires-Dist: scikit-misc>=0.5.1
+Requires-Dist: scipy>=1.16.2
+Requires-Dist: seaborn>=0.13.2
+Requires-Dist: skrebate>=0.62
+Requires-Dist: sparse>=0.17.0
+Requires-Dist: SQLAlchemy>=2.0.44
+Requires-Dist: statsmodels>=0.14.5
+Requires-Dist: sympy>=1.14.0
+Requires-Dist: threadpoolctl>=3.6.0
+Requires-Dist: torch>=2.9.1
+Requires-Dist: tqdm>=4.67.1
+Requires-Dist: tzdata>=2025.3
+Requires-Dist: uncertainty-calibration>=0.1.4
+Requires-Dist: xgboost>=3.1.2
+Requires-Dist: xmltodict>=1.0.2
+Requires-Dist: yarg>=0.1.10
+Dynamic: license-file
+
+# Clinical ML for Patient Enrichment and Stratification
+
+A patient-level machine learning framework for improving clinical-trial design through enrichment, stratification, and prospective screening.
+
+This framework helps clinical and translational teams evaluate whether patient-level data can be used to identify higher-yield subgroups, define clinically meaningful strata, and support more efficient study planning across disease areas.
+
+It is designed for the reality of clinical-trial data: datasets may be small, heterogeneous, noisy, and expensive to collect, but teams still need to make high-impact decisions about enrollment, subgroup analysis, validation, and future trial design.
+
+<img width="1568" height="814" alt="image" src="https://github.com/user-attachments/assets/ba2dc360-c5d4-49ca-a84a-feb4c2a20b50" />
+<p align="center"><em>Modality- and disease-area-agnostic workflow for translating clinical data into patient enrichment and stratification strategies.</em></p>
+
+
+## The Challenge
+
+Clinical trials are expensive, time-consuming, and often affected by heterogeneous patient response. When patients vary widely in disease biology, progression, or likelihood of response, broad enrollment can dilute treatment effects, increase sample-size requirements, and make trial results harder to interpret.
+
+At the same time, clinical-trial datasets are often small, noisy, and difficult to reuse for future study design. Even when patient-level features contain useful signal, it can be difficult to determine whether that signal is stable enough and actionable enough to support patient selection.
+
+The practical challenge is not only whether a model can predict an outcome, but whether patient-level predictions can help identify enriched subgroups, define meaningful patient strata, reduce screening inefficiency, and support more focused clinical-trial decisions.
+
+
+## The Solution
+
+This framework helps clinical teams translate patient-level data into enrichment and stratification strategies that can support more efficient clinical-trial design.
+
+It uses machine learning to generate patient-level risk, diagnostic, or response scores, then converts those scores into trial-planning outputs that help teams:
+
+- identify higher-yield patient subgroups for focused enrollment
+- define probability-based strata for subgroup analysis and trial planning
+- estimate screening burden, sample size, power, and validation feasibility
+
+In practice, this helps teams assess whether enrichment or stratification could improve trial efficiency by focusing enrollment, increasing the expected response or event rate, reducing uninformative screening or enrollment, and supporting faster go/no-go decisions.
+
+## Patient Selection Framework
+
+The same patient-level score can support both **enrichment** and **stratification**.
+
+- **Enrichment** applies a fixed threshold to select a subgroup.
+- **Stratification** divides patients into ordered probability groups, such as low, medium, and high likelihood groups.
+
+| Patient selection framework | Core question | Score used | Enrichment use | Stratification use | Status |
+|---|---|---|---|---|---|
+| Diagnostic | Who likely has the disease or diagnostic target? | `P(disease given patient features)` | Select patients above a diagnostic-likelihood threshold | Group patients into diagnostic-likelihood strata | Supported |
+| Prognostic | Who likely experiences the future outcome of interest? | `P(outcome given patient features)` | Select patients above an outcome-probability threshold | Group patients into outcome-likelihood strata | Supported |
+| Treatment-benefit / treatment-effect | Who likely benefits more from treatment than control or no treatment? | Estimated treatment benefit | Select patients above a treatment-benefit threshold | Group patients into treatment-benefit strata | Future work |
+
+## What the Framework Produces
+
+Typical outputs include:
+
+- calibrated patient-level scores and ranked screening views
+- enrichment and stratification summaries, including subgroup rates and enrichment factors
+- screening burden, number needed to screen, sample-size, and power estimates
+- patient-level uncertainty and stability summaries
+
+---
+
+## Use Cases
+
+This framework is designed for clinical and translational teams working with retrospective or early-stage clinical-trial data.
+
+Example use cases include:
+
+- enrichment feasibility analysis for diagnostic or prognostic endpoints
+- patient stratification for subgroup analysis and trial planning
+- biomarker or feature-panel evaluation
+- screening, recruitment, and prospective validation planning
+
+## Technical Foundation
+
+The framework is built around clinical-trial data realities: limited sample size, heterogeneous patients, repeated measurements, patient-level grouping, calibration needs, and validation leakage risk.
+
+Key technical features include:
+
+- patient-level and group-aware validation
+- nested cross-validation support
+- calibrated probability estimation
+- repeated prediction pooling to patient-level summaries
+- diagnostic and prognostic enrichment analysis
+- probability-based patient stratification
+- sample-size and power calculations
+- modality-agnostic inputs, including tabular, biomarker, time-series, imaging-derived, and multimodal features
+
+
+## Requirements
+
+- Python 3.9+
+
+
+## Installation
+
+### Option 1: Install directly from GitHub
+
+```bash
+pip install git+https://github.com/NehemiahZewde/AI_framework.git
+````
+### Option 2: Clone and install
+```bash
+git clone https://github.com/NehemiahZewde/AI_framework.git
+cd AI_framework
+pip install -e .
+````
+
+## Project layout
+
+* `ai_framework/` — core pipeline building blocks (data prep, training, evaluation, calibration, reporting)
+* `tutorial/` — end-to-end examples
+
+---
